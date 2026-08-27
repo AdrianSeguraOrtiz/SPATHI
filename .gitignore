@@ -51,6 +51,9 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Local SPATHI run artifacts (inputs/examples remain versioned separately)
+results/
+
 # Translations
 *.mo
 *.pot
