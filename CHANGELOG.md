@@ -16,6 +16,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Optional external-group size correction and per-group weight diagnostics.
 - Weighted Extra-Trees and Random-Forest inference with deterministic task seeds.
 - Self-contained, deterministically ordered run artifacts and metadata.
+- Cell-embedding and explained-variance artifacts for inspecting the fitted PCA
+  distance representation or the explicitly auxiliary expression-space display PCA.
+- Default-on target weight panels, an exact effective-weight-mass heatmap, and a
+  visualization manifest with projection semantics and file hashes; `--no-visualize`
+  disables their generation.
 - Unit, integration, CLI, parallel reproducibility, and distribution tests.
 - Developer documentation, minimal example, scaling benchmark, and CI workflow.
 
@@ -26,9 +31,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Resolve bootstrap sampling automatically by estimator: disabled for Extra-Trees and
   enabled for Random Forest unless explicitly overridden; record requested and
   effective values separately.
-- Bound pairwise-distance working chunks to 64 MiB and stream required
-  cell-to-centroid distances in `group-distance` mode instead of retaining the full
-  matrix.
+- Cap PCA components at the informative `n_cells - 1` limit (with a defined one-cell
+  exception), delegate `auto` solver negotiation without private state, and record the
+  solver policy and explained-variance diagnostics.
+- Bound pairwise-distance working chunks to 64 MiB and avoid computing
+  cell-to-centroid distances entirely in `group-distance` mode.
+- Treat `group_affinities.tsv` as a centroid-level diagnostic and identify
+  `cell_weights.tsv.gz` and `weight_diagnostics.tsv` as the authoritative effective
+  model weights and group contributions.
+- Exclude TF predictors that are constant among positive-weight cells while preserving
+  predictor-name mappings and reporting used, discarded, and constant predictors.
 - Process target genes in bounded sub-batches in addition to group batches.
 - Parse large expression TSVs into one exact numeric allocation without retaining a
   table-sized string copy, and hash the exact bytes consumed during validation.

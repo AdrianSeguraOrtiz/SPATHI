@@ -31,10 +31,22 @@ pipeline; `none` leaves values unstandardized. This does not modify the values u
 the tree ensembles. SPATHI performs no implicit library-size normalization, log
 transformation, scaling, or feature selection on the inference matrix.
 
-When PCA is selected, scikit-learn PCA receives cells as observations. If the requested
-component count is too large, the effective count is bounded safely by the available
-cells and genes and recorded in `run_metadata.json`. The selected SVD solver and global
-random seed are also recorded.
+When PCA is selected, scikit-learn PCA receives cells as observations. Its centered-data
+informative-rank bound is `min(n_genes, max(0, n_cells - 1))`. The one-cell case keeps
+one structural component so downstream shapes remain defined; its informative bound
+and explained variance are both recorded as zero. Otherwise, the effective component
+count is the smaller of the requested count and that bound. `run_metadata.json`
+records the requested and effective counts, informative bound, SVD policy, and both
+per-component and cumulative explained-variance ratios. When the policy is `auto`,
+the concrete solver remains delegated to the recorded scikit-learn version; SPATHI
+does not reproduce private solver-selection logic.
+
+PCA distance-space runs write `cell_embedding.tsv.gz` with the first up to three
+retained PCs and `pca_explained_variance.tsv` with the complete variance summary. A
+visualized expression-space run writes the same artifact names for its clearly named
+`AuxiliaryPC` display projection; these auxiliary coordinates do not participate in
+distance or weight calculation. They are absent for expression-space runs with
+`--no-visualize`.
 
 ### Numeric precision
 
@@ -60,32 +72,33 @@ Prototype calculation is isolated behind a dedicated component so that medoids o
 other prototypes can be added without redefining weighting or inference. Centroids are
 computed once per run.
 
-For the selected Euclidean or cosine metric, SPATHI calculates:
+For the selected Euclidean or cosine metric, SPATHI always calculates the pairwise
+centroid distances \(d(\mu_h,\mu_c)\). The dense group-by-group result is materialized
+once because it is both small relative to the expression matrix and a requested
+output. In `cell-distance` and `cell-distance-group-anchored`, SPATHI additionally
+calculates every \(d(z_i,\mu_c)\). These cell-to-centroid calculations are vectorized
+through scikit-learn in chunks with a 64 MiB working-memory budget rather than
+inheriting scikit-learn's much larger process-wide default. The resulting cell-by-group
+matrix is reused; above the in-memory threshold, chunks are written directly into a
+temporary disk-backed memory map.
 
-1. distances \(d(z_i, \mu_c)\) from every cell to every group centroid; and
-2. distances \(d(\mu_h, \mu_c)\) between every pair of group centroids.
+`group-distance` never needs cell-to-centroid distances and therefore does not compute
+them. It uses only the centroid-to-centroid matrix. The per-cell `distance` in
+`cell_weights.tsv.gz` is consequently the centroid distance shared by that cell's
+source group. Automatic-bandwidth calculations retain the exact positive-distance
+median relevant to the selected mode; large cell-distance calculations use bounded
+scans and a temporary disk-backed selection array.
 
-Cell-to-centroid calculations are vectorized through scikit-learn in chunks with a
-64 MiB working-memory budget rather than inheriting scikit-learn's much larger
-process-wide default. The required centroid-to-centroid result is a dense
-group-by-group matrix and is materialized once because it is itself an output. The two
-cell-distance modes reuse the cell-by-group matrix; when it exceeds the in-memory
-threshold, chunks are written directly into a temporary disk-backed memory map.
-`group-distance` does not need that matrix for weighting, so it performs the required
-cell-to-centroid calculation as a bounded streaming pass and discards each chunk. The
-long-form weight artifact continues to record the mode's actual weighting distance,
-which is centroid-to-centroid in this mode. Large automatic-bandwidth calculations
-likewise use bounded scans and a temporary disk-backed selection array while retaining
-the exact positive-distance median.
-
-Cosine distance is undefined for a zero vector. SPATHI therefore rejects any zero-norm
-cell representation or centroid and reports the corresponding identifiers; it does
-not silently assign distance zero or one. Non-zero rows at exceptional magnitudes are
-rescaled before the cosine calculation to avoid norm underflow or overflow. Finally,
-non-negative cosine values no larger than the `float64` forward-error bound for a dot
-product of the configured dimension are set to exactly zero. This prevents numerical
-residue from becoming an artificial automatic bandwidth while preserving genuinely
-positive distances above that bound.
+Cosine distance is undefined for a zero vector. SPATHI therefore rejects zero-norm
+centroids in every mode and zero-norm cell representations in the two modes that
+actually calculate cell-to-centroid distances. `group-distance` does not inspect cell
+norms because those vectors never enter its distance calculation. Required zero rows
+are reported by identifier rather than silently assigned distance zero or one. Non-zero
+rows at exceptional magnitudes are rescaled before the cosine calculation to avoid norm
+underflow or overflow. Finally, non-negative cosine values no larger than the `float64`
+forward-error bound for a dot product of the configured dimension are set to exactly
+zero. This prevents numerical residue from becoming an artificial automatic bandwidth
+while preserving genuinely positive distances above that bound.
 
 ## Kernels and global bandwidth
 
@@ -212,10 +225,50 @@ exceeds target mass, and excessive concentration in one external group. These wa
 are interpretive signals. They do not stop a run unless the resulting model cannot be
 trained.
 
+`group_affinities.tsv` is deliberately a group-level centroid diagnostic. Its
+`base_affinity` is the kernel of the source-to-target centroid distance, irrespective
+of the selected weighting mode, and is a per-cell base model weight only in
+`group-distance`. Its `group_size_factor` is the per-cell multiplicity correction for
+that source/target pair. The authoritative model-level values are
+`cell_weights.tsv.gz:final_weight`; their exact effective source-group mass is reported
+in `weight_diagnostics.tsv`.
+
+## Visual diagnostics
+
+`spathi infer` generates visual diagnostics by default; `--no-visualize` (or
+`visualize=False` in the Python API) disables the complete `visualizations/` tree.
+When enabled, it writes:
+
+- `visualizations/targets/*.png`, one combined panel per target group showing distance
+  against base/final weight, a two-dimensional cell projection coloured by exact
+  final model weight, final-weight distributions by source group, and the resulting
+  effective sample size;
+- `visualizations/effective-weight-mass.png`, a target-by-source heatmap built from
+  the exact `source_mass_percent` values in the weight diagnostics; and
+- `visualizations/manifest.json`, recording projection semantics, figure paths,
+  SHA-256 digests, byte sizes, and relevant target/cell/group counts.
+
+For PCA-distance runs, the two-dimensional view is PC1/PC2 from the retained fitted
+representation; if only one component exists, the second display coordinate is zero.
+PC1/PC2 is a projection, not the space in which weights are recomputed: distance in
+later retained components can be invisible in the panel. Colours always use the exact
+`final_weight` passed to inference. For expression-distance runs, SPATHI fits a
+deterministic auxiliary two-component PCA solely for display; neither inference
+distances nor weights change. Scatter plots may use a deterministic subset for very
+large inputs. That subset reserves representation for rare source groups and always
+includes the target group; distributions and aggregate mass continue to use all cells.
+Use `--no-visualize` in calibration or timing runs to exclude rendering cost without
+changing numeric networks or weights.
+
+The heatmap quantifies statistical contribution under the chosen weighting rule. It
+does not represent causal influence, lineage, or a regulatory edge between groups.
+
 ## Weighted network inference
 
-For group \(c\) and target gene \(t\), SPATHI constructs a predictor matrix from all
-valid TFs and removes \(t\) if it is among them. It then fits either scikit-learn's
+For group \(c\) and target gene \(t\), SPATHI starts from all valid TFs, removes \(t\)
+if it is among them, and excludes any remaining predictor that is constant among cells
+with positive \(w_i^{(c)}\). This positive-weight restriction matches the observations
+that can affect the fitted model. It then fits either scikit-learn's
 `ExtraTreesRegressor` or `RandomForestRegressor` on all cells:
 
 \[
@@ -232,8 +285,11 @@ of both `--bootstrap` and `--no-bootstrap` in the CLI, selects that automatic po
 an explicit boolean overrides it. `parameters.json` preserves the requested nullable
 value and `run_metadata.json` records the effective boolean used by every estimator.
 
-All genes are attempted as targets. Constant responses, empty predictor sets, and other
-non-trainable models are recorded in `skipped_targets.tsv`. No self-edges are produced,
+All genes are attempted as targets. Constant responses, empty or entirely constant
+predictor sets, and other non-trainable models are recorded in `skipped_targets.tsv`.
+`model_diagnostics.tsv.gz` distinguishes the self-excluded predictor, constant
+predictors, the complete discarded set, and the number actually used, preserving the
+mapping from fitted importance columns back to TF names. No self-edges are produced,
 no automatic threshold is applied, and every finite score strictly greater than zero
 is retained. The feature importances are relative within each target model and are not
 renormalized across targets or groups.
@@ -271,10 +327,11 @@ every gene is retained at once. The same public thread limit also constrains PCA
 distance-library thread pools, while cell-to-centroid chunks use their separate 64 MiB
 working-memory cap.
 
-Representations, centroids, the distances needed by the selected weighting mode,
-bandwidth, TF predictors, size factors, and one weight vector per target group are
-reused. Phase timings, requested/effective threads, backend, model counts, relevant
-dependency versions, and warnings are written to metadata.
+Representations, centroids, only the distance matrices needed by the selected
+weighting mode, bandwidth, TF predictors, size factors, and one weight vector per
+target group are reused. In particular, `group-distance` does not allocate or scan a
+cell-to-centroid matrix. Phase timings, requested/effective threads, backend, model
+counts, relevant dependency versions, and warnings are written to metadata.
 
 Deterministic rows are written in stable order. Compressed tables also use a fixed gzip
 timestamp, so a deterministic table such as `cell_weights.tsv.gz` has identical bytes
@@ -295,7 +352,9 @@ In particular:
 - a centroid may summarize a heterogeneous or non-convex group poorly;
 - group-size correction changes statistical contribution, not biological similarity.
 
-Use `cell_weights.tsv.gz`, `group_affinities.tsv`, and
-`weight_diagnostics.tsv` to assess whether the fitted context matches the intended
-biological interpretation. Independent evidence and downstream validation remain
-necessary.
+Use `cell_weights.tsv.gz:final_weight` for the exact observation weights and
+`weight_diagnostics.tsv` for their effective group-level contribution.
+`group_affinities.tsv` should be used only as the centroid-affinity diagnostic
+described above. The figures provide a compact view of those quantities, but their
+PC1/PC2 positions are projections and do not replace the tabular values. Independent
+evidence and downstream validation remain necessary.
