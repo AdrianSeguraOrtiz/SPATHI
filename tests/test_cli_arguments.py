@@ -47,6 +47,14 @@ def test_cli_bootstrap_is_automatic_unless_explicitly_overridden() -> None:
     )
 
 
+def test_cli_visualization_is_enabled_unless_explicitly_disabled() -> None:
+    parser = build_parser()
+    assert config_from_args(parser.parse_args(BASE_ARGUMENTS)).visualize is True
+    assert (
+        config_from_args(parser.parse_args([*BASE_ARGUMENTS, "--no-visualize"])).visualize is False
+    )
+
+
 def test_cli_distinguishes_integer_and_fractional_max_features() -> None:
     parser = build_parser()
     integer = config_from_args(

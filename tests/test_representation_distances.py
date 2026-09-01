@@ -74,8 +74,52 @@ def test_pca_caps_components_and_does_not_modify_expression() -> None:
     assert result.values.shape == (3, 2)
     assert result.effective_n_components == 2
     assert result.requested_n_components == 50
-    assert result.effective_pca_svd_solver == "full"
+    assert result.pca_svd_solver_resolution == "explicit"
     pd.testing.assert_frame_equal(expression, original)
+
+
+def test_pca_caps_components_to_centered_informative_rank_and_delegates_auto_solver() -> None:
+    expression = pd.DataFrame(
+        [
+            [1.0, 2.0, 3.0],
+            [3.0, 1.0, 2.0],
+            [0.0, 4.0, 2.0],
+            [8.0, 3.0, 1.0],
+        ],
+        index=["G1", "G2", "G3", "G4"],
+        columns=["c1", "c2", "c3"],
+    )
+
+    result = compute_distance_representation(
+        expression,
+        distance_space="pca",
+        n_components=50,
+        pca_svd_solver="auto",
+    )
+
+    assert result.values.shape == (3, 2)
+    assert result.effective_n_components == 2
+    assert result.maximum_informative_n_components == 2
+    assert result.pca_svd_solver == "auto"
+    assert result.pca_svd_solver_resolution == "delegated-to-scikit-learn"
+
+
+def test_single_cell_pca_retains_one_structural_component() -> None:
+    expression = pd.DataFrame(
+        [[1.0], [2.0], [3.0]],
+        index=["G1", "G2", "G3"],
+        columns=["c1"],
+    )
+
+    result = compute_distance_representation(expression, n_components=50)
+
+    assert result.values.shape == (1, 1)
+    assert result.effective_n_components == 1
+    assert result.maximum_informative_n_components == 0
+    assert result.explained_variance_ratio == (0.0,)
+    assert result.pca_degenerate is True
+    assert result.pca_degeneracy_reason is not None
+    assert "fewer than two cells" in result.pca_degeneracy_reason
 
 
 @pytest.mark.parametrize(

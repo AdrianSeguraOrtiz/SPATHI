@@ -5,7 +5,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from spathi.outputs import IncrementalRunWriter, create_output_directory, write_json
+from spathi.outputs import (
+    IncrementalRunWriter,
+    create_output_directory,
+    write_json,
+    write_tsv_gzip,
+)
 
 
 def test_output_directory_is_never_overwritten(tmp_path: Path) -> None:
@@ -94,6 +99,31 @@ def test_json_writer_handles_paths_and_has_terminal_newline(tmp_path: Path) -> N
         "value": 2,
     }
     assert path.read_bytes().endswith(b"\n")
+
+
+def test_gzip_tsv_writer_preserves_requested_schema_and_is_reproducible(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "cell": ["c1", "c2"],
+            "group": ["A", "B"],
+            "PC1": [1.5, -1.5],
+            "unused": [1, 2],
+        }
+    )
+    first = tmp_path / "first" / "embedding.tsv.gz"
+    second = tmp_path / "second" / "embedding.tsv.gz"
+    first.parent.mkdir()
+    second.parent.mkdir()
+
+    write_tsv_gzip(frame, first, ("cell", "group", "PC1"))
+    write_tsv_gzip(frame, second, ("cell", "group", "PC1"))
+
+    assert first.read_bytes() == second.read_bytes()
+    assert first.read_bytes()[4:8] == b"\x00\x00\x00\x00"
+    with gzip.open(first, "rt", encoding="utf-8") as handle:
+        observed = pd.read_csv(handle, sep="\t")
+    assert observed.columns.tolist() == ["cell", "group", "PC1"]
+    pd.testing.assert_frame_equal(observed, frame[["cell", "group", "PC1"]])
 
 
 def test_gzip_outputs_are_byte_reproducible_and_have_zero_mtime(tmp_path: Path) -> None:

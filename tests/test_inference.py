@@ -164,6 +164,101 @@ def test_all_genes_are_targets_constants_are_recorded_and_autoedges_removed() ->
     assert all(edge.sign == "?" for edge in result.edges)
 
 
+def test_constant_predictors_are_excluded_with_correct_edge_mapping_and_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fitted_matrices: dict[tuple[float, ...], np.ndarray] = {}
+    fitted_matrix_ids: dict[tuple[float, ...], int] = {}
+
+    class FakeEstimator:
+        feature_importances_: np.ndarray
+
+        def fit(self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray) -> FakeEstimator:
+            fitted_matrices[tuple(y.tolist())] = x.copy()
+            fitted_matrix_ids[tuple(y.tolist())] = id(x)
+            raw_importances = np.arange(1, x.shape[1] + 1, dtype=np.float64)
+            self.feature_importances_ = raw_importances / raw_importances.sum()
+            return self
+
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: FakeEstimator(),
+    )
+    tf_left = np.array([0.0, 1.0, 2.0, 3.0])
+    tf_constant = np.full(4, 7.0)
+    tf_right = np.array([3.0, 1.0, 4.0, 2.0])
+    target = np.array([1.0, 4.0, 2.0, 8.0])
+    target_2 = np.array([2.0, 5.0, 9.0, 3.0])
+    expression = np.column_stack([tf_left, tf_constant, tf_right, target, target_2])
+
+    result = infer_networks(
+        expression,
+        ["TF_LEFT", "TF_CONSTANT", "TF_RIGHT", "TARGET", "TARGET_2"],
+        ["TF_LEFT", "TF_CONSTANT", "TF_RIGHT"],
+        {"A": np.ones(expression.shape[0])},
+        n_estimators=2,
+        threads=1,
+    )
+
+    target_matrix = fitted_matrices[tuple(target.tolist())]
+    assert target_matrix.flags.c_contiguous
+    np.testing.assert_array_equal(target_matrix, np.column_stack([tf_left, tf_right]))
+    # Non-TF targets share the group-level filtered matrix instead of copying it
+    # once per target. TF targets still receive a self-excluded matrix.
+    assert fitted_matrix_ids[tuple(target.tolist())] == fitted_matrix_ids[tuple(target_2.tolist())]
+    target_edges = {
+        edge.source: edge.score
+        for edge in result.edges
+        if edge.context == "group:A" and edge.target == "TARGET"
+    }
+    assert target_edges == {
+        "TF_LEFT": pytest.approx(1.0 / 3.0),
+        "TF_RIGHT": pytest.approx(2.0 / 3.0),
+    }
+
+    target_stat = next(stat for stat in result.model_stats if stat.target == "TARGET")
+    assert target_stat.n_predictors_input == 3
+    assert target_stat.n_predictors_used == 2
+    assert target_stat.constant_predictors == ("TF_CONSTANT",)
+    assert target_stat.discarded_predictors == ("TF_CONSTANT",)
+
+    right_stat = next(stat for stat in result.model_stats if stat.target == "TF_RIGHT")
+    assert right_stat.n_predictors_used == 1
+    assert right_stat.constant_predictors == ("TF_CONSTANT",)
+    assert right_stat.discarded_predictors == ("TF_CONSTANT", "TF_RIGHT")
+    assert all(edge.source != edge.target for edge in result.edges)
+
+
+def test_all_constant_eligible_predictors_are_discarded_without_fitting() -> None:
+    expression = np.column_stack(
+        [
+            np.full(4, 1.0),
+            np.full(4, 2.0),
+            np.array([0.0, 1.0, 2.0, 3.0]),
+        ]
+    )
+
+    result = infer_networks(
+        expression,
+        ["TF1", "TF2", "TARGET"],
+        ["TF1", "TF2"],
+        {"A": np.ones(expression.shape[0])},
+        n_estimators=2,
+        threads=1,
+    )
+
+    target_stat = next(stat for stat in result.model_stats if stat.target == "TARGET")
+    assert target_stat.status == "no_variable_predictors"
+    assert target_stat.n_predictors_used == 0
+    assert target_stat.constant_predictors == ("TF1", "TF2")
+    assert target_stat.discarded_predictors == ("TF1", "TF2")
+    assert any(
+        skipped.target == "TARGET" and skipped.reason == "no_variable_predictors"
+        for skipped in result.skipped_targets
+    )
+
+
 def test_fixed_seed_is_equivalent_across_thread_counts() -> None:
     expression, genes, tfs = inference_data()
     weights = {

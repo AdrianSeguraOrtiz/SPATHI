@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .weighting import WeightResult
+from .weighting import WeightResult, _stringify_group_labels, _stringify_target_group
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,18 +133,20 @@ def _coerce_inputs(
                 "cell_groups and target_group must be omitted when a WeightResult is supplied"
             )
         values = np.asarray(weights.final_weight, dtype=np.float64)
-        groups = np.asarray(weights.cell_groups, dtype=str)
-        target = weights.target_group
+        groups = _stringify_group_labels(weights.cell_groups, field_name="cell_groups")
+        target = _stringify_target_group(weights.target_group)
     else:
-        if cell_groups is None or target_group is None:
-            raise ValueError("cell_groups and target_group are required with a raw weight vector")
+        if cell_groups is None:
+            raise ValueError("cell_groups is required with a raw weight vector")
+        if target_group is None:
+            raise ValueError("target_group must be a non-missing, non-empty group label")
         values = np.asarray(weights, dtype=np.float64)
         if isinstance(cell_groups, pd.Series):
-            raw_groups = cell_groups.astype("string").to_numpy()
+            raw_groups = cell_groups.to_numpy(dtype=object).tolist()
         else:
-            raw_groups = np.asarray(list(cell_groups), dtype=object)
-        groups = np.asarray([str(group) for group in raw_groups], dtype=str)
-        target = str(target_group)
+            raw_groups = list(cell_groups)
+        groups = _stringify_group_labels(raw_groups, field_name="cell_groups")
+        target = _stringify_target_group(target_group)
     if values.ndim != 1 or values.size == 0:
         raise ValueError("weights must be a non-empty one-dimensional vector")
     if groups.shape != values.shape:

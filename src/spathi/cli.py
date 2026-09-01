@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-components",
         type=_positive_int,
         default=50,
-        help="requested PCA components (safely capped to the matrix dimensions)",
+        help="requested PCA components (capped to centered-data rank, except one-cell PC1)",
     )
     infer.add_argument(
         "--distance-standardization",
@@ -241,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="single parallelism budget; -1 uses all available CPUs",
     )
     infer.add_argument(
+        "--visualize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write deterministic weight-assignment figures alongside tabular artifacts",
+    )
+    infer.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -274,6 +280,7 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         bootstrap=getattr(args, "bootstrap", None),
         random_seed=args.random_seed,
         threads=args.threads,
+        visualize=args.visualize,
     )
 
 

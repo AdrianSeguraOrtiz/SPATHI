@@ -357,6 +357,19 @@ def write_tsv(frame: pd.DataFrame, path: Path, columns: Sequence[str] | None = N
     frame.to_csv(path, sep="\t", index=False, lineterminator="\n")
 
 
+def write_tsv_gzip(
+    frame: pd.DataFrame,
+    path: Path,
+    columns: Sequence[str] | None = None,
+) -> None:
+    """Write a table as deterministic gzip-compressed TSV."""
+
+    if columns is not None:
+        frame = frame.loc[:, list(columns)]
+    with _open_reproducible_gzip_text(path) as handle:
+        frame.to_csv(handle, sep="\t", index=False, lineterminator="\n")
+
+
 def write_tsv_records(records: Iterable[Any], path: Path, columns: Sequence[str]) -> int:
     """Stream mapping-like records to a deterministic TSV with one header."""
 

@@ -14,6 +14,7 @@ from sklearn.preprocessing import StandardScaler
 DistanceSpace = Literal["pca", "expression"]
 DistanceStandardization = Literal["none", "standard"]
 PCASVDSolver = Literal["auto", "randomized", "full"]
+PCASVDSolverResolution = Literal["explicit", "delegated-to-scikit-learn"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +28,9 @@ class RepresentationResult:
     standardization: DistanceStandardization
     requested_n_components: int
     effective_n_components: int | None
+    maximum_informative_n_components: int | None
     pca_svd_solver: PCASVDSolver
-    effective_pca_svd_solver: str | None
+    pca_svd_solver_resolution: PCASVDSolverResolution | None
     explained_variance_ratio: tuple[float, ...] | None = None
     pca_degenerate: bool = False
     pca_degeneracy_reason: str | None = None
@@ -101,8 +103,10 @@ def compute_distance_representation(
     Neither this representation nor the standardized values replace the
     original expression values used by the inference models.
 
-    ``n_components`` is capped at ``min(n_cells, n_genes)``.  This safe,
-    effective value is returned for run metadata and reproducibility.
+    ``n_components`` is capped at the centered-data rank bound
+    ``min(n_genes, n_cells - 1)``. The one-cell exception retains one structural
+    component whose explained variance is diagnosed as zero, while metadata reports
+    that its informative rank bound is zero.
     """
 
     if distance_space not in {"pca", "expression"}:
@@ -133,14 +137,20 @@ def compute_distance_representation(
             standardization=distance_standardization,
             requested_n_components=int(n_components),
             effective_n_components=None,
+            maximum_informative_n_components=None,
             pca_svd_solver=pca_svd_solver,
-            effective_pca_svd_solver=None,
+            pca_svd_solver_resolution=None,
             explained_variance_ratio=None,
             pca_degenerate=False,
             pca_degeneracy_reason=None,
         )
 
-    effective = min(int(n_components), cells_by_genes.shape[0], cells_by_genes.shape[1])
+    n_cells, n_genes = cells_by_genes.shape
+    maximum_informative = min(n_genes, max(0, n_cells - 1))
+    effective = min(int(n_components), max(1, maximum_informative))
+    # Preserve scikit-learn's documented ``auto`` policy instead of copying its
+    # version-specific negotiation or reading the private ``_fit_svd_solver`` state.
+    # Dependency versions in run metadata make that delegated policy reproducible.
     pca = PCA(n_components=effective, svd_solver=pca_svd_solver, random_state=random_state)
     # scikit-learn reports an expected RuntimeWarning when total variance is
     # zero (including a one-cell matrix). Capture it and expose a structured
@@ -194,8 +204,11 @@ def compute_distance_representation(
         standardization=distance_standardization,
         requested_n_components=int(n_components),
         effective_n_components=effective,
+        maximum_informative_n_components=maximum_informative,
         pca_svd_solver=pca_svd_solver,
-        effective_pca_svd_solver=str(getattr(pca, "_fit_svd_solver", pca_svd_solver)),
+        pca_svd_solver_resolution=(
+            "delegated-to-scikit-learn" if pca_svd_solver == "auto" else "explicit"
+        ),
         explained_variance_ratio=explained,
         pca_degenerate=pca_degenerate,
         pca_degeneracy_reason=degeneracy_reason,

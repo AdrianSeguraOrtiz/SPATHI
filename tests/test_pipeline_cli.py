@@ -12,9 +12,11 @@ import pytest
 
 import spathi.inference as inference_module
 import spathi.pipeline as pipeline_module
+import spathi.visualization as visualization_module
 from spathi import SpathiConfig, infer_group_specific_grns
 
 EXPECTED_ARTIFACTS = {
+    "cell_embedding.tsv.gz",
     "cell_weights.tsv.gz",
     "centroids.tsv",
     "group_affinities.tsv",
@@ -22,13 +24,21 @@ EXPECTED_ARTIFACTS = {
     "model_diagnostics.tsv.gz",
     "network.csv",
     "parameters.json",
+    "pca_explained_variance.tsv",
     "run_metadata.json",
     "skipped_targets.tsv",
     "weight_diagnostics.tsv",
+    "visualizations",
 }
 
 
-def config_for(input_files: dict[str, Path], output_dir: Path, *, threads: int = 1) -> SpathiConfig:
+def config_for(
+    input_files: dict[str, Path],
+    output_dir: Path,
+    *,
+    threads: int = 1,
+    visualize: bool = False,
+) -> SpathiConfig:
     return SpathiConfig(
         expression=input_files["expression"],
         tf_list=input_files["tf_list"],
@@ -40,6 +50,7 @@ def config_for(input_files: dict[str, Path], output_dir: Path, *, threads: int =
         n_estimators=12,
         random_seed=91,
         threads=threads,
+        visualize=visualize,
     )
 
 
@@ -48,7 +59,7 @@ def test_public_pipeline_writes_self_contained_deterministic_run(
     tmp_path: Path, input_files: dict[str, Path]
 ) -> None:
     output_dir = tmp_path / "run"
-    result = infer_group_specific_grns(config_for(input_files, output_dir))
+    result = infer_group_specific_grns(config_for(input_files, output_dir, visualize=True))
     assert result.output_dir == output_dir
     assert {path.name for path in output_dir.iterdir()} == EXPECTED_ARTIFACTS
     assert result.total_models == 8
@@ -84,19 +95,76 @@ def test_public_pipeline_writes_self_contained_deterministic_run(
         "targets": 4,
         "transcription_factors": 2,
     }
-    assert metadata["effective_parameters"]["effective_n_components"] == 4
+    embedding = pd.read_csv(output_dir / "cell_embedding.tsv.gz", sep="\t")
+    assert embedding.columns.tolist() == ["cell", "group", "PC1", "PC2", "PC3"]
+    assert embedding["cell"].tolist() == ["cell_1", "cell_2", "cell_3", "cell_4"]
+    assert embedding["group"].tolist() == ["A", "A", "B", "B"]
+
+    explained_variance = pd.read_csv(output_dir / "pca_explained_variance.tsv", sep="\t")
+    assert explained_variance.columns.tolist() == [
+        "component",
+        "explained_variance_ratio",
+        "cumulative_explained_variance_ratio",
+    ]
+    assert explained_variance["component"].tolist() == ["PC1", "PC2", "PC3"]
+    assert explained_variance["cumulative_explained_variance_ratio"].is_monotonic_increasing
+
+    assert metadata["effective_parameters"]["effective_n_components"] == 3
+    assert metadata["effective_parameters"]["maximum_informative_n_components"] == 3
+    assert metadata["effective_parameters"]["pca_svd_solver_requested"] == "auto"
+    assert (
+        metadata["effective_parameters"]["pca_svd_solver_resolution"] == "delegated-to-scikit-learn"
+    )
+    np.testing.assert_allclose(
+        metadata["effective_parameters"]["pca_explained_variance_ratio"],
+        explained_variance["explained_variance_ratio"],
+    )
+    np.testing.assert_allclose(
+        metadata["effective_parameters"]["pca_cumulative_explained_variance_ratio"],
+        explained_variance["cumulative_explained_variance_ratio"],
+    )
     assert metadata["effective_parameters"]["tree_target_dtype"] == "float64"
     assert metadata["effective_parameters"]["tree_predictor_dtype"] == "float32"
     assert metadata["effective_parameters"]["bootstrap_requested"] is None
     assert metadata["effective_parameters"]["bootstrap_effective"] is False
     assert metadata["effective_parameters"]["targets_per_batch"] == 4
     assert metadata["memory_estimate_bytes"]["maximum_target_batch_edge_records"] == 8
+    assert (
+        metadata["memory_estimate_bytes"]["group_constant_filter_predictors_float32_upper_bound"]
+        >= 0
+    )
+    assert metadata["memory_estimate_bytes"]["visualization_retained_rough_bytes"] > 0
+    assert metadata["memory_estimate_bytes"]["visualization_panel_working_rough_bytes"] > 0
     assert metadata["memory_estimate_bytes"]["cell_centroid_distances_heap_float64"] == 64
     assert metadata["memory_estimate_bytes"]["cell_centroid_distances_mapped_float64"] == 0
+    assert metadata["effective_parameters"]["cell_centroid_distances_computed"] is True
+    assert (
+        metadata["artifact_semantics"]["group_affinities.tsv"]["authoritative_model_weights"]
+        == "cell_weights.tsv.gz:final_weight"
+    )
+    assert metadata["artifact_semantics"]["cell_embedding.tsv.gz"]["components"] == [
+        "PC1",
+        "PC2",
+        "PC3",
+    ]
     assert metadata["models"]["completed"] == 8
     assert metadata["parallelism"]["threads_requested"] == 1
     assert len(metadata["inputs"]["expression"]["sha256"]) == 64
     assert Path(metadata["inputs"]["expression"]["path"]).is_absolute()
+    assert metadata["visualizations"]["requested"] is True
+    assert metadata["visualizations"]["generated"] is True
+    manifest_path = output_dir / metadata["visualizations"]["artifacts"]["manifest"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["projection"]["kind"] == "distance-pca"
+    assert len(manifest["figures"]) == 3
+    assert {figure["kind"] for figure in manifest["figures"]} == {
+        "effective-mass-heatmap",
+        "target-weight-panel",
+    }
+    for figure in manifest["figures"]:
+        figure_path = output_dir / figure["relative_path"]
+        assert figure_path.is_file()
+        assert len(figure["sha256"]) == 64
 
 
 @pytest.mark.integration
@@ -148,7 +216,7 @@ def test_pipeline_switches_to_disk_backed_distances_above_threshold(
 
 
 @pytest.mark.integration
-def test_group_distance_streams_and_discards_cell_distance_matrix(
+def test_group_distance_does_not_compute_cell_to_centroid_distances(
     tmp_path: Path,
     input_files: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -171,11 +239,12 @@ def test_group_distance_streams_and_discards_cell_distance_matrix(
     )
     infer_group_specific_grns(config)
     metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
-    assert (
-        metadata["effective_parameters"]["cell_centroid_distance_storage"] == "streamed-discarded"
-    )
+    assert metadata["effective_parameters"]["cell_centroid_distance_storage"] == "not-computed"
+    assert metadata["effective_parameters"]["cell_centroid_distances_computed"] is False
+    assert metadata["effective_parameters"]["distance_chunk_working_memory_mib"] is None
     assert metadata["memory_estimate_bytes"]["cell_centroid_distances_heap_float64"] == 0
     assert metadata["memory_estimate_bytes"]["cell_centroid_distances_mapped_float64"] == 0
+    assert metadata["memory_estimate_bytes"]["distance_chunk_working_memory_upper_bound"] == 0
 
 
 @pytest.mark.integration
@@ -211,6 +280,76 @@ def test_prepublication_failure_leaves_requested_output_available_for_retry(
 
     assert not output_dir.exists()
     assert not list(tmp_path.glob(".retryable.staging-*"))
+
+
+@pytest.mark.integration
+def test_expression_visualization_is_auxiliary_and_respects_thread_budget(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_thread_counts: list[int] = []
+    original_prepare = visualization_module.prepare_visualization_embedding
+
+    def capture_thread_budget(*args: object, **kwargs: object):
+        from threadpoolctl import threadpool_info
+
+        observed_thread_counts.extend(
+            int(pool["num_threads"])
+            for pool in threadpool_info()
+            if pool.get("num_threads") is not None
+        )
+        return original_prepare(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        visualization_module,
+        "prepare_visualization_embedding",
+        capture_thread_budget,
+    )
+    output_dir = tmp_path / "expression-visualized"
+    base = config_for(input_files, output_dir, threads=1, visualize=True)
+    config = SpathiConfig(**{**base.to_dict(), "distance_space": "expression"})
+
+    infer_group_specific_grns(config)
+
+    assert all(thread_count == 1 for thread_count in observed_thread_counts)
+    embedding = pd.read_csv(output_dir / "cell_embedding.tsv.gz", sep="\t")
+    assert embedding.columns.tolist() == [
+        "cell",
+        "group",
+        "AuxiliaryPC1",
+        "AuxiliaryPC2",
+    ]
+    metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    semantics = metadata["artifact_semantics"]["cell_embedding.tsv.gz"]
+    assert semantics["projection_role"] == "visualization-only"
+    assert metadata["memory_estimate_bytes"]["visualization_auxiliary_pca_working_rough_bytes"] > 0
+    manifest = json.loads(
+        (output_dir / metadata["visualizations"]["artifacts"]["manifest"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["projection"]["kind"] == "auxiliary-pca"
+    assert manifest["projection"]["distance_space"] == "expression"
+
+
+@pytest.mark.integration
+def test_visualization_failure_is_atomic_and_leaves_output_retryable(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_render(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated visualization failure")
+
+    monkeypatch.setattr(visualization_module, "write_target_weight_panel", fail_render)
+    output_dir = tmp_path / "visualization-retryable"
+
+    with pytest.raises(RuntimeError, match="simulated visualization failure"):
+        infer_group_specific_grns(config_for(input_files, output_dir, visualize=True))
+
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(".visualization-retryable.staging-*"))
 
 
 @pytest.mark.integration
@@ -262,10 +401,24 @@ def test_cli_smoke_and_existing_output_failure(
         "8",
         "--threads",
         "2",
+        "--no-visualize",
     ]
     first = subprocess.run(command, check=False, capture_output=True, text=True)
     assert first.returncode == 0, first.stderr
     assert (output_dir / "network.csv").is_file()
+    assert not (output_dir / "cell_embedding.tsv.gz").exists()
+    assert not (output_dir / "pca_explained_variance.tsv").exists()
+    metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["effective_parameters"]["effective_n_components"] is None
+    assert metadata["effective_parameters"]["pca_explained_variance_ratio"] is None
+    assert metadata["artifact_semantics"]["cell_embedding.tsv.gz"] is None
+    assert metadata["visualizations"] == {
+        "artifacts": None,
+        "generated": False,
+        "requested": False,
+    }
+    assert metadata["memory_estimate_bytes"]["visualization_retained_rough_bytes"] == 0
+    assert metadata["memory_estimate_bytes"]["visualization_panel_working_rough_bytes"] == 0
     second = subprocess.run(command, check=False, capture_output=True, text=True)
     assert second.returncode == 2
     assert "will not be overwritten" in second.stderr

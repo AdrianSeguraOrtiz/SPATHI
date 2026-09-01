@@ -28,7 +28,6 @@ from spathi.distances import (
     DEFAULT_WORKING_MEMORY_MIB,
     compute_cell_to_centroid_distances,
     compute_centroid_distances,
-    iter_cell_to_centroid_distance_chunks,
 )
 from spathi.inference import prepare_inference
 from spathi.io import load_inputs
@@ -38,6 +37,7 @@ from spathi.outputs import (
     create_output_directory,
     write_json,
     write_tsv,
+    write_tsv_gzip,
     write_tsv_records,
 )
 from spathi.parallel import available_cpu_count
@@ -81,6 +81,7 @@ def _dependency_versions() -> dict[str, str]:
         "scipy": "scipy",
         "scikit_learn": "scikit-learn",
         "joblib": "joblib",
+        "matplotlib": "matplotlib",
         "threadpoolctl": "threadpoolctl",
     }
     resolved: dict[str, str] = {"python": platform.python_version(), "spathi": __version__}
@@ -215,9 +216,7 @@ def _infer_group_specific_grns_impl(
     group_ids = sorted(map(str, pd.unique(inputs.groups)))
     group_sizes = inputs.groups.astype(str).value_counts(sort=False).to_dict()
     expected_cell_distance_bytes = len(cell_names) * len(group_ids) * np.dtype(np.float64).itemsize
-    cell_distance_storage = (
-        "streamed-discarded" if config.weight_mode == "group-distance" else "memory"
-    )
+    cell_distance_storage = "not-computed" if config.weight_mode == "group-distance" else "memory"
     cell_distance_output: np.ndarray | None = None
     distance_temporary_file: Any = None
     distance_storage_finalizer: Any = None
@@ -293,19 +292,7 @@ def _infer_group_specific_grns_impl(
             centroids,
             metric=config.distance_metric,
         )
-        if config.weight_mode == "group-distance":
-            # The scientific contract still requires cell-to-centroid distances
-            # to be calculated once.  This mode never consumes the full matrix,
-            # so discard bounded chunks instead of retaining O(cells * groups).
-            for _ in iter_cell_to_centroid_distance_chunks(
-                representation,
-                centroids,
-                metric=config.distance_metric,
-                working_memory=DEFAULT_WORKING_MEMORY_MIB,
-            ):
-                pass
-            cell_distances = None
-        else:
+        if config.weight_mode != "group-distance":
             cell_distances = compute_cell_to_centroid_distances(
                 representation,
                 centroids,
@@ -313,6 +300,8 @@ def _infer_group_specific_grns_impl(
                 working_memory=DEFAULT_WORKING_MEMORY_MIB,
                 output=cell_distance_output,
             )
+        else:
+            cell_distances = None
     phase_times["prototypes_and_distances"] = perf_counter() - phase_started
 
     phase_started = perf_counter()
@@ -375,8 +364,8 @@ def _infer_group_specific_grns_impl(
         group_batch_size if target_batch_size == len(gene_names) else 1
     )
     models_per_inference_batch = target_batch_size * active_groups_per_inference_batch
-    memory_estimate["distance_chunk_working_memory_upper_bound"] = int(
-        DEFAULT_WORKING_MEMORY_MIB * 1024**2
+    memory_estimate["distance_chunk_working_memory_upper_bound"] = (
+        0 if cell_distances is None else int(DEFAULT_WORKING_MEMORY_MIB * 1024**2)
     )
     memory_estimate["maximum_target_batch_edge_records"] = int(
         models_per_inference_batch * len(tf_names)
@@ -393,6 +382,39 @@ def _infer_group_specific_grns_impl(
     memory_estimate["group_positive_masks_bool"] = int(
         len(cell_names) * group_batch_size * np.dtype(np.bool_).itemsize
     )
+    # If a group contains any constant TF among its positive-weight cells,
+    # inference caches one filtered predictor matrix for that group. This is a
+    # conservative bound: groups without constant TFs share the core matrix and
+    # a filtered matrix can never be larger than it.
+    memory_estimate["group_constant_filter_predictors_float32_upper_bound"] = int(
+        group_batch_size * prepared.predictor_nbytes
+    )
+    if config.visualize:
+        n_cells = len(cell_names)
+        n_groups = len(group_ids)
+        # Retained visualization state: 2D cell/group coordinates, stable cell
+        # hashes, group codes, one shared position index, and the group palette.
+        memory_estimate["visualization_retained_rough_bytes"] = int(
+            n_cells * (2 * 8 + 8 + 8 + 8) + n_groups * (2 * 8 + 3 * 8)
+        )
+        # Expression-space display PCA may center/copy the complete distance
+        # representation in addition to its two-component result. This is a
+        # deliberately conservative operational estimate, not a library ABI.
+        memory_estimate["visualization_auxiliary_pca_working_rough_bytes"] = int(
+            0
+            if representation.distance_space == "pca"
+            else 2 * representation.values.nbytes + n_cells * 2 * 8
+        )
+        # One panel is rendered at a time. Account approximately for tabular
+        # validation/reindexing, Matplotlib point buffers, and the Agg canvas.
+        displayed_cells = min(n_cells, 50_000)
+        memory_estimate["visualization_panel_working_rough_bytes"] = int(
+            n_cells * 256 + displayed_cells * 128 + 16 * 1024**2
+        )
+    else:
+        memory_estimate["visualization_retained_rough_bytes"] = 0
+        memory_estimate["visualization_auxiliary_pca_working_rough_bytes"] = 0
+        memory_estimate["visualization_panel_working_rough_bytes"] = 0
     concurrent_fits = min(numeric_thread_limit, models_per_inference_batch)
     concurrent_tf_targets = min(
         concurrent_fits,
@@ -413,16 +435,29 @@ def _infer_group_specific_grns_impl(
             "weight_batch_retained_float64",
             "weight_result_working_float64",
             "group_positive_masks_bool",
+            "group_constant_filter_predictors_float32_upper_bound",
             "maximum_target_batch_edge_records_rough_bytes",
             "maximum_target_batch_model_records_rough_bytes",
             "concurrent_self_exclusion_predictors_float32",
         )
     )
+    visualization_retained = memory_estimate["visualization_retained_rough_bytes"]
+    visualization_preparation_temporary = (
+        visualization_retained + memory_estimate["visualization_auxiliary_pca_working_rough_bytes"]
+    )
+    visualization_panel_temporary = (
+        visualization_retained
+        + memory_estimate["visualization_panel_working_rough_bytes"]
+        + memory_estimate["weight_batch_retained_float64"]
+        + memory_estimate["weight_result_working_float64"]
+    )
     memory_estimate["estimated_peak_heap_before_tree_storage"] = int(
         memory_estimate["estimated_heap_core_array_total"]
         + max(
             memory_estimate["distance_chunk_working_memory_upper_bound"],
-            inference_temporary,
+            inference_temporary + visualization_retained,
+            visualization_preparation_temporary,
+            visualization_panel_temporary,
         )
     )
     memory_estimate["estimated_peak_heap_with_rough_trees"] = int(
@@ -447,6 +482,32 @@ def _infer_group_specific_grns_impl(
         output_dir = working_output_dir
         if not output_dir.is_dir() or any(output_dir.iterdir()):
             raise RuntimeError("internal staging output directory must exist and be empty")
+
+    # Keep Matplotlib and its import-time cost entirely outside non-visual runs.
+    # The module exposes an incremental API, so no cells-by-groups weight table is
+    # accumulated merely to draw the figures.
+    visualization_module: Any = None
+    visualization_embedding: Any = None
+    visualization_figure_records: list[Any] = []
+    visualization_diagnostics: list[Any] = []
+    visualization_metadata: dict[str, Any] | None = None
+    visualization_seconds = 0.0
+    if config.visualize:
+        phase_started = perf_counter()
+        import spathi.visualization as visualization_module
+
+        # Auxiliary expression-space PCA must obey the same single numerical
+        # thread budget as the scientific distance representation. The context
+        # is harmless for PCA-space runs, where this call only slices PC1/PC2.
+        with threadpool_limits(limits=numeric_thread_limit):
+            visualization_embedding = visualization_module.prepare_visualization_embedding(
+                representation,
+                inputs.groups,
+                centroids,
+                random_state=config.random_seed,
+            )
+        visualization_seconds += perf_counter() - phase_started
+
     output_started = perf_counter()
     centroid_output = centroids.reset_index()
     write_tsv(centroid_output, output_dir / "centroids.tsv")
@@ -466,6 +527,92 @@ def _infer_group_specific_grns_impl(
         output_dir / "group_affinities.tsv",
         _GROUP_AFFINITY_COLUMNS,
     )
+    if representation.distance_space == "pca":
+        embedding_component_count = min(3, representation.values.shape[1])
+        embedding_components = representation.dimension_names[:embedding_component_count]
+        embedding_output = pd.DataFrame(
+            representation.values[:, :embedding_component_count],
+            columns=embedding_components,
+        )
+        embedding_output.insert(
+            0,
+            "group",
+            inputs.groups.loc[list(representation.cell_ids)].astype(str).to_numpy(copy=False),
+        )
+        embedding_output.insert(0, "cell", representation.cell_ids)
+        write_tsv_gzip(
+            embedding_output,
+            output_dir / "cell_embedding.tsv.gz",
+            ("cell", "group", *embedding_components),
+        )
+
+        if representation.explained_variance_ratio is None:
+            raise RuntimeError("PCA representation did not report explained variance")
+        explained_variance = np.asarray(
+            representation.explained_variance_ratio,
+            dtype=np.float64,
+        )
+        if explained_variance.shape != (representation.values.shape[1],):
+            raise RuntimeError("PCA explained variance does not match the fitted components")
+        variance_output = pd.DataFrame(
+            {
+                "component": representation.dimension_names,
+                "explained_variance_ratio": explained_variance,
+                "cumulative_explained_variance_ratio": np.cumsum(
+                    explained_variance,
+                    dtype=np.float64,
+                ),
+            }
+        )
+        write_tsv(
+            variance_output,
+            output_dir / "pca_explained_variance.tsv",
+            (
+                "component",
+                "explained_variance_ratio",
+                "cumulative_explained_variance_ratio",
+            ),
+        )
+    elif visualization_embedding is not None:
+        # Expression-space runs use PCA only as an explicitly auxiliary 2D view.
+        # Persist its numeric coordinates so every rendered point is auditable.
+        auxiliary_component_count = len(visualization_embedding.explained_variance_ratio)
+        auxiliary_component_names = tuple(
+            f"AuxiliaryPC{index}" for index in range(1, auxiliary_component_count + 1)
+        )
+        embedding_output = pd.DataFrame(
+            visualization_embedding.coordinates[:, :auxiliary_component_count],
+            columns=auxiliary_component_names,
+        )
+        embedding_output.insert(0, "group", visualization_embedding.cell_groups)
+        embedding_output.insert(0, "cell", visualization_embedding.cell_ids)
+        write_tsv_gzip(
+            embedding_output,
+            output_dir / "cell_embedding.tsv.gz",
+            ("cell", "group", *auxiliary_component_names),
+        )
+        auxiliary_explained = np.asarray(
+            visualization_embedding.explained_variance_ratio,
+            dtype=np.float64,
+        )
+        write_tsv(
+            pd.DataFrame(
+                {
+                    "component": auxiliary_component_names,
+                    "explained_variance_ratio": auxiliary_explained,
+                    "cumulative_explained_variance_ratio": np.cumsum(
+                        auxiliary_explained,
+                        dtype=np.float64,
+                    ),
+                }
+            ),
+            output_dir / "pca_explained_variance.tsv",
+            (
+                "component",
+                "explained_variance_ratio",
+                "cumulative_explained_variance_ratio",
+            ),
+        )
     write_json(config.to_dict(), output_dir / "parameters.json")
     phase_times["artifact_writing"] = perf_counter() - output_started
 
@@ -516,6 +663,20 @@ def _infer_group_specific_grns_impl(
                 batch_weights[target_group] = weights.final_weight
                 weighting_seconds += perf_counter() - phase_started
 
+                if visualization_embedding is not None:
+                    phase_started = perf_counter()
+                    visualization_figure_records.append(
+                        visualization_module.write_target_weight_panel(
+                            output_dir,
+                            weights,
+                            visualization_embedding,
+                            kernel=config.kernel,
+                            bandwidth=bandwidth.value,
+                        )
+                    )
+                    visualization_diagnostics.append(diagnostics)
+                    visualization_seconds += perf_counter() - phase_started
+
                 phase_started = perf_counter()
                 writer.write_weight_result(weights)
                 writer.write_weight_diagnostics(diagnostics.iter_records())
@@ -546,6 +707,27 @@ def _infer_group_specific_grns_impl(
     phase_times["weighting_and_diagnostics"] = weighting_seconds
     phase_times["model_inference"] = inference_seconds
     phase_times["artifact_writing"] += dynamic_writing_seconds
+    if visualization_embedding is not None:
+        phase_started = perf_counter()
+        visualization_figure_records.append(
+            visualization_module.write_effective_mass_heatmap(
+                output_dir,
+                visualization_diagnostics,
+                group_order=visualization_embedding.group_ids,
+            )
+        )
+        visualization_result = visualization_module.write_visualization_manifest(
+            output_dir,
+            visualization_embedding,
+            visualization_figure_records,
+            # Figure writers created these records synchronously inside the
+            # private staging directory, so size/path validation is sufficient
+            # here and avoids a second full read of every PNG.
+            verify_hashes=False,
+        )
+        visualization_metadata = visualization_result.to_metadata()
+        visualization_seconds += perf_counter() - phase_started
+    phase_times["visualization"] = visualization_seconds
     if distance_storage_finalizer is not None and distance_storage_finalizer.alive:
         distance_storage_finalizer()
 
@@ -592,11 +774,21 @@ def _infer_group_specific_grns_impl(
             "distance_space": representation.distance_space,
             "distance_standardization": representation.standardization,
             "pca_svd_solver_requested": representation.pca_svd_solver,
-            "pca_svd_solver_effective": representation.effective_pca_svd_solver,
+            "pca_svd_solver_resolution": representation.pca_svd_solver_resolution,
             "effective_n_components": representation.effective_n_components,
+            "maximum_informative_n_components": (representation.maximum_informative_n_components),
+            "pca_explained_variance_ratio": representation.explained_variance_ratio,
+            "pca_cumulative_explained_variance_ratio": (
+                None
+                if representation.explained_variance_ratio is None
+                else tuple(np.cumsum(representation.explained_variance_ratio, dtype=np.float64))
+            ),
             "distance_metric": config.distance_metric,
             "cell_centroid_distance_storage": cell_distance_storage,
-            "distance_chunk_working_memory_mib": DEFAULT_WORKING_MEMORY_MIB,
+            "cell_centroid_distances_computed": cell_distances is not None,
+            "distance_chunk_working_memory_mib": (
+                None if cell_distances is None else DEFAULT_WORKING_MEMORY_MIB
+            ),
             "bandwidth": asdict(bandwidth),
             "tree_target_dtype": prepared.expression_dtype,
             "tree_predictor_dtype": prepared.predictor_dtype,
@@ -641,6 +833,57 @@ def _infer_group_specific_grns_impl(
             "positive_edges": n_edges,
         },
         "memory_estimate_bytes": memory_estimate,
+        "artifact_semantics": {
+            "group_affinities.tsv": {
+                "scope": "group-level diagnostic",
+                "base_affinity": (
+                    "kernel affinity computed from source-to-target centroid distance; "
+                    "it is a per-cell base model weight only in group-distance mode"
+                ),
+                "group_size_factor": (
+                    "per-cell multiplicity factor for the source group relative to the target group"
+                ),
+                "authoritative_model_weights": "cell_weights.tsv.gz:final_weight",
+            },
+            "cell_embedding.tsv.gz": (
+                {
+                    "scope": "visual projection of the fitted PCA distance representation",
+                    "projection_role": "distance-space",
+                    "components": list(
+                        representation.dimension_names[: min(3, representation.values.shape[1])]
+                    ),
+                    "distance_fidelity": (
+                        "exact only when all fitted PCA components are included; otherwise this "
+                        "is a lower-dimensional view"
+                    ),
+                }
+                if representation.distance_space == "pca"
+                else (
+                    None
+                    if visualization_embedding is None
+                    else {
+                        "scope": "auxiliary PCA coordinates used only for visualization",
+                        "projection_role": "visualization-only",
+                        "components": [
+                            f"AuxiliaryPC{index}"
+                            for index in range(
+                                1,
+                                len(visualization_embedding.explained_variance_ratio) + 1,
+                            )
+                        ],
+                        "distance_fidelity": (
+                            "SPATHI weights and distances were calculated in expression space, "
+                            "not in this auxiliary projection"
+                        ),
+                    }
+                )
+            ),
+        },
+        "visualizations": {
+            "requested": config.visualize,
+            "generated": visualization_metadata is not None,
+            "artifacts": visualization_metadata,
+        },
         "dependency_versions": _dependency_versions(),
         "phase_times_seconds": phase_times,
         "warnings": warning_messages,

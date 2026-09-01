@@ -153,7 +153,9 @@ class _PreparedGroup:
     name: str
     weights: NDArray[np.float64]
     positive_mask: NDArray[np.bool_]
-    constant_tf_positions: tuple[int, ...]
+    constant_tf_positions: frozenset[int]
+    variable_tf_positions: tuple[int, ...]
+    variable_tf_expression: NDArray[np.float32]
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,13 +637,33 @@ def _prepare_groups(
                 initial=-np.inf,
             )
             constant_mask = minima == maxima
-        constant_positions = tuple(int(position) for position in np.flatnonzero(constant_mask))
+        constant_positions = frozenset(int(position) for position in np.flatnonzero(constant_mask))
+        variable_positions = tuple(
+            position
+            for position in range(tf_expression.shape[1])
+            if position not in constant_positions
+        )
+        if constant_positions:
+            # A constant-TF mask belongs to the target group, not to an
+            # individual target gene. Materialize the filtered matrix once and
+            # share it across every model for this group. Without this cache a
+            # single constant TF caused the same cells-by-TF copy to be rebuilt
+            # for every target gene.
+            variable_tf_expression = np.take(
+                tf_expression,
+                np.asarray(variable_positions, dtype=np.intp),
+                axis=1,
+            )
+        else:
+            variable_tf_expression = tf_expression
         prepared.append(
             _PreparedGroup(
                 name=group,
                 weights=weights,
                 positive_mask=np.ascontiguousarray(positive_mask),
                 constant_tf_positions=constant_positions,
+                variable_tf_positions=variable_positions,
+                variable_tf_expression=variable_tf_expression,
             )
         )
     return tuple(prepared)
@@ -715,14 +737,24 @@ def _skipped_result(
 def _fit_model_task(task: _ModelTask, context: _FitContext) -> _TaskResult:
     seed = stable_task_seed(context.global_seed, task.group.name, task.target_name)
     self_position = context.target_to_tf_position[task.target_index]
-    discarded = (context.tf_names[self_position],) if self_position is not None else ()
-    selected_positions = tuple(
+    eligible_positions = tuple(
         position for position in range(len(context.tf_names)) if position != self_position
     )
-    selected_names = tuple(context.tf_names[position] for position in selected_positions)
-    constant_set = set(task.group.constant_tf_positions)
+    constant_set = task.group.constant_tf_positions
     constant_predictors = tuple(
-        context.tf_names[position] for position in selected_positions if position in constant_set
+        context.tf_names[position] for position in eligible_positions if position in constant_set
+    )
+    selected_positions = tuple(
+        position for position in task.group.variable_tf_positions if position != self_position
+    )
+    selected_names = tuple(context.tf_names[position] for position in selected_positions)
+    discarded_positions = constant_set.intersection(eligible_positions)
+    if self_position is not None:
+        discarded_positions = discarded_positions.union((self_position,))
+    discarded = tuple(
+        context.tf_names[position]
+        for position in range(len(context.tf_names))
+        if position in discarded_positions
     )
 
     n_positive = int(np.count_nonzero(task.group.positive_mask))
@@ -752,7 +784,7 @@ def _fit_model_task(task: _ModelTask, context: _FitContext) -> _TaskResult:
             constant_predictors=constant_predictors,
         )
 
-    if not selected_positions:
+    if not eligible_positions:
         return _skipped_result(
             task,
             context,
@@ -764,31 +796,33 @@ def _fit_model_task(task: _ModelTask, context: _FitContext) -> _TaskResult:
             constant_predictors=(),
         )
 
-    if len(constant_predictors) == len(selected_positions):
+    if not selected_positions:
         return _skipped_result(
             task,
             context,
             reason="no_variable_predictors",
             detail="all eligible predictors are constant among positive-weight cells",
             seed=seed,
-            n_predictors_used=len(selected_positions),
+            n_predictors_used=0,
             discarded=discarded,
             constant_predictors=constant_predictors,
         )
 
-    if self_position is None:
-        x_model = context.tf_expression
+    if self_position is None or self_position in constant_set:
+        x_model = task.group.variable_tf_expression
     else:
-        # Only TF targets need a per-task matrix to remove self-prediction. Fill
-        # one C-contiguous allocation directly; advanced column indexing followed
-        # by ``ascontiguousarray`` would transiently allocate two full copies.
+        # Only variable TF targets need one per-task copy for self-exclusion.
+        # Fill a single C-contiguous allocation directly so no intermediate
+        # advanced-indexing array is created.
+        source = task.group.variable_tf_expression
+        self_variable_position = task.group.variable_tf_positions.index(self_position)
         x_model = np.empty(
-            (context.tf_expression.shape[0], len(selected_positions)),
+            (source.shape[0], len(selected_positions)),
             dtype=np.float32,
             order="C",
         )
-        x_model[:, :self_position] = context.tf_expression[:, :self_position]
-        x_model[:, self_position:] = context.tf_expression[:, self_position + 1 :]
+        x_model[:, :self_variable_position] = source[:, :self_variable_position]
+        x_model[:, self_variable_position:] = source[:, self_variable_position + 1 :]
 
     estimator = create_tree_estimator(
         context.tree_method,

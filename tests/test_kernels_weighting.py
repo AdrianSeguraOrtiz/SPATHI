@@ -180,3 +180,44 @@ def test_cap_to_target_is_separate_and_only_caps_larger_external_groups() -> Non
     )
     np.testing.assert_allclose(result.group_size_factor, factors)
     np.testing.assert_allclose(result.final_weight, result.base_weight * result.group_size_factor)
+
+
+@pytest.mark.parametrize("missing_group", [None, np.nan, pd.NA], ids=["none", "nan", "pd-na"])
+@pytest.mark.parametrize("use_series", [False, True], ids=["sequence", "series"])
+def test_weighting_apis_reject_missing_cell_groups_before_string_conversion(
+    missing_group: object,
+    use_series: bool,
+) -> None:
+    raw_groups = ["A", missing_group]
+    groups = pd.Series(raw_groups, index=["a", "b"]) if use_series else raw_groups
+
+    with pytest.raises(ValueError, match="cell_groups contains a missing"):
+        compute_group_size_factors(groups, "A")
+    with pytest.raises(ValueError, match="cell_groups contains a missing"):
+        compute_weights(
+            "A",
+            groups,
+            mode="cell-distance",
+            bandwidth=1.0,
+            group_size_correction="none",
+            cell_distances=np.array([0.0, 1.0]),
+        )
+
+
+@pytest.mark.parametrize("missing_target", [None, np.nan, pd.NA], ids=["none", "nan", "pd-na"])
+def test_weighting_apis_reject_missing_target_group_before_string_conversion(
+    missing_target: object,
+) -> None:
+    groups = ["A", "B"]
+
+    with pytest.raises(ValueError, match="target_group must be a non-missing"):
+        compute_group_size_factors(groups, missing_target)
+    with pytest.raises(ValueError, match="target_group must be a non-missing"):
+        compute_weights(
+            missing_target,
+            groups,
+            mode="cell-distance",
+            bandwidth=1.0,
+            group_size_correction="none",
+            cell_distances=np.array([0.0, 1.0]),
+        )

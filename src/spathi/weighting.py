@@ -112,6 +112,36 @@ def _effective_bandwidth(bandwidth: float | BandwidthSelection) -> float:
     return value
 
 
+def _is_missing_group_label(value: object) -> bool:
+    """Return whether one scalar group label represents a missing value."""
+
+    missing = pd.isna(value)
+    return bool(missing) if isinstance(missing, (bool, np.bool_)) else False
+
+
+def _stringify_group_labels(values: Sequence[object], *, field_name: str) -> np.ndarray:
+    """Validate group labels before converting them to their canonical strings."""
+
+    raw_values = list(values)
+    if any(_is_missing_group_label(value) for value in raw_values):
+        raise ValueError(f"{field_name} contains a missing or empty group")
+    labels = np.asarray([str(value) for value in raw_values], dtype=str)
+    if any(not value.strip() for value in labels):
+        raise ValueError(f"{field_name} contains a missing or empty group")
+    return labels
+
+
+def _stringify_target_group(target_group: Hashable) -> str:
+    """Validate a target-group scalar before converting it to text."""
+
+    if _is_missing_group_label(target_group):
+        raise ValueError("target_group must be a non-missing, non-empty group label")
+    target = str(target_group)
+    if not target.strip():
+        raise ValueError("target_group must be a non-missing, non-empty group label")
+    return target
+
+
 def _coerce_groups_and_cells(
     cell_groups: pd.Series | Sequence[Hashable],
     cell_ids: Sequence[str] | None,
@@ -119,7 +149,6 @@ def _coerce_groups_and_cells(
     if isinstance(cell_groups, pd.Series):
         if cell_groups.index.has_duplicates:
             raise ValueError("cell_groups has duplicate cell identifiers")
-        groups = cell_groups.astype("string").to_numpy(dtype=str)
         inferred_cells = tuple(map(str, cell_groups.index))
         if cell_ids is not None:
             requested_cells = tuple(map(str, cell_ids))
@@ -131,26 +160,25 @@ def _coerce_groups_and_cells(
                 )
             aligned = cell_groups.copy()
             aligned.index = pd.Index(inferred_cells)
-            groups = aligned.loc[list(requested_cells)].astype("string").to_numpy(dtype=str)
+            raw_groups = aligned.loc[list(requested_cells)].to_numpy(dtype=object).tolist()
             cells = requested_cells
         else:
+            raw_groups = cell_groups.to_numpy(dtype=object).tolist()
             cells = inferred_cells
     else:
         raw_groups = list(cell_groups)
-        groups = np.asarray([str(value) for value in raw_groups], dtype=object)
         cells = (
             tuple(map(str, cell_ids))
             if cell_ids is not None
-            else tuple(f"cell_{i}" for i in range(groups.size))
+            else tuple(f"cell_{i}" for i in range(len(raw_groups)))
         )
 
+    groups = _stringify_group_labels(raw_groups, field_name="cell_groups")
     if groups.ndim != 1 or groups.size == 0:
         raise ValueError("cell_groups must be a non-empty one-dimensional vector")
     if len(cells) != groups.size or len(set(cells)) != len(cells):
         raise ValueError("cell identifiers must be unique and match cell_groups")
-    if pd.isna(groups).any() or any(not str(value).strip() for value in groups):
-        raise ValueError("cell_groups contains a missing or empty group")
-    return np.asarray(groups, dtype=str), cells
+    return groups, cells
 
 
 def compute_group_size_factors(
@@ -166,11 +194,13 @@ def compute_group_size_factors(
     """
 
     validated = _validate_correction(correction)
-    if isinstance(cell_groups, pd.Series):
-        labels = cell_groups.astype("string").to_numpy(dtype=str)
-    else:
-        labels = np.asarray([str(value) for value in cell_groups], dtype=str)
-    target = str(target_group)
+    raw_groups = (
+        cell_groups.to_numpy(dtype=object).tolist()
+        if isinstance(cell_groups, pd.Series)
+        else list(cell_groups)
+    )
+    labels = _stringify_group_labels(raw_groups, field_name="cell_groups")
+    target = _stringify_target_group(target_group)
     if labels.ndim != 1 or labels.size == 0:
         raise ValueError("cell_groups must be a non-empty one-dimensional vector")
     target_count = int(np.count_nonzero(labels == target))
@@ -322,7 +352,7 @@ def compute_weights(
     correction = _validate_correction(group_size_correction)
     scale = _effective_bandwidth(bandwidth)
     labels, cells = _coerce_groups_and_cells(cell_groups, cell_ids)
-    target = str(target_group)
+    target = _stringify_target_group(target_group)
     target_mask = labels == target
     if not target_mask.any():
         raise ValueError(f"target group {target!r} has no cells")

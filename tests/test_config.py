@@ -71,6 +71,8 @@ def test_invalid_scalar_configuration_is_rejected(field: str, value: object) -> 
         ("random_seed", True),
         ("threads", 1.5),
         ("threads", False),
+        ("visualize", "yes"),
+        ("visualize", 1),
     ],
 )
 def test_wrong_runtime_types_are_rejected(field: str, value: object) -> None:
@@ -112,6 +114,7 @@ def test_configuration_serializes_paths_and_defaults() -> None:
     assert values["group_size_correction"] == "cap-to-target"
     assert values["bootstrap"] is None
     assert values["threads"] == -1
+    assert values["visualize"] is True
 
 
 def test_configuration_accepts_explicit_bootstrap_overrides() -> None:

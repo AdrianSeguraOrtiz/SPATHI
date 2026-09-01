@@ -64,3 +64,34 @@ def test_group_mass_aggregation_preserves_first_seen_group_order() -> None:
     assert list(result.group_weight_mass) == ["C", "A", "B"]
     assert result.group_weight_mass == {"C": 1.0, "A": 1.25, "B": 0.5}
     assert result.n_target_cells == 2
+
+
+@pytest.mark.parametrize("missing_group", [None, np.nan, pd.NA], ids=["none", "nan", "pd-na"])
+@pytest.mark.parametrize("use_series", [False, True], ids=["sequence", "series"])
+def test_diagnostics_reject_missing_cell_groups_before_string_conversion(
+    missing_group: object,
+    use_series: bool,
+) -> None:
+    raw_groups = ["A", missing_group]
+    groups = pd.Series(raw_groups) if use_series else raw_groups
+
+    with pytest.raises(ValueError, match="cell_groups contains a missing"):
+        compute_weight_diagnostics(
+            np.array([1.0, 0.5]),
+            groups,
+            "A",
+            emit_warnings=False,
+        )
+
+
+@pytest.mark.parametrize("missing_target", [None, np.nan, pd.NA], ids=["none", "nan", "pd-na"])
+def test_diagnostics_reject_missing_target_group_before_string_conversion(
+    missing_target: object,
+) -> None:
+    with pytest.raises(ValueError, match="target_group must be a non-missing"):
+        compute_weight_diagnostics(
+            np.array([1.0, 0.5]),
+            ["A", "B"],
+            missing_target,
+            emit_warnings=False,
+        )

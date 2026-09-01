@@ -99,6 +99,7 @@ class SpathiConfig:
     bootstrap: bool | None = None
     random_seed: int = 123
     threads: int = -1
+    visualize: bool = True
 
     def __post_init__(self) -> None:
         """Reject invalid scalar configuration before any input is read."""
@@ -166,6 +167,8 @@ class SpathiConfig:
         _validate_integer("threads", self.threads)
         if self.threads == 0 or self.threads < -1:
             raise ValueError("threads must be -1 or a positive integer")
+        if type(self.visualize) is not bool:
+            raise TypeError("visualize must be a boolean")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation of this configuration."""
