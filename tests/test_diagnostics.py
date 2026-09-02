@@ -1,8 +1,21 @@
 import numpy as np
-import pandas as pd
 import pytest
 
-from spathi.diagnostics import compute_weight_diagnostics, diagnostics_frame, effective_sample_size
+from spathi.diagnostics import compute_weight_diagnostics, effective_sample_size
+from spathi.weighting import WeightResult, prepare_weighting_context
+
+
+def diagnostic_weights(groups: list[str], weights: np.ndarray, target_group: str) -> WeightResult:
+    context = prepare_weighting_context(groups)
+    return WeightResult(
+        context=context,
+        target_group=target_group,
+        distance=np.zeros_like(weights),
+        base_weight=weights.copy(),
+        group_size_factor=np.ones_like(weights),
+        final_weight=weights,
+        mode="cell-distance",
+    )
 
 
 def test_effective_sample_size_matches_exact_formula() -> None:
@@ -12,10 +25,12 @@ def test_effective_sample_size_matches_exact_formula() -> None:
 
 
 def test_weight_diagnostics_record_mass_for_every_group() -> None:
-    groups = pd.Series(["A", "A", "B", "B", "C"])
+    groups = ["A", "A", "B", "B", "C"]
     weights = np.array([1.0, 1.0, 0.25, 0.5, 0.25])
     result = compute_weight_diagnostics(
-        weights, groups, "A", emit_warnings=False, low_ess_fraction=0.0
+        diagnostic_weights(groups, weights, "A"),
+        emit_warnings=False,
+        low_ess_fraction=0.0,
     )
     assert result.n_target_cells == 2
     assert result.total_weight == 3.0
@@ -26,9 +41,7 @@ def test_weight_diagnostics_record_mass_for_every_group() -> None:
     assert result.group_weight_mass == {"A": 2.0, "B": 0.75, "C": 0.25}
     assert result.positive_cell_count == 5
 
-    frame = diagnostics_frame([result])
-    assert frame["source_group"].tolist() == ["A", "B", "C"]
-    assert frame.loc[frame["source_group"] == "B", "source_weight"].item() == 0.75
+    assert list(result.group_weight_mass) == ["A", "B", "C"]
 
 
 def test_diagnostics_warn_for_external_dominance_and_low_ess() -> None:
@@ -36,9 +49,7 @@ def test_diagnostics_warn_for_external_dominance_and_low_ess() -> None:
     weights = np.array([0.1, 1.0, 0.0, 0.0, 0.0])
     with pytest.warns(RuntimeWarning) as emitted:
         result = compute_weight_diagnostics(
-            weights,
-            groups,
-            "A",
+            diagnostic_weights(groups, weights, "A"),
             low_ess_fraction=0.8,
             dominant_external_fraction=0.5,
         )
@@ -54,9 +65,7 @@ def test_group_mass_aggregation_preserves_first_seen_group_order() -> None:
     weights = np.array([0.25, 1.0, 0.75, 0.5, 0.25])
 
     result = compute_weight_diagnostics(
-        weights,
-        groups,
-        "A",
+        diagnostic_weights(groups, weights, "A"),
         emit_warnings=False,
         low_ess_fraction=0.0,
     )
@@ -66,32 +75,17 @@ def test_group_mass_aggregation_preserves_first_seen_group_order() -> None:
     assert result.n_target_cells == 2
 
 
-@pytest.mark.parametrize("missing_group", [None, np.nan, pd.NA], ids=["none", "nan", "pd-na"])
-@pytest.mark.parametrize("use_series", [False, True], ids=["sequence", "series"])
-def test_diagnostics_reject_missing_cell_groups_before_string_conversion(
-    missing_group: object,
-    use_series: bool,
-) -> None:
-    raw_groups = ["A", missing_group]
-    groups = pd.Series(raw_groups) if use_series else raw_groups
-
-    with pytest.raises(ValueError, match="cell_groups contains a missing"):
-        compute_weight_diagnostics(
-            np.array([1.0, 0.5]),
-            groups,
+def test_external_mass_is_summed_directly_without_cancellation() -> None:
+    tiny_external_weight = 1e-16
+    result = compute_weight_diagnostics(
+        diagnostic_weights(
+            ["A", "A", "B"],
+            np.array([1.0, 1.0, tiny_external_weight]),
             "A",
-            emit_warnings=False,
-        )
+        ),
+        emit_warnings=False,
+        low_ess_fraction=0.0,
+    )
 
-
-@pytest.mark.parametrize("missing_target", [None, np.nan, pd.NA], ids=["none", "nan", "pd-na"])
-def test_diagnostics_reject_missing_target_group_before_string_conversion(
-    missing_target: object,
-) -> None:
-    with pytest.raises(ValueError, match="target_group must be a non-missing"):
-        compute_weight_diagnostics(
-            np.array([1.0, 0.5]),
-            ["A", "B"],
-            missing_target,
-            emit_warnings=False,
-        )
+    assert result.external_weight == tiny_external_weight
+    assert result.external_mass_percent > 0.0

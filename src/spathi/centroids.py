@@ -1,16 +1,13 @@
-"""Group-prototype calculation for the SPATHI distance space."""
+"""Arithmetic group centroids in the configured SPATHI distance space."""
 
 from __future__ import annotations
 
 from collections.abc import Hashable, Sequence
-from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from .representation import RepresentationResult
-
-PrototypeMethod = Literal["mean"]
 
 
 def _coerce_representation(
@@ -102,35 +99,6 @@ def _ordered_groups(
     return labels, order
 
 
-def compute_prototypes(
-    representation: RepresentationResult | pd.DataFrame | np.ndarray,
-    groups: pd.Series | Sequence[Hashable],
-    *,
-    method: PrototypeMethod = "mean",
-    cell_ids: Sequence[str] | None = None,
-    group_order: Sequence[Hashable] | None = None,
-) -> pd.DataFrame:
-    """Compute one reusable prototype per group.
-
-    ``method`` is intentionally explicit even though the MVP implements only
-    arithmetic means.  This keeps distance and weighting code independent of
-    the prototype definition so medoids can be introduced later.
-    """
-
-    if method != "mean":
-        raise ValueError("The MVP supports only the 'mean' prototype method")
-    values, cells, dimensions = _coerce_representation(representation, cell_ids)
-    labels, order = _ordered_groups(groups, cells, group_order)
-
-    frame = pd.DataFrame(values, index=cells, columns=dimensions, copy=False)
-    centroids = frame.groupby(labels, sort=False, observed=True).mean()
-    centroids = centroids.loc[order]
-    centroids.index.name = "group"
-    if not np.isfinite(centroids.to_numpy(dtype=np.float64, copy=False)).all():
-        raise ValueError("prototype calculation produced non-finite values")
-    return centroids
-
-
 def compute_centroids(
     representation: RepresentationResult | pd.DataFrame | np.ndarray,
     groups: pd.Series | Sequence[Hashable],
@@ -138,15 +106,50 @@ def compute_centroids(
     cell_ids: Sequence[str] | None = None,
     group_order: Sequence[Hashable] | None = None,
 ) -> pd.DataFrame:
-    """Compute arithmetic-mean group centroids."""
+    """Compute one arithmetic-mean centroid per group."""
 
-    return compute_prototypes(
-        representation,
-        groups,
-        method="mean",
-        cell_ids=cell_ids,
-        group_order=group_order,
-    )
+    values, cells, dimensions = _coerce_representation(representation, cell_ids)
+    labels, order = _ordered_groups(groups, cells, group_order)
+
+    frame = pd.DataFrame(values, index=cells, columns=dimensions, copy=False)
+    grouped = frame.groupby(labels, sort=False, observed=True)
+    centroids = grouped.mean()
+    centroids = centroids.loc[order]
+    centroids.index.name = "group"
+    centroid_values = centroids.to_numpy(dtype=np.float64, copy=False)
+    if not np.isfinite(centroid_values).all():
+        # pandas' fast grouped sum can overflow before division even when the
+        # arithmetic mean is finite (for example, mean([float_max, float_max])).
+        # Recompute only this exceptional case with an online mean.  When the
+        # subtraction in the usual update overflows for opposite-sign extrema,
+        # use a convex combination whose products stay within the input range.
+        centroid_values = np.empty((len(order), values.shape[1]), dtype=np.float64)
+        for group_index, group in enumerate(order):
+            positions = grouped.indices[group]
+            mean = np.array(values[positions[0]], dtype=np.float64, copy=True)
+            for count, position in enumerate(positions[1:], start=2):
+                row = values[position]
+                with np.errstate(over="ignore", invalid="ignore"):
+                    delta = row - mean
+                regular = np.isfinite(delta)
+                mean[regular] += delta[regular] / count
+                exceptional = ~regular
+                if np.any(exceptional):
+                    previous_weight = (count - 1) / count
+                    new_weight = 1.0 / count
+                    mean[exceptional] = (
+                        mean[exceptional] * previous_weight + row[exceptional] * new_weight
+                    )
+            centroid_values[group_index] = mean
+        centroids = pd.DataFrame(
+            centroid_values,
+            index=pd.Index(order, name="group"),
+            columns=dimensions,
+            copy=False,
+        )
+    if not np.isfinite(centroid_values).all():
+        raise ValueError("centroid calculation produced non-finite values")
+    return centroids
 
 
-__all__ = ["PrototypeMethod", "compute_centroids", "compute_prototypes"]
+__all__ = ["compute_centroids"]

@@ -1,4 +1,9 @@
-from spathi.parallel import resolve_thread_budget, stable_task_seed
+from threading import get_ident
+
+import pytest
+
+import spathi.parallel as parallel_module
+from spathi.parallel import PersistentTaskExecutor, resolve_thread_budget, stable_task_seed
 
 
 def test_thread_budget_never_creates_nested_parallelism() -> None:
@@ -13,6 +18,30 @@ def test_thread_budget_never_creates_nested_parallelism() -> None:
     assert estimator_plan.parallel_level == "estimator"
 
 
+def test_thread_budget_respects_caller_supplied_outer_memory_cap() -> None:
+    capped = resolve_thread_budget(
+        8,
+        20,
+        available_threads=8,
+        max_outer_jobs=3,
+    )
+    assert capped.outer_jobs == 1
+    assert capped.model_n_jobs == 8
+    assert capped.effective_threads == 8
+    assert capped.max_outer_jobs == 3
+    assert capped.parallel_level == "estimator"
+
+    single_model = resolve_thread_budget(
+        8,
+        20,
+        available_threads=8,
+        max_outer_jobs=1,
+    )
+    assert single_model.outer_jobs == 1
+    assert single_model.model_n_jobs == 8
+    assert single_model.parallel_level == "estimator"
+
+
 def test_minus_one_resolves_to_available_cpu_capacity() -> None:
     plan = resolve_thread_budget(-1, 20, available_threads=6)
     assert plan.requested_threads == -1
@@ -24,3 +53,106 @@ def test_task_seed_depends_on_identity_not_schedule_order() -> None:
     assert first == stable_task_seed(123, "B cells", "TP53")
     assert first != stable_task_seed(123, "T cells", "TP53")
     assert first != stable_task_seed(123, "B cells", "MYC")
+
+
+def test_persistent_executor_reuses_pool_and_restores_input_order() -> None:
+    plan = resolve_thread_budget(2, 6, available_threads=2)
+
+    with PersistentTaskExecutor(plan) as executor:
+        first = executor.execute(lambda value: value * 2, [3, 1, 2])
+        second = executor.execute(lambda value: value + 10, [2, 0, 1])
+
+    assert first == [6, 2, 4]
+    assert second == [12, 10, 11]
+
+
+def test_persistent_executor_can_consume_without_collecting_results() -> None:
+    plan = resolve_thread_budget(2, 6, available_threads=2)
+    callback_threads: list[int] = []
+    observed: list[int] = []
+    caller_thread = get_ident()
+
+    def record(result: int) -> None:
+        callback_threads.append(get_ident())
+        observed.append(result)
+
+    with PersistentTaskExecutor(plan) as executor:
+        returned = executor.consume(
+            lambda value: value * 2,
+            [3, 1, 2],
+            on_result=record,
+        )
+
+    assert returned is None
+    assert sorted(observed) == [2, 4, 6]
+    assert callback_threads == [caller_thread] * 3
+
+
+def test_persistent_executor_bounds_completed_result_backlog_to_one_worker_wave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted_wave_sizes: list[int] = []
+
+    class RecordingParallel:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def __call__(self, jobs: object):
+            submitted = list(jobs)  # type: ignore[arg-type]
+            submitted_wave_sizes.append(len(submitted))
+            return (function(*args, **kwargs) for function, args, kwargs in submitted)
+
+    monkeypatch.setattr(parallel_module, "Parallel", RecordingParallel)
+    plan = resolve_thread_budget(3, 8, available_threads=3)
+    observed: list[int] = []
+
+    with PersistentTaskExecutor(plan) as executor:
+        executor.consume(lambda value: value * 2, range(8), on_result=observed.append)
+
+    assert submitted_wave_sizes == [3, 3, 2]
+    assert observed == [0, 2, 4, 6, 8, 10, 12, 14]
+
+
+def test_persistent_executor_accepts_empty_batches() -> None:
+    plan = resolve_thread_budget(2, 2, available_threads=2)
+    with PersistentTaskExecutor(plan) as executor:
+        assert executor.execute(lambda value: value, []) == []
+
+
+def test_persistent_executor_restores_thread_limits_when_pool_opening_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = resolve_thread_budget(2, 4, available_threads=2)
+    active_limits: list[int] = []
+
+    class FakeLimit:
+        def __enter__(self):
+            active_limits.append(1)
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            active_limits.pop()
+
+    class FailingParallel:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self):
+            raise RuntimeError("simulated pool failure")
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    monkeypatch.setattr(parallel_module, "threadpool_limits", lambda **kwargs: FakeLimit())
+    monkeypatch.setattr(parallel_module, "Parallel", FailingParallel)
+
+    with pytest.raises(RuntimeError, match="simulated pool failure"):
+        PersistentTaskExecutor(plan).__enter__()
+
+    assert active_limits == []

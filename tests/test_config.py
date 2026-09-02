@@ -46,6 +46,7 @@ def test_invalid_scalar_configuration_is_rejected(field: str, value: object) -> 
     ("field", "value"),
     [
         ("expression", 1),
+        ("target_list", 1),
         ("weight_mode", True),
         ("distance_space", None),
         ("n_components", 1.5),
@@ -71,8 +72,8 @@ def test_invalid_scalar_configuration_is_rejected(field: str, value: object) -> 
         ("random_seed", True),
         ("threads", 1.5),
         ("threads", False),
-        ("visualize", "yes"),
-        ("visualize", 1),
+        ("report", "yes"),
+        ("report", 1),
     ],
 )
 def test_wrong_runtime_types_are_rejected(field: str, value: object) -> None:
@@ -110,11 +111,30 @@ def test_configuration_serializes_paths_and_defaults() -> None:
     values = make_config().to_dict()
     assert values["expression"] == "expression.tsv"
     assert values["distance_space"] == "pca"
+    assert values["distance_metric"] == "cosine"
     assert values["weight_mode"] == "cell-distance-group-anchored"
     assert values["group_size_correction"] == "cap-to-target"
     assert values["bootstrap"] is None
+    assert values["n_estimators"] == 250
+    assert values["max_features"] == "sqrt"
+    assert values["target_list"] is None
+    assert values["report"] is True
     assert values["threads"] == -1
-    assert values["visualize"] is True
+
+
+def test_configuration_serializes_optional_target_list_path() -> None:
+    values = make_config(target_list=Path("targets.txt")).to_dict()
+    assert values["target_list"] == "targets.txt"
+
+
+def test_configuration_requires_explicit_keywords() -> None:
+    with pytest.raises(TypeError):
+        SpathiConfig(  # type: ignore[misc]
+            Path("expression.tsv"),
+            Path("tf_list.txt"),
+            Path("groups.tsv"),
+            Path("results"),
+        )
 
 
 def test_configuration_accepts_explicit_bootstrap_overrides() -> None:

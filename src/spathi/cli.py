@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from collections.abc import Sequence
+from dataclasses import MISSING, fields
 from math import isfinite
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+
+from rich_argparse import RichHelpFormatter
 
 from spathi._version import __version__
 from spathi.config import (
+    DEFAULT_DISTANCE_METRIC,
+    DEFAULT_MAX_FEATURES,
+    DEFAULT_N_ESTIMATORS,
     DISTANCE_METRICS,
     DISTANCE_SPACES,
     DISTANCE_STANDARDIZATIONS,
@@ -25,8 +30,29 @@ from spathi.config import (
     MaxFeatures,
     SpathiConfig,
 )
+from spathi.console import InferenceProgress, configure_logging, create_console, print_banner
 
-LOGGER = logging.getLogger("spathi")
+_CONFIG_DEFAULTS = {
+    field.name: field.default for field in fields(SpathiConfig) if field.default is not MISSING
+}
+
+
+def _config_default(field_name: str) -> Any:
+    """Return a scientific default from the canonical core configuration."""
+
+    try:
+        return _CONFIG_DEFAULTS[field_name]
+    except KeyError as exc:  # pragma: no cover - import-time developer error
+        raise RuntimeError(f"SpathiConfig has no default for {field_name!r}") from exc
+
+
+class _HelpFormatter(RichHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Render colored terminal help while retaining explicit default values."""
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        if action.required or action.default is None:
+            return action.help or ""
+        return super()._get_help_string(action) or ""
 
 
 def _positive_int(value: str) -> int:
@@ -90,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Infer group-specific gene-regulatory networks with transcriptomic similarity weights."
         ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=_HelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"SPATHI {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -102,121 +128,145 @@ def build_parser() -> argparse.ArgumentParser:
             "Validate ANDREA-compatible inputs and infer one similarity-weighted "
             "regulatory network per cell group."
         ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=_HelpFormatter,
     )
-    infer.add_argument(
+    inputs = infer.add_argument_group("Inputs and outputs")
+    weighting = infer.add_argument_group("Weighting and distance")
+    model = infer.add_argument_group("Regulatory model")
+    execution = infer.add_argument_group("Execution")
+
+    inputs.add_argument(
         "--expression",
         required=True,
         type=Path,
         help="genes-by-cells expression matrix in ANDREA-compatible TSV format",
     )
-    infer.add_argument(
+    inputs.add_argument(
         "--tf-list",
         required=True,
         type=Path,
         help="plain-text file containing one transcription-factor identifier per line",
     )
-    infer.add_argument(
+    inputs.add_argument(
+        "--target-list",
+        type=Path,
+        help=(
+            "optional plain-text file containing one target-gene identifier per line; "
+            "all expression genes are targets when omitted"
+        ),
+    )
+    inputs.add_argument(
         "--groups",
         required=True,
         type=Path,
         help="ANDREA-compatible TSV assigning every expression cell to a cluster",
     )
-    infer.add_argument(
+    inputs.add_argument(
         "--output-dir",
         required=True,
         type=Path,
         help="new directory for run artifacts; existing paths are never overwritten",
     )
-    infer.add_argument(
+    execution.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume exact completed models from the output directory's hidden checkpoint",
+    )
+    execution.add_argument(
+        "--checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="transactionally checkpoint each completed model for interruption-safe resume",
+    )
+    weighting.add_argument(
         "--weight-mode",
         choices=WEIGHT_MODES,
-        default="cell-distance-group-anchored",
+        default=_config_default("weight_mode"),
         help="observation-weight construction used for each target group",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--distance-space",
         choices=DISTANCE_SPACES,
-        default="pca",
+        default=_config_default("distance_space"),
         help="representation used only for centroids and distances",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--n-components",
         type=_positive_int,
-        default=50,
+        default=_config_default("n_components"),
         help="requested PCA components (capped to centered-data rank, except one-cell PC1)",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--distance-standardization",
         choices=DISTANCE_STANDARDIZATIONS,
-        default="none",
+        default=_config_default("distance_standardization"),
         help="whether to standardize genes before constructing the distance space",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--pca-svd-solver",
         choices=PCA_SVD_SOLVERS,
-        default="auto",
+        default=_config_default("pca_svd_solver"),
         help="SVD solver requested from scikit-learn PCA",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--distance-metric",
         choices=DISTANCE_METRICS,
-        default="euclidean",
+        default=DEFAULT_DISTANCE_METRIC,
         help="metric for cell-to-centroid and centroid-to-centroid distances",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--kernel",
         choices=KERNEL_NAMES,
-        default="gaussian",
+        default=_config_default("kernel"),
         help="kernel that transforms distances into affinities",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--bandwidth",
         type=_bandwidth,
-        default="auto",
+        default=_config_default("bandwidth"),
         help="global positive kernel bandwidth or median-based automatic selection",
     )
-    infer.add_argument(
+    weighting.add_argument(
         "--group-size-correction",
         choices=GROUP_SIZE_CORRECTIONS,
-        default="cap-to-target",
+        default=_config_default("group_size_correction"),
         help="optional correction that caps external groups to the target-group size",
     )
-    infer.add_argument(
+    model.add_argument(
         "--tree-method",
         choices=TREE_METHODS,
-        default="extra-trees",
+        default=_config_default("tree_method"),
         help="weighted tree ensemble used for each target gene",
     )
-    infer.add_argument(
+    model.add_argument(
         "--n-estimators",
         type=_positive_int,
-        default=500,
+        default=DEFAULT_N_ESTIMATORS,
         help="number of trees in every fitted ensemble",
     )
-    infer.add_argument(
+    model.add_argument(
         "--max-features",
         type=_max_features,
-        default=1.0,
+        default=DEFAULT_MAX_FEATURES,
         metavar="{sqrt,log2,INT,FRACTION}",
         help=(
             "predictors considered per split: '1' means exactly one predictor, while "
             "'1.0' means 100%% of predictors"
         ),
     )
-    infer.add_argument(
+    model.add_argument(
         "--min-samples-leaf",
         type=_positive_int,
-        default=1,
+        default=_config_default("min_samples_leaf"),
         help="minimum number of samples required in each tree leaf",
     )
-    infer.add_argument(
+    model.add_argument(
         "--max-depth",
         type=_positive_int,
         default=argparse.SUPPRESS,
         help="maximum tree depth; omit for unbounded depth",
     )
-    infer.add_argument(
+    model.add_argument(
         "--bootstrap",
         action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,
@@ -225,28 +275,37 @@ def build_parser() -> argparse.ArgumentParser:
             "and Random Forest enables it"
         ),
     )
-    infer.add_argument(
+    model.add_argument(
         "--random-seed",
         type=_random_seed,
-        default=123,
+        default=_config_default("random_seed"),
         help=(
             "global seed in scikit-learn's unsigned 32-bit range, used to derive "
             "deterministic model seeds"
         ),
     )
-    infer.add_argument(
+    execution.add_argument(
         "--threads",
         type=_threads,
-        default=-1,
+        default=_config_default("threads"),
         help="single parallelism budget; -1 uses all available CPUs",
     )
-    infer.add_argument(
-        "--visualize",
+    execution.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=_config_default("report"),
+        help="write one self-contained interactive HTML report alongside tabular artifacts",
+    )
+    execution.add_argument(
+        "--progress",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="write deterministic weight-assignment figures alongside tabular artifacts",
+        help=(
+            "show an interactive progress bar on terminals and periodic progress logs "
+            "when redirected"
+        ),
     )
-    infer.add_argument(
+    execution.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -263,6 +322,7 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         tf_list=args.tf_list,
         groups=args.groups,
         output_dir=args.output_dir,
+        target_list=args.target_list,
         weight_mode=args.weight_mode,
         distance_space=args.distance_space,
         n_components=args.n_components,
@@ -280,29 +340,49 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         bootstrap=getattr(args, "bootstrap", None),
         random_seed=args.random_seed,
         threads=args.threads,
-        visualize=args.visualize,
+        report=args.report,
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the SPATHI command line and return a process exit code."""
 
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    console = create_console()
+    if "--version" not in cli_args:
+        print_banner(console)
     parser = build_parser()
-    args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    args = parser.parse_args(cli_args)
+    logger = configure_logging(console, args.log_level)
 
     if args.command == "infer":
         try:
-            from spathi.pipeline import infer_group_specific_grns
+            from spathi.core import infer
 
-            result = infer_group_specific_grns(config_from_args(args))
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            LOGGER.error("%s", exc)
+            with InferenceProgress(
+                console=console,
+                logger=logger,
+                enabled=args.progress,
+            ) as progress:
+                result = infer(
+                    config_from_args(args),
+                    progress_callback=progress.callback,
+                    resume=args.resume,
+                    checkpoint=args.checkpoint,
+                )
+        except KeyboardInterrupt:
+            if args.checkpoint:
+                logger.warning(
+                    "Interrupted by user; rerun with --resume if completed models were checkpointed."
+                )
+            else:
+                logger.warning("Interrupted by user.")
+            return 130
+        except (MemoryError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.error("Inference failed | %s", exc)
+            logger.debug("Inference failure details", exc_info=True)
             return 2
-        LOGGER.info("Completed SPATHI run: %s", result.output_dir)
+        logger.info("Run complete | output=%s | edges=%s", result.output_dir, result.n_edges)
         return 0
 
     parser.error(f"unknown command: {args.command}")

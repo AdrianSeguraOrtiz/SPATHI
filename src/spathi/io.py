@@ -1,4 +1,4 @@
-"""Strict readers for the three ANDREA-compatible SPATHI inputs.
+"""Strict readers for ANDREA-compatible SPATHI inputs and target selection.
 
 The expression matrix is deliberately kept in its on-disk orientation (genes by
 cells).  Downstream code can therefore distinguish the inference matrix from the
@@ -12,7 +12,7 @@ import io
 import os
 from collections import Counter
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from hashlib import sha256
 from os import PathLike
 from pathlib import Path
@@ -29,7 +29,7 @@ class InputValidationError(ValueError):
     """Raised when an input file does not satisfy the SPATHI input contract."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InputData:
     """Validated SPATHI input data.
 
@@ -39,6 +39,9 @@ class InputData:
         Numeric expression matrix with genes in rows and cells in columns.
     transcription_factors:
         TF identifiers, in the same order as the TF-list file.
+    targets:
+        Expression genes selected as inference targets. When no target-list file
+        is supplied, this contains every expression gene in matrix order.
     groups:
         Cell-to-group mapping, reordered to match the expression columns.
     input_fingerprints:
@@ -47,14 +50,9 @@ class InputData:
 
     expression: pd.DataFrame
     transcription_factors: tuple[str, ...]
+    targets: tuple[str, ...]
     groups: pd.Series
-    input_fingerprints: Mapping[str, InputFingerprint] = field(default_factory=dict)
-
-    @property
-    def tf_list(self) -> tuple[str, ...]:
-        """Alias retained for callers that use the input-file terminology."""
-
-        return self.transcription_factors
+    input_fingerprints: Mapping[str, InputFingerprint]
 
 
 _EXPRESSION_FIRST_COLUMN_DISALLOWED_NAMES = {
@@ -372,41 +370,37 @@ def _read_expression_matrix_with_fingerprint(
     return expression, fingerprint
 
 
-def read_expression_matrix(path: Pathish) -> pd.DataFrame:
-    """Read and validate a genes-by-cells expression TSV as ``float64``.
-
-    Parsing is two-pass and memory-bounded with respect to textual values: the
-    first pass validates identifiers and shape, and the second fills one exact
-    numeric array. Orientation is never inferred or corrected automatically.
-    """
-
-    expression, _ = _read_expression_matrix_with_fingerprint(path)
-    return expression
-
-
-def _validate_tf_membership(tf_ids: Sequence[str], expression_genes: Collection[str]) -> None:
+def _validate_gene_membership(
+    identifiers: Sequence[str],
+    expression_genes: Collection[str],
+    *,
+    description: str,
+) -> None:
     genes = set(expression_genes)
-    missing = [tf for tf in tf_ids if tf not in genes]
+    missing = [identifier for identifier in identifiers if identifier not in genes]
     if missing:
         raise InputValidationError(
-            "TF identifiers absent from the expression matrix: " + _format_items(missing)
+            f"{description} identifiers absent from the expression matrix: "
+            + _format_items(missing)
         )
 
 
-def _read_tf_list_with_fingerprint(
+def _read_gene_list_with_fingerprint(
     path: Pathish,
-    expression_genes: Collection[str] | None = None,
+    *,
+    description: str,
+    identifier_kind: str,
+    expression_genes: Collection[str] | None,
 ) -> tuple[list[str], InputFingerprint]:
-    """Read a one-identifier-per-line TF list and validate exact membership.
+    """Read a strict one-gene-per-line list and validate exact membership.
 
     Blank lines (including whitespace-only lines), duplicate identifiers, and
     multi-field tab-separated lines are rejected.  When ``expression_genes`` is
-    supplied, every TF must occur in that collection.
+    supplied, every listed gene must occur in that collection.
     """
 
-    description = "TF list"
     file_path = _validated_input_path(path, description=description)
-    tf_ids: list[str] = []
+    identifiers: list[str] = []
     try:
         with file_path.open("rb") as handle:
             initial_stat = os.fstat(handle.fileno())
@@ -417,15 +411,19 @@ def _read_tf_list_with_fingerprint(
                     value = value[:-1]
                 if not value.strip():
                     raise InputValidationError(
-                        f"TF list contains an empty line at line {line_number}"
+                        f"{description} contains an empty line at line {line_number}"
                     )
                 if "\t" in value:
                     raise InputValidationError(
-                        f"TF list line {line_number} contains multiple tab-separated fields; "
+                        f"{description} line {line_number} contains multiple tab-separated fields; "
                         "provide exactly one identifier per line"
                     )
-                tf_ids.append(
-                    _validate_identifier(value, kind="TF", location=f"line {line_number}")
+                identifiers.append(
+                    _validate_identifier(
+                        value,
+                        kind=identifier_kind,
+                        location=f"line {line_number}",
+                    )
                 )
             fingerprint = _finish_fingerprint(
                 file_path,
@@ -435,28 +433,46 @@ def _read_tf_list_with_fingerprint(
                 description=description,
             )
     except UnicodeDecodeError as exc:
-        raise InputValidationError(f"TF list must be UTF-8 text: {file_path}") from exc
+        raise InputValidationError(f"{description} must be UTF-8 text: {file_path}") from exc
 
-    duplicates = sorted(value for value, count in Counter(tf_ids).items() if count > 1)
+    duplicates = sorted(value for value, count in Counter(identifiers).items() if count > 1)
     if duplicates:
         raise InputValidationError(
-            f"TF list contains duplicate identifiers: {_format_items(duplicates)}"
+            f"{description} contains duplicate identifiers: {_format_items(duplicates)}"
         )
-    if not tf_ids:
-        raise InputValidationError("TF list is empty after validation")
+    if not identifiers:
+        raise InputValidationError(f"{description} is empty after validation")
     if expression_genes is not None:
-        _validate_tf_membership(tf_ids, expression_genes)
-    return tf_ids, fingerprint
+        _validate_gene_membership(
+            identifiers,
+            expression_genes,
+            description=description,
+        )
+    return identifiers, fingerprint
 
 
-def read_tf_list(
+def _read_tf_list_with_fingerprint(
     path: Pathish,
     expression_genes: Collection[str] | None = None,
-) -> list[str]:
-    """Read a one-identifier-per-line TF list and validate exact membership."""
+) -> tuple[list[str], InputFingerprint]:
+    return _read_gene_list_with_fingerprint(
+        path,
+        description="TF list",
+        identifier_kind="TF",
+        expression_genes=expression_genes,
+    )
 
-    tf_ids, _ = _read_tf_list_with_fingerprint(path, expression_genes)
-    return tf_ids
+
+def _read_target_list_with_fingerprint(
+    path: Pathish,
+    expression_genes: Collection[str] | None = None,
+) -> tuple[list[str], InputFingerprint]:
+    return _read_gene_list_with_fingerprint(
+        path,
+        description="Target list",
+        identifier_kind="target",
+        expression_genes=expression_genes,
+    )
 
 
 def _validate_group_coverage(groups: pd.Series, expression_cells: Sequence[str]) -> pd.Series:
@@ -563,16 +579,6 @@ def _read_groups_with_fingerprint(
     return groups, fingerprint
 
 
-def read_groups(
-    path: Pathish,
-    expression_cells: Sequence[str] | None = None,
-) -> pd.Series:
-    """Read an ANDREA-compatible groups TSV with exact cell coverage."""
-
-    groups, _ = _read_groups_with_fingerprint(path, expression_cells)
-    return groups
-
-
 def _check_joint_orientation(
     expression: pd.DataFrame,
     transcription_factors: Sequence[str],
@@ -594,7 +600,12 @@ def _check_joint_orientation(
         )
 
 
-def load_inputs(expression: Pathish, tf_list: Pathish, groups: Pathish) -> InputData:
+def load_inputs(
+    expression: Pathish,
+    tf_list: Pathish,
+    groups: Pathish,
+    target_list: Pathish | None = None,
+) -> InputData:
     """Load all inputs and enforce their joint identifier contracts.
 
     Joint validation provides a stronger rejection of inverse expression
@@ -605,32 +616,34 @@ def load_inputs(expression: Pathish, tf_list: Pathish, groups: Pathish) -> Input
     tf_ids, tf_fingerprint = _read_tf_list_with_fingerprint(tf_list)
     group_series, groups_fingerprint = _read_groups_with_fingerprint(groups)
     _check_joint_orientation(expression_frame, tf_ids, group_series)
-    _validate_tf_membership(tf_ids, expression_frame.index)
+    _validate_gene_membership(tf_ids, expression_frame.index, description="TF list")
+    if target_list is None:
+        target_ids = list(map(str, expression_frame.index))
+        target_fingerprint = None
+    else:
+        target_ids, target_fingerprint = _read_target_list_with_fingerprint(
+            target_list,
+            expression_frame.index,
+        )
     group_series = _validate_group_coverage(group_series, list(expression_frame.columns))
+    fingerprints = {
+        "expression": expression_fingerprint,
+        "tf_list": tf_fingerprint,
+        "groups": groups_fingerprint,
+    }
+    if target_fingerprint is not None:
+        fingerprints["target_list"] = target_fingerprint
     return InputData(
         expression=expression_frame,
         transcription_factors=tuple(tf_ids),
+        targets=tuple(target_ids),
         groups=group_series,
-        input_fingerprints={
-            "expression": expression_fingerprint,
-            "tf_list": tf_fingerprint,
-            "groups": groups_fingerprint,
-        },
+        input_fingerprints=fingerprints,
     )
-
-
-# Compact aliases that read naturally in both notebooks and pipeline code.
-read_expression = read_expression_matrix
-load_and_validate_inputs = load_inputs
 
 
 __all__ = [
     "InputData",
     "InputValidationError",
-    "load_and_validate_inputs",
     "load_inputs",
-    "read_expression",
-    "read_expression_matrix",
-    "read_groups",
-    "read_tf_list",
 ]

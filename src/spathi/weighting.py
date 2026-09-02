@@ -4,22 +4,73 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 import pandas as pd
 
+from .config import GroupSizeCorrection, WeightMode
 from .kernels import BandwidthSelection, apply_kernel
-
-WeightMode = Literal["cell-distance", "cell-distance-group-anchored", "group-distance"]
-GroupSizeCorrection = Literal["none", "cap-to-target"]
 
 
 class DegenerateWeightsError(ValueError):
     """Raised when no positive sample weight remains for model fitting."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WeightingContext:
+    """Validated cell/group structure shared by every target group in a run."""
+
+    cells: tuple[str, ...]
+    cell_groups: tuple[str, ...]
+    group_ids: tuple[str, ...]
+    group_codes: np.ndarray
+    group_counts: np.ndarray
+
+    def __post_init__(self) -> None:
+        n_cells = len(self.cells)
+        n_groups = len(self.group_ids)
+        if n_cells == 0 or len(self.cell_groups) != n_cells:
+            raise ValueError("weighting context must contain aligned, non-empty cells and groups")
+        if any(
+            not isinstance(cell, str) or not cell.strip() or cell != cell.strip()
+            for cell in self.cells
+        ):
+            raise ValueError("weighting context cell identifiers must be non-empty trimmed strings")
+        if len(set(self.cells)) != n_cells:
+            raise ValueError("weighting context cell identifiers must be unique")
+        if (
+            n_groups == 0
+            or any(
+                not isinstance(group, str) or not group.strip() or group != group.strip()
+                for group in self.group_ids
+            )
+            or len(set(self.group_ids)) != n_groups
+        ):
+            raise ValueError("weighting context group identifiers must be unique and non-empty")
+        codes = np.asarray(self.group_codes, dtype=np.intp)
+        counts = np.asarray(self.group_counts, dtype=np.int64)
+        if codes.shape != (n_cells,) or counts.shape != (n_groups,):
+            raise ValueError("weighting context codes and counts do not match its identifiers")
+        if np.any(codes < 0) or np.any(codes >= n_groups):
+            raise ValueError("weighting context contains an invalid group code")
+        if np.any(counts <= 0) or not np.array_equal(
+            counts, np.bincount(codes, minlength=n_groups)
+        ):
+            raise ValueError("weighting context group counts are inconsistent with its codes")
+        canonical_groups = tuple(self.group_ids[int(code)] for code in codes)
+        if canonical_groups != self.cell_groups:
+            raise ValueError("weighting context group labels are inconsistent with its codes")
+        # Defensive private copies make the frozen context truly immutable even
+        # when a caller retains references to arrays supplied to the constructor.
+        codes = codes.copy()
+        counts = counts.copy()
+        codes.setflags(write=False)
+        counts.setflags(write=False)
+        object.__setattr__(self, "group_codes", codes)
+        object.__setattr__(self, "group_counts", counts)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WeightResult:
     """All interpretable stages of one target group's sample weights.
 
@@ -30,9 +81,8 @@ class WeightResult:
     anchored exactly at one.
     """
 
+    context: WeightingContext
     target_group: str
-    cells: tuple[str, ...]
-    cell_groups: tuple[str, ...]
     distance: np.ndarray
     base_weight: np.ndarray
     group_size_factor: np.ndarray
@@ -41,55 +91,37 @@ class WeightResult:
     normalization_factor: float = 1.0
 
     def __post_init__(self) -> None:
-        lengths = {
-            len(self.cells),
-            len(self.cell_groups),
-            self.distance.size,
-            self.base_weight.size,
-            self.group_size_factor.size,
-            self.final_weight.size,
+        expected_shape = (len(self.context.cells),)
+        vectors = {
+            "distance": self.distance,
+            "base_weight": self.base_weight,
+            "group_size_factor": self.group_size_factor,
+            "final_weight": self.final_weight,
         }
-        if len(lengths) != 1:
-            raise ValueError("all WeightResult vectors must have the same length")
+        invalid_shapes = {
+            name: np.asarray(values).shape
+            for name, values in vectors.items()
+            if np.asarray(values).shape != expected_shape
+        }
+        if invalid_shapes:
+            raise ValueError(
+                f"all WeightResult vectors must have shape {expected_shape!r}; "
+                f"received {invalid_shapes!r}"
+            )
+        if self.target_group not in self.context.group_ids:
+            raise ValueError(f"target group {self.target_group!r} has no cells")
 
     @property
-    def distances(self) -> np.ndarray:
-        """Plural alias for :attr:`distance`."""
+    def cells(self) -> tuple[str, ...]:
+        """Cell identifiers shared by every target-group result in the run."""
 
-        return self.distance
-
-    @property
-    def base_weights(self) -> np.ndarray:
-        """Plural alias for :attr:`base_weight`."""
-
-        return self.base_weight
+        return self.context.cells
 
     @property
-    def group_size_factors(self) -> np.ndarray:
-        """Plural alias for :attr:`group_size_factor`."""
+    def cell_groups(self) -> tuple[str, ...]:
+        """Canonical group label for each cell in :attr:`cells`."""
 
-        return self.group_size_factor
-
-    @property
-    def final_weights(self) -> np.ndarray:
-        """Plural alias for :attr:`final_weight`."""
-
-        return self.final_weight
-
-    def to_frame(self) -> pd.DataFrame:
-        """Return the exact long-form fields required by ``cell_weights.tsv.gz``."""
-
-        return pd.DataFrame(
-            {
-                "target_group": self.target_group,
-                "cell": self.cells,
-                "cell_group": self.cell_groups,
-                "distance": self.distance,
-                "base_weight": self.base_weight,
-                "group_size_factor": self.group_size_factor,
-                "final_weight": self.final_weight,
-            }
-        )
+        return self.context.cell_groups
 
 
 def _validate_mode(mode: str) -> WeightMode:
@@ -181,11 +213,31 @@ def _coerce_groups_and_cells(
     return groups, cells
 
 
-def compute_group_size_factors(
+def prepare_weighting_context(
     cell_groups: pd.Series | Sequence[Hashable],
-    target_group: Hashable,
     *,
-    correction: GroupSizeCorrection = "cap-to-target",
+    cell_ids: Sequence[str] | None = None,
+) -> WeightingContext:
+    """Validate and encode the cell/group structure once for the complete run."""
+
+    labels, cells = _coerce_groups_and_cells(cell_groups, cell_ids)
+    codes, unique_groups = pd.factorize(labels, sort=False)
+    group_ids = tuple(str(group) for group in unique_groups.tolist())
+    counts = np.bincount(codes, minlength=len(group_ids))
+    return WeightingContext(
+        cells=cells,
+        cell_groups=tuple(labels.tolist()),
+        group_ids=group_ids,
+        group_codes=codes,
+        group_counts=counts,
+    )
+
+
+def _compute_group_size_factors(
+    context: WeightingContext,
+    target_index: int,
+    *,
+    correction: GroupSizeCorrection,
 ) -> np.ndarray:
     r"""Return per-cell factors ``min(1, n_target / n_source)``.
 
@@ -193,27 +245,14 @@ def compute_group_size_factors(
     ones and is therefore a true no-correction path in all three modes.
     """
 
-    validated = _validate_correction(correction)
-    raw_groups = (
-        cell_groups.to_numpy(dtype=object).tolist()
-        if isinstance(cell_groups, pd.Series)
-        else list(cell_groups)
-    )
-    labels = _stringify_group_labels(raw_groups, field_name="cell_groups")
-    target = _stringify_target_group(target_group)
-    if labels.ndim != 1 or labels.size == 0:
-        raise ValueError("cell_groups must be a non-empty one-dimensional vector")
-    target_count = int(np.count_nonzero(labels == target))
-    if target_count == 0:
-        raise ValueError(f"target group {target!r} has no cells")
-    factors = np.ones(labels.size, dtype=np.float64)
-    if validated == "none":
+    factors = np.ones(len(context.cells), dtype=np.float64)
+    if correction == "none":
         return factors
 
-    unique, inverse, counts = np.unique(labels, return_inverse=True, return_counts=True)
-    per_group = np.minimum(1.0, target_count / counts.astype(np.float64))
-    per_group[unique == target] = 1.0
-    factors[:] = per_group[inverse]
+    target_count = int(context.group_counts[target_index])
+    per_group = np.minimum(1.0, target_count / context.group_counts.astype(np.float64))
+    per_group[target_index] = 1.0
+    factors[:] = per_group[context.group_codes]
     return factors
 
 
@@ -237,7 +276,7 @@ def _coerce_cell_distances(
         if set(frame.index) != set(cells):
             raise ValueError("cell distance matrix must cover exactly the weighted cells")
         if tuple(frame.index) == cells:
-            # The pipeline already stores rows in expression-cell order. Preserve the
+            # The core already stores rows in expression-cell order. Preserve the
             # contiguous column view (notably for a Fortran-order memmap) instead of
             # invoking label-based fancy indexing and copying it unnecessarily.
             values = frame[target_group].to_numpy(dtype=np.float64, copy=False)
@@ -264,8 +303,6 @@ def _coerce_cell_distances(
             raise ValueError("cell distances must be a vector or cell-by-group matrix")
     if values.shape != (len(cells),):
         raise ValueError("cell distance vector length does not match cell_groups")
-    if not np.isfinite(values).all() or np.any(values < 0):
-        raise ValueError("cell distances must be finite and non-negative")
     return np.asarray(values, dtype=np.float64)
 
 
@@ -320,15 +357,12 @@ def _coerce_group_distance_map(
     missing = [group for group in observed_groups if group not in mapping]
     if missing:
         raise ValueError(f"centroid distances are missing observed groups: {missing!r}")
-    used = np.asarray([mapping[group] for group in observed_groups], dtype=np.float64)
-    if not np.isfinite(used).all() or np.any(used < 0):
-        raise ValueError("centroid distances must be finite and non-negative")
     return mapping
 
 
 def compute_weights(
     target_group: Hashable,
-    cell_groups: pd.Series | Sequence[Hashable],
+    context: WeightingContext,
     *,
     mode: WeightMode,
     bandwidth: float | BandwidthSelection,
@@ -338,10 +372,8 @@ def compute_weights(
     group_distances: (
         pd.DataFrame | pd.Series | Mapping[Hashable, float] | np.ndarray | Sequence[float] | None
     ) = None,
-    cell_ids: Sequence[str] | None = None,
-    group_ids: Sequence[str] | None = None,
 ) -> WeightResult:
-    """Compute one target group's sample weights according to an exact MVP mode.
+    """Compute one target group's sample weights according to the selected mode.
 
     Parameters named ``cell_distances`` and ``group_distances`` may be either a
     target-specific vector or a labelled full matrix.  This allows one global
@@ -351,41 +383,39 @@ def compute_weights(
     validated_mode = _validate_mode(mode)
     correction = _validate_correction(group_size_correction)
     scale = _effective_bandwidth(bandwidth)
-    labels, cells = _coerce_groups_and_cells(cell_groups, cell_ids)
     target = _stringify_target_group(target_group)
-    target_mask = labels == target
-    if not target_mask.any():
-        raise ValueError(f"target group {target!r} has no cells")
+    cells = context.cells
+    try:
+        target_index = context.group_ids.index(target)
+    except ValueError:
+        raise ValueError(f"target group {target!r} has no cells") from None
+    target_mask = context.group_codes == target_index
 
-    factors = compute_group_size_factors(labels, target, correction=correction)
+    factors = _compute_group_size_factors(context, target_index, correction=correction)
     if validated_mode in {"cell-distance", "cell-distance-group-anchored"}:
         used_distances = _coerce_cell_distances(
             cell_distances,
             target_group=target,
             cells=cells,
-            group_ids=group_ids,
+            group_ids=context.group_ids,
         )
         base = apply_kernel(used_distances, scale, kernel=kernel)
         if validated_mode == "cell-distance-group-anchored":
             base[target_mask] = 1.0
     else:
-        observed_groups = list(dict.fromkeys(labels.tolist()))
+        observed_groups = list(context.group_ids)
         distance_map = _coerce_group_distance_map(
             group_distances,
             target_group=target,
             observed_groups=observed_groups,
-            group_ids=group_ids,
+            group_ids=context.group_ids,
         )
-        distance_groups = tuple(distance_map)
-        group_positions = pd.Index(distance_groups).get_indexer(labels)
-        if np.any(group_positions < 0):  # guarded by _coerce_group_distance_map
-            raise AssertionError("validated group distances lost an observed group")
         distance_values = np.fromiter(
-            (distance_map[group] for group in distance_groups),
+            (distance_map[group] for group in context.group_ids),
             dtype=np.float64,
-            count=len(distance_groups),
+            count=len(context.group_ids),
         )
-        used_distances = np.take(distance_values, group_positions)
+        used_distances = np.take(distance_values, context.group_codes)
         base = apply_kernel(used_distances, scale, kernel=kernel)
         base[target_mask] = 1.0
 
@@ -407,26 +437,18 @@ def compute_weights(
     else:
         final = corrected
 
-    for name, values in (
-        ("base weights", base),
-        ("group-size factors", factors),
-        ("final weights", final),
-    ):
-        if not np.isfinite(values).all() or np.any(values < 0) or np.any(values > 1 + 1e-12):
-            raise ValueError(f"{name} violate the finite [0, 1] weight contract")
-    base = np.clip(base, 0.0, 1.0)
-    factors = np.clip(factors, 0.0, 1.0)
-    final = np.clip(final, 0.0, 1.0)
+    if not np.isfinite(final).all() or np.any(final < 0) or np.any(final > 1 + 1e-12):
+        raise ValueError("final weights violate the finite [0, 1] weight contract")
+    np.clip(final, 0.0, 1.0, out=final)
     if validated_mode != "cell-distance" and not np.all(final[target_mask] == 1.0):
         raise AssertionError(
             "anchored and group-distance target-cell weights must remain exactly one"
         )
 
     return WeightResult(
+        context=context,
         target_group=target,
-        cells=cells,
-        cell_groups=tuple(labels.tolist()),
-        distance=np.asarray(used_distances, dtype=np.float64).copy(),
+        distance=np.asarray(used_distances, dtype=np.float64),
         # These arrays are freshly allocated above. Reusing them avoids a second
         # full set of per-cell vectors at the return boundary.
         base_weight=np.asarray(base, dtype=np.float64),
@@ -435,39 +457,6 @@ def compute_weights(
         mode=validated_mode,
         normalization_factor=float(normalization_factor),
     )
-
-
-def compute_all_weights(
-    cell_groups: pd.Series | Sequence[Hashable],
-    *,
-    mode: WeightMode,
-    bandwidth: float | BandwidthSelection,
-    kernel: str = "gaussian",
-    group_size_correction: GroupSizeCorrection = "cap-to-target",
-    cell_to_centroid_distances: pd.DataFrame | np.ndarray | None = None,
-    centroid_distances: pd.DataFrame | np.ndarray | None = None,
-    cell_ids: Sequence[str] | None = None,
-    group_ids: Sequence[str] | None = None,
-) -> dict[str, WeightResult]:
-    """Compute and cache exactly one weight vector per observed target group."""
-
-    labels, cells = _coerce_groups_and_cells(cell_groups, cell_ids)
-    targets = list(dict.fromkeys(labels.tolist()))
-    return {
-        target: compute_weights(
-            target,
-            labels,
-            mode=mode,
-            bandwidth=bandwidth,
-            kernel=kernel,
-            group_size_correction=group_size_correction,
-            cell_distances=cell_to_centroid_distances,
-            group_distances=centroid_distances,
-            cell_ids=cells,
-            group_ids=group_ids,
-        )
-        for target in targets
-    }
 
 
 def iter_group_affinity_records(
@@ -527,46 +516,13 @@ def iter_group_affinity_records(
             }
 
 
-def compute_group_affinities(
-    centroid_distances: pd.DataFrame,
-    group_sizes: Mapping[Hashable, int] | pd.Series,
-    *,
-    bandwidth: float | BandwidthSelection,
-    kernel: str = "gaussian",
-    group_size_correction: GroupSizeCorrection = "cap-to-target",
-) -> pd.DataFrame:
-    """Build the complete long-form group-affinity DataFrame for API callers."""
-
-    return pd.DataFrame.from_records(
-        iter_group_affinity_records(
-            centroid_distances,
-            group_sizes,
-            bandwidth=bandwidth,
-            kernel=kernel,
-            group_size_correction=group_size_correction,
-        ),
-        columns=[
-            "target_group",
-            "source_group",
-            "centroid_distance",
-            "base_affinity",
-            "group_size_factor",
-        ],
-    )
-
-
-calculate_weights = compute_weights
-
-
 __all__ = [
     "DegenerateWeightsError",
     "GroupSizeCorrection",
     "WeightMode",
     "WeightResult",
-    "calculate_weights",
-    "compute_all_weights",
-    "compute_group_affinities",
-    "compute_group_size_factors",
+    "WeightingContext",
     "compute_weights",
     "iter_group_affinity_records",
+    "prepare_weighting_context",
 ]

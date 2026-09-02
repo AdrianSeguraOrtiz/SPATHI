@@ -8,62 +8,47 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Initial standalone Python package and `spathi infer` command.
-- Strict ANDREA-compatible TSV and transcription-factor-list validation.
-- PCA and expression distance spaces with reusable group centroids.
-- Gaussian and exponential kernels with reproducible automatic bandwidth selection.
-- Cell-distance, group-anchored cell-distance, and group-distance weighting modes.
-- Optional external-group size correction and per-group weight diagnostics.
-- Weighted Extra-Trees and Random-Forest inference with deterministic task seeds.
-- Self-contained, deterministically ordered run artifacts and metadata.
-- Cell-embedding and explained-variance artifacts for inspecting the fitted PCA
-  distance representation or the explicitly auxiliary expression-space display PCA.
-- Default-on target weight panels, an exact effective-weight-mass heatmap, and a
-  visualization manifest with projection semantics and file hashes; `--no-visualize`
-  disables their generation.
-- Unit, integration, CLI, parallel reproducibility, and distribution tests.
-- Developer documentation, minimal example, scaling benchmark, and CI workflow.
+- Initial standalone Python package, currently identified as `0.1.0.dev0`, with a
+  CLI-independent inference core and the canonical
+  `from spathi import SpathiConfig, SpathiProgressEvent, infer` API.
+- Thin `spathi infer` adapter with a terminal-only SPATHI banner, coloured Rich help
+  and logs, an interactive model-progress bar, plain redirected progress records,
+  `--no-progress`, and `NO_COLOR` support.
+- Strict ANDREA-format contracts for expression, transcription-factor, cell-group,
+  and optional target-gene inputs, including exact fingerprints and actionable
+  validation errors.
+- Separate PCA or expression distance spaces, overflow-safe arithmetic group
+  centroids, numerically stable Euclidean or cosine distances, Gaussian or exponential
+  kernels, and reproducible global bandwidth selection.
+- Cell-distance, group-anchored cell-distance, and group-distance weighting modes,
+  with optional group-size correction and complete per-cell and per-group diagnostics.
+- Weighted Extra-Trees and Random-Forest inference with deterministic task seeds,
+  strict target subsets, constant-predictor filtering, and positive unsigned edge
+  scores.
+- Calibrated defaults shared by core and CLI: cosine distance, 250 trees, and
+  `max_features=sqrt`.
+- One process-wide thread budget, non-nested parallelism, a reusable worker pool,
+  bounded model-result backpressure, deterministic single-thread preprocessing, and
+  memory-aware group/target batching.
+- `MemAvailable`- and cgroup-aware memory planning, live-headroom-sized distance
+  chunks, exception-safe disk-backed cell-distance storage selected by size or memory
+  pressure, streamed outputs, and early release of redundant expression allocations.
+- Structured phase/model progress callbacks and exact SQLite checkpoints with input,
+  parameter, dependency, implementation, and per-group weight identity validation.
+- Private staging followed by atomic no-replace publication, an early target-filesystem
+  capability probe, a direct Linux syscall fallback for libc versions without a
+  `renameat2` wrapper, deterministic run artifacts, reproducible gzip files, and
+  complete metadata for scientific and operational decisions.
+- Default-on `report.html`: one self-contained offline Plotly report with target-level
+  and aggregate interactive charts, exact full-data summaries, shared deterministic
+  group-stratified sampling, cell embeddings, explained-variance output, provenance,
+  accessible tab navigation, path-free shareable settings, an identifier-handling
+  notice, and explicit memory and timing accounting. `--report`/`--no-report` and
+  `report=True`/`report=False` control generation without changing inference, while
+  `SpathiRunResult.report_path` exposes the published artifact.
+- Unit, numerical, integration, CLI, checkpoint, concurrency, distribution, and
+  interruption tests, plus developer documentation, a minimal example, CI, and a
+  reproducible scaling benchmark with target subsets, balanced schedules, wall time,
+  peak process-tree RSS, persistent logs, and safe child-process cancellation.
 
-### Changed
-
-- Preserve target responses in `float64` while storing only reusable TF predictors in
-  the tree implementation's `float32` working representation.
-- Resolve bootstrap sampling automatically by estimator: disabled for Extra-Trees and
-  enabled for Random Forest unless explicitly overridden; record requested and
-  effective values separately.
-- Cap PCA components at the informative `n_cells - 1` limit (with a defined one-cell
-  exception), delegate `auto` solver negotiation without private state, and record the
-  solver policy and explained-variance diagnostics.
-- Bound pairwise-distance working chunks to 64 MiB and avoid computing
-  cell-to-centroid distances entirely in `group-distance` mode.
-- Treat `group_affinities.tsv` as a centroid-level diagnostic and identify
-  `cell_weights.tsv.gz` and `weight_diagnostics.tsv` as the authoritative effective
-  model weights and group contributions.
-- Exclude TF predictors that are constant among positive-weight cells while preserving
-  predictor-name mappings and reporting used, discarded, and constant predictors.
-- Process target genes in bounded sub-batches in addition to group batches.
-- Parse large expression TSVs into one exact numeric allocation without retaining a
-  table-sized string copy, and hash the exact bytes consumed during validation.
-- Stream group-distance, group-affinity, and weight-diagnostic rows instead of
-  accumulating redundant quadratic Python record collections.
-- Use column-contiguous cell-distance storage in memory and on disk, and account
-  separately for heap, mapped, scratch, edge-batch, and conservative tree memory.
-- Publish completed run directories from private staging so early failures leave the
-  requested path immediately reusable.
-- Keep wheel construction out of the Python-version test matrix; the dedicated
-  distribution CI job remains the authoritative build, clean-install, and smoke test.
-
-### Fixed
-
-- Reject undefined cosine distances for zero-norm cells or centroids and canonicalize
-  round-off residues near exact zero before automatic bandwidth selection.
-- Make gzip containers reproducible by fixing their header timestamp, enabling
-  byte-identical compressed output for deterministic tables.
-- Correct the README's minimal example output path so it does not collide with an
-  existing example directory.
-- Reject random seeds outside scikit-learn's supported unsigned 32-bit interval and
-  convert oversized numeric bandwidths into actionable configuration errors.
-- Accept universal LF, CRLF, and CR newlines while preserving exact input hashes and
-  avoid imposing extra reserved cluster labels beyond the ANDREA contract.
-
-No version represented here has been published to PyPI yet.
+No SPATHI version has been published yet.

@@ -11,13 +11,12 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-DistanceSpace = Literal["pca", "expression"]
-DistanceStandardization = Literal["none", "standard"]
-PCASVDSolver = Literal["auto", "randomized", "full"]
+from .config import DistanceSpace, DistanceStandardization, PCASVDSolver
+
 PCASVDSolverResolution = Literal["explicit", "delegated-to-scikit-learn"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RepresentationResult:
     """A cell-by-dimension distance representation and its effective settings."""
 
@@ -35,29 +34,20 @@ class RepresentationResult:
     pca_degenerate: bool = False
     pca_degeneracy_reason: str | None = None
 
-    def to_frame(self) -> pd.DataFrame:
-        """Return a labelled cell-by-dimension copy-free view where possible."""
-
-        return pd.DataFrame(self.values, index=self.cell_ids, columns=self.dimension_names)
-
-    @property
-    def representation(self) -> np.ndarray:
-        """Descriptive alias for :attr:`values`."""
-
-        return self.values
-
 
 def _coerce_expression(
     expression: pd.DataFrame | np.ndarray,
     cell_ids: list[str] | tuple[str, ...] | None,
     gene_ids: list[str] | tuple[str, ...] | None,
+    *,
+    own_work_buffer: bool,
 ) -> tuple[np.ndarray, tuple[str, ...], tuple[str, ...]]:
     if isinstance(expression, pd.DataFrame):
         cells = tuple(map(str, expression.columns))
         genes = tuple(map(str, expression.index))
-        values = expression.to_numpy(dtype=np.float64, copy=False)
+        values = expression.to_numpy(copy=False)
     else:
-        values = np.asarray(expression, dtype=np.float64)
+        values = np.asarray(expression)
         if values.ndim != 2:
             raise ValueError("expression must be a two-dimensional genes-by-cells matrix")
         cells = (
@@ -79,9 +69,19 @@ def _coerce_expression(
         raise ValueError("gene_ids length does not match the expression rows")
     if len(set(cells)) != len(cells) or len(set(genes)) != len(genes):
         raise ValueError("expression cell and gene identifiers must be unique")
-    if not np.isfinite(values).all():
+    # PCA owns exactly one full-sized, C-contiguous float64 work buffer in the
+    # orientation expected by scikit-learn.  Besides avoiding an intermediate
+    # float64 genes-by-cells copy for narrower inputs, ownership lets the
+    # standardizer and PCA safely reuse this buffer in place without ever
+    # mutating the caller's DataFrame or ndarray. Expression-space runs retain
+    # a copy-free view where the input layout permits it.
+    if own_work_buffer:
+        cells_by_genes = np.array(values.T, dtype=np.float64, order="C", copy=True)
+    else:
+        cells_by_genes = np.asarray(values.T, dtype=np.float64)
+    if not np.isfinite(cells_by_genes).all():
         raise ValueError("expression must contain only finite values")
-    return values, tuple(map(str, cells)), tuple(map(str, genes))
+    return cells_by_genes, tuple(map(str, cells)), tuple(map(str, genes))
 
 
 def compute_distance_representation(
@@ -122,15 +122,22 @@ def compute_distance_representation(
     ):
         raise ValueError("n_components must be a positive integer")
 
-    genes_by_cells, cells, genes = _coerce_expression(expression, cell_ids, gene_ids)
-    cells_by_genes = np.asarray(genes_by_cells.T, dtype=np.float64, order="C")
+    cells_by_genes, cells, genes = _coerce_expression(
+        expression,
+        cell_ids,
+        gene_ids,
+        own_work_buffer=distance_space == "pca",
+    )
 
     if distance_standardization == "standard":
-        cells_by_genes = StandardScaler(copy=True).fit_transform(cells_by_genes)
+        cells_by_genes = np.asarray(
+            StandardScaler(copy=distance_space != "pca").fit_transform(cells_by_genes),
+            dtype=np.float64,
+        )
 
     if distance_space == "expression":
         return RepresentationResult(
-            values=np.asarray(cells_by_genes, dtype=np.float64, order="C"),
+            values=np.asarray(cells_by_genes, dtype=np.float64),
             cell_ids=cells,
             dimension_names=genes,
             distance_space="expression",
@@ -151,7 +158,16 @@ def compute_distance_representation(
     # Preserve scikit-learn's documented ``auto`` policy instead of copying its
     # version-specific negotiation or reading the private ``_fit_svd_solver`` state.
     # Dependency versions in run metadata make that delegated policy reproducible.
-    pca = PCA(n_components=effective, svd_solver=pca_svd_solver, random_state=random_state)
+    # ``cells_by_genes`` is SPATHI-owned scratch storage, so PCA may center it
+    # in place.  The fitted representation is returned separately by
+    # ``fit_transform``; retaining another complete centered matrix would only
+    # increase peak memory without changing any result.
+    pca = PCA(
+        n_components=effective,
+        copy=False,
+        svd_solver=pca_svd_solver,
+        random_state=random_state,
+    )
     # scikit-learn reports an expected RuntimeWarning when total variance is
     # zero (including a one-cell matrix). Capture it and expose a structured
     # diagnostic instead of leaking a low-level numerical warning to the CLI.
@@ -176,7 +192,7 @@ def compute_distance_representation(
             degeneracy_reason = (
                 "fewer than two cells; PCA explained variance is undefined and was recorded as zero"
             )
-        elif np.all(cells_by_genes == cells_by_genes[0], axis=None):
+        elif np.all(np.ptp(cells_by_genes, axis=0) == 0.0):
             degeneracy_reason = (
                 "all expression dimensions are constant across cells; PCA explained variance "
                 "is undefined and was recorded as zero"
@@ -215,17 +231,10 @@ def compute_distance_representation(
     )
 
 
-# Natural aliases for callers that prefer shorter names.
-build_distance_representation = compute_distance_representation
-create_distance_representation = compute_distance_representation
-
-
 __all__ = [
     "DistanceSpace",
     "DistanceStandardization",
     "PCASVDSolver",
     "RepresentationResult",
-    "build_distance_representation",
     "compute_distance_representation",
-    "create_distance_representation",
 ]

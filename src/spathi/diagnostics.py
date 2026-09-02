@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Hashable, Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
-import pandas as pd
 
-from .weighting import WeightResult, _stringify_group_labels, _stringify_target_group
+from .weighting import WeightResult
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WeightDiagnostics:
     """Diagnostics for the reusable weight vector of one target network."""
 
@@ -34,74 +33,6 @@ class WeightDiagnostics:
     group_mass_percent: Mapping[str, float]
     warnings: tuple[str, ...]
 
-    @property
-    def ess(self) -> float:
-        """Short alias for :attr:`effective_sample_size`."""
-
-        return self.effective_sample_size
-
-    @property
-    def sum_weights(self) -> float:
-        """Alias for :attr:`total_weight`."""
-
-        return self.total_weight
-
-    @property
-    def target_weight_mass(self) -> float:
-        """Alias for :attr:`target_weight`."""
-
-        return self.target_weight
-
-    @property
-    def external_weight_mass(self) -> float:
-        """Alias for :attr:`external_weight`."""
-
-        return self.external_weight
-
-    def to_summary_record(self) -> dict[str, str | int | float]:
-        """Return a deterministic scalar record suitable for a TSV row."""
-
-        return {
-            "target_group": self.target_group,
-            "n_cells": self.n_cells,
-            "n_target_cells": self.n_target_cells,
-            "total_weight": self.total_weight,
-            "target_weight": self.target_weight,
-            "external_weight": self.external_weight,
-            "target_mass_percent": self.target_mass_percent,
-            "external_mass_percent": self.external_mass_percent,
-            "min_weight": self.min_weight,
-            "max_weight": self.max_weight,
-            "mean_weight": self.mean_weight,
-            "median_weight": self.median_weight,
-            "positive_cell_count": self.positive_cell_count,
-            "effective_sample_size": self.effective_sample_size,
-            "warnings": " | ".join(self.warnings),
-        }
-
-    def to_frame(self) -> pd.DataFrame:
-        """Return one row per contributing group with summary metrics repeated.
-
-        This long layout records every external group's mass without dynamic or
-        JSON-encoded columns, while remaining straightforward to inspect in
-        ``weight_diagnostics.tsv``.
-        """
-
-        return pd.DataFrame.from_records(self.iter_records())
-
-    def iter_records(self) -> Iterator[dict[str, str | int | float | bool]]:
-        """Yield one source-group row without retaining the complete long table."""
-
-        summary = self.to_summary_record()
-        for source_group, mass in self.group_weight_mass.items():
-            yield {
-                **summary,
-                "source_group": source_group,
-                "source_is_target": source_group == self.target_group,
-                "source_weight": mass,
-                "source_mass_percent": self.group_mass_percent[source_group],
-            }
-
 
 def effective_sample_size(weights: Sequence[float] | np.ndarray) -> float:
     r"""Calculate :math:`(\sum_i w_i)^2 / \sum_i w_i^2`.
@@ -122,44 +53,17 @@ def effective_sample_size(weights: Sequence[float] | np.ndarray) -> float:
     return (total * total) / denominator
 
 
-def _coerce_inputs(
-    weights: WeightResult | Sequence[float] | np.ndarray,
-    cell_groups: pd.Series | Sequence[Hashable] | None,
-    target_group: Hashable | None,
-) -> tuple[np.ndarray, np.ndarray, str]:
-    if isinstance(weights, WeightResult):
-        if cell_groups is not None or target_group is not None:
-            raise ValueError(
-                "cell_groups and target_group must be omitted when a WeightResult is supplied"
-            )
-        values = np.asarray(weights.final_weight, dtype=np.float64)
-        groups = _stringify_group_labels(weights.cell_groups, field_name="cell_groups")
-        target = _stringify_target_group(weights.target_group)
-    else:
-        if cell_groups is None:
-            raise ValueError("cell_groups is required with a raw weight vector")
-        if target_group is None:
-            raise ValueError("target_group must be a non-missing, non-empty group label")
-        values = np.asarray(weights, dtype=np.float64)
-        if isinstance(cell_groups, pd.Series):
-            raw_groups = cell_groups.to_numpy(dtype=object).tolist()
-        else:
-            raw_groups = list(cell_groups)
-        groups = _stringify_group_labels(raw_groups, field_name="cell_groups")
-        target = _stringify_target_group(target_group)
+def _validate_weights(weights: WeightResult) -> np.ndarray:
+    values = np.asarray(weights.final_weight, dtype=np.float64)
     if values.ndim != 1 or values.size == 0:
         raise ValueError("weights must be a non-empty one-dimensional vector")
-    if groups.shape != values.shape:
-        raise ValueError("cell_groups length must match weights")
-    if not np.any(groups == target):
-        raise ValueError(f"target group {target!r} has no cells")
-    return values, groups, target
+    if values.shape != (len(weights.context.cells),):
+        raise ValueError("weight vector length must match its weighting context")
+    return values
 
 
 def compute_weight_diagnostics(
-    weights: WeightResult | Sequence[float] | np.ndarray,
-    cell_groups: pd.Series | Sequence[Hashable] | None = None,
-    target_group: Hashable | None = None,
+    weights: WeightResult,
     *,
     low_ess_fraction: float = 0.1,
     dominant_external_fraction: float = 0.5,
@@ -178,7 +82,10 @@ def compute_weight_diagnostics(
         raise ValueError("low_ess_fraction must be between zero and one")
     if not np.isfinite(dominant_external_fraction) or not 0 < dominant_external_fraction <= 1:
         raise ValueError("dominant_external_fraction must be in (0, 1]")
-    values, groups, target = _coerce_inputs(weights, cell_groups, target_group)
+    values = _validate_weights(weights)
+    context = weights.context
+    target = weights.target_group
+    target_index = context.group_ids.index(target)
     messages: list[str] = []
 
     all_finite = bool(np.isfinite(values).all())
@@ -199,22 +106,24 @@ def compute_weight_diagnostics(
     else:
         total = minimum = maximum = mean = median = float("nan")
 
-    # Factorize once and aggregate every source group in one linear pass.  The
-    # previous per-group boolean mask scaled as O(n_cells * n_groups).
-    group_codes, group_labels = pd.factorize(groups, sort=False)
-    unique_groups = [str(group) for group in group_labels.tolist()]
-    masses = np.bincount(group_codes, weights=values, minlength=len(unique_groups))
-    group_counts = np.bincount(group_codes, minlength=len(unique_groups))
-    group_mass = {group: float(masses[index]) for index, group in enumerate(unique_groups)}
-    group_index = {group: index for index, group in enumerate(unique_groups)}
-    target_weight = group_mass[target]
-    external_weight = (
-        total - target_weight if np.isfinite(total) and np.isfinite(target_weight) else float("nan")
+    unique_groups = context.group_ids
+    masses = np.bincount(
+        context.group_codes,
+        weights=values,
+        minlength=len(unique_groups),
     )
+    group_mass = {group: float(masses[index]) for index, group in enumerate(unique_groups)}
+    target_weight = group_mass[target]
+    external_weight = float(
+        np.sum(masses[:target_index], dtype=np.float64)
+        + np.sum(masses[target_index + 1 :], dtype=np.float64)
+    )
+    if not np.isfinite(total) or not np.isfinite(target_weight):
+        external_weight = float("nan")
     if np.isfinite(total) and total > 0:
         group_percent = {group: (mass / total) * 100.0 for group, mass in group_mass.items()}
         target_percent = group_percent[target]
-        external_percent = 100.0 - target_percent
+        external_percent = (external_weight / total) * 100.0
     else:
         group_percent = {group: float("nan") for group in unique_groups}
         target_percent = external_percent = float("nan")
@@ -245,7 +154,7 @@ def compute_weight_diagnostics(
     return WeightDiagnostics(
         target_group=target,
         n_cells=int(values.size),
-        n_target_cells=int(group_counts[group_index[target]]),
+        n_target_cells=int(context.group_counts[target_index]),
         total_weight=total,
         target_weight=target_weight,
         external_weight=external_weight,
@@ -263,27 +172,8 @@ def compute_weight_diagnostics(
     )
 
 
-def diagnostics_frame(
-    diagnostics: Sequence[WeightDiagnostics] | Mapping[str, WeightDiagnostics],
-) -> pd.DataFrame:
-    """Combine diagnostics into deterministic target/source-group rows."""
-
-    values = list(diagnostics.values()) if isinstance(diagnostics, Mapping) else list(diagnostics)
-    if not values:
-        return pd.DataFrame()
-    frame = pd.concat([item.to_frame() for item in values], ignore_index=True)
-    return frame.sort_values(["target_group", "source_group"], kind="stable", ignore_index=True)
-
-
-compute_ess = effective_sample_size
-summarize_weights = compute_weight_diagnostics
-
-
 __all__ = [
     "WeightDiagnostics",
-    "compute_ess",
     "compute_weight_diagnostics",
-    "diagnostics_frame",
     "effective_sample_size",
-    "summarize_weights",
 ]

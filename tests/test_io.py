@@ -2,16 +2,51 @@ from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import spathi.io as io_module
 from spathi.io import (
+    InputData,
     InputValidationError,
     load_inputs,
-    read_expression_matrix,
-    read_groups,
-    read_tf_list,
 )
+
+
+def read_expression_matrix(path: Path) -> pd.DataFrame:
+    return io_module._read_expression_matrix_with_fingerprint(path)[0]
+
+
+def read_tf_list(path: Path, expression_genes: list[str]) -> list[str]:
+    return io_module._read_tf_list_with_fingerprint(path, expression_genes)[0]
+
+
+def read_target_list(path: Path, expression_genes: list[str]) -> list[str]:
+    return io_module._read_target_list_with_fingerprint(path, expression_genes)[0]
+
+
+def read_groups(path: Path, expression_cells: list[str] | None = None) -> pd.Series:
+    return io_module._read_groups_with_fingerprint(path, expression_cells)[0]
+
+
+def test_input_data_requires_explicit_keyword_fields_and_resolved_targets() -> None:
+    frame = pd.DataFrame([[1.0]], index=["G"], columns=["C"])
+    groups = pd.Series(["A"], index=["C"])
+    fingerprints = {"expression": {"path": "x", "size_bytes": 1, "sha256": "a"}}
+
+    inputs = InputData(
+        expression=frame,
+        transcription_factors=("G",),
+        targets=("G",),
+        groups=groups,
+        input_fingerprints=fingerprints,
+    )
+
+    assert inputs.groups is groups
+    assert inputs.input_fingerprints is fingerprints
+    assert inputs.targets == ("G",)
+    with pytest.raises(TypeError):
+        InputData(frame, ("G",), ("G",), groups)  # type: ignore[misc]
 
 
 def test_expression_tsv_is_read_as_genes_by_cells(input_files: dict[str, Path]) -> None:
@@ -27,11 +62,32 @@ def test_loaded_inputs_record_hashes_of_the_exact_parsed_files(
 ) -> None:
     inputs = load_inputs(input_files["expression"], input_files["tf_list"], input_files["groups"])
     assert set(inputs.input_fingerprints) == {"expression", "tf_list", "groups"}
+    assert inputs.targets == ("TF1", "TF2", "G3", "CONST")
     for name, path in input_files.items():
         fingerprint = inputs.input_fingerprints[name]
         assert fingerprint["path"] == str(path.resolve())
         assert fingerprint["size_bytes"] == path.stat().st_size
         assert fingerprint["sha256"] == sha256(path.read_bytes()).hexdigest()
+
+
+def test_explicit_target_list_preserves_order_and_records_fingerprint(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    target_list = tmp_path / "targets.txt"
+    target_list.write_text("G3\nTF1\n", encoding="utf-8")
+
+    inputs = load_inputs(
+        input_files["expression"],
+        input_files["tf_list"],
+        input_files["groups"],
+        target_list,
+    )
+
+    assert inputs.targets == ("G3", "TF1")
+    fingerprint = inputs.input_fingerprints["target_list"]
+    assert fingerprint["path"] == str(target_list.resolve())
+    assert fingerprint["sha256"] == sha256(target_list.read_bytes()).hexdigest()
 
 
 def test_csv_expression_is_rejected(tmp_path: Path) -> None:
@@ -113,6 +169,28 @@ def test_tf_list_contract(
     path.write_text(content, encoding="utf-8")
     with pytest.raises(InputValidationError, match=message):
         read_tf_list(path, ["TF1", "TF2", "G3"])
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("G3\n\nTF1\n", "empty line"),
+        ("G3\nG3\n", "duplicate"),
+        ("MISSING\n", "absent"),
+        ("", "empty"),
+        (" G3\n", "whitespace"),
+        ("G3\tTF1\n", "exactly one identifier"),
+    ],
+)
+def test_target_list_contract(
+    tmp_path: Path,
+    content: str,
+    message: str,
+) -> None:
+    path = tmp_path / "invalid_targets.txt"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(InputValidationError, match=message):
+        read_target_list(path, ["TF1", "TF2", "G3"])
 
 
 def test_groups_are_reordered_to_expression_cells(input_files: dict[str, Path]) -> None:

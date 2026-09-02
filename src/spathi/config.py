@@ -33,6 +33,9 @@ GROUP_SIZE_CORRECTIONS: tuple[GroupSizeCorrection, ...] = ("none", "cap-to-targe
 TREE_METHODS: tuple[TreeMethod, ...] = ("extra-trees", "random-forest")
 MAX_FEATURES_NAMES: tuple[Literal["sqrt", "log2"], ...] = ("sqrt", "log2")
 MAX_RANDOM_SEED = 2**32 - 1
+DEFAULT_DISTANCE_METRIC: DistanceMetric = "cosine"
+DEFAULT_N_ESTIMATORS = 250
+DEFAULT_MAX_FEATURES: MaxFeatures = "sqrt"
 
 
 def _coerce_path(field_name: str, value: object) -> Path:
@@ -69,7 +72,7 @@ def _validate_integer(
         raise ValueError(f"{field_name} must be at least {minimum}")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SpathiConfig:
     """Complete, immutable configuration for one SPATHI run.
 
@@ -87,19 +90,20 @@ class SpathiConfig:
     n_components: int = 50
     distance_standardization: DistanceStandardization = "none"
     pca_svd_solver: PCASVDSolver = "auto"
-    distance_metric: DistanceMetric = "euclidean"
+    distance_metric: DistanceMetric = DEFAULT_DISTANCE_METRIC
     kernel: KernelName = "gaussian"
     bandwidth: Bandwidth = "auto"
     group_size_correction: GroupSizeCorrection = "cap-to-target"
     tree_method: TreeMethod = "extra-trees"
-    n_estimators: int = 500
-    max_features: MaxFeatures = 1.0
+    n_estimators: int = DEFAULT_N_ESTIMATORS
+    max_features: MaxFeatures = DEFAULT_MAX_FEATURES
     min_samples_leaf: int = 1
     max_depth: int | None = None
     bootstrap: bool | None = None
     random_seed: int = 123
     threads: int = -1
-    visualize: bool = True
+    report: bool = True
+    target_list: Path | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid scalar configuration before any input is read."""
@@ -109,6 +113,12 @@ class SpathiConfig:
                 self,
                 field_name,
                 _coerce_path(field_name, getattr(self, field_name)),
+            )
+        if self.target_list is not None:
+            object.__setattr__(
+                self,
+                "target_list",
+                _coerce_path("target_list", self.target_list),
             )
 
         _validate_choice("weight_mode", self.weight_mode, WEIGHT_MODES)
@@ -167,8 +177,8 @@ class SpathiConfig:
         _validate_integer("threads", self.threads)
         if self.threads == 0 or self.threads < -1:
             raise ValueError("threads must be -1 or a positive integer")
-        if type(self.visualize) is not bool:
-            raise TypeError("visualize must be a boolean")
+        if type(self.report) is not bool:
+            raise TypeError("report must be a boolean")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation of this configuration."""
@@ -176,4 +186,6 @@ class SpathiConfig:
         values = asdict(self)
         for key in ("expression", "tf_list", "groups", "output_dir"):
             values[key] = str(values[key])
+        if values["target_list"] is not None:
+            values["target_list"] = str(values["target_list"])
         return values

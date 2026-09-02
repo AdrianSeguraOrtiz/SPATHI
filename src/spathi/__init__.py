@@ -2,7 +2,7 @@
 
 The scientific stack is imported lazily so lightweight operations such as
 ``spathi --version`` do not load NumPy, pandas, and scikit-learn. The exported
-objects and their type information remain unchanged for library callers.
+objects and their type information remain available to library callers.
 """
 
 from __future__ import annotations
@@ -13,14 +13,18 @@ from spathi._version import __version__
 
 if TYPE_CHECKING:
     from spathi.config import SpathiConfig as SpathiConfig
-    from spathi.pipeline import SpathiRunResult as SpathiRunResult
-    from spathi.pipeline import infer_group_specific_grns as infer_group_specific_grns
+    from spathi.core import SpathiRunResult as SpathiRunResult
+    from spathi.core import infer as infer
+    from spathi.progress import ProgressCallback as ProgressCallback
+    from spathi.progress import SpathiProgressEvent as SpathiProgressEvent
 
 __all__ = [
     "SpathiConfig",
+    "SpathiProgressEvent",
     "SpathiRunResult",
+    "ProgressCallback",
     "__version__",
-    "infer_group_specific_grns",
+    "infer",
 ]
 
 
@@ -32,11 +36,17 @@ def __getattr__(name: str) -> Any:
 
         globals()[name] = SpathiConfig
         return SpathiConfig
-    if name in {"SpathiRunResult", "infer_group_specific_grns"}:
-        from spathi.pipeline import SpathiRunResult, infer_group_specific_grns
+    if name in {"ProgressCallback", "SpathiProgressEvent"}:
+        from spathi.progress import ProgressCallback, SpathiProgressEvent
+
+        globals()["ProgressCallback"] = ProgressCallback
+        globals()["SpathiProgressEvent"] = SpathiProgressEvent
+        return globals()[name]
+    if name in {"SpathiRunResult", "infer"}:
+        from spathi.core import SpathiRunResult, infer
 
         globals()["SpathiRunResult"] = SpathiRunResult
-        globals()["infer_group_specific_grns"] = infer_group_specific_grns
+        globals()["infer"] = infer
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
