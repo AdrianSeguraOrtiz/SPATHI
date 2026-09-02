@@ -26,6 +26,25 @@ def test_wheel_build_contains_package_and_console_entry_point(tmp_path: Path) ->
     with zipfile.ZipFile(wheels[0]) as archive:
         members = archive.namelist()
         assert "spathi/__init__.py" in members
+        assert "spathi/_report.py" in members
+        assert "spathi/core.py" in members
         assert "spathi/py.typed" in members
+        assert "spathi/pipeline.py" not in members
+        assert "spathi/prototypes.py" not in members
+        assert "spathi/visualization.py" not in members
         entry_points = next(name for name in members if name.endswith("entry_points.txt"))
         assert "spathi = spathi.cli:main" in archive.read(entry_points).decode("utf-8")
+        metadata_path = next(name for name in members if name.endswith(".dist-info/METADATA"))
+        metadata = archive.read(metadata_path).decode("utf-8")
+        assert "Import-Name: spathi\n" in metadata
+        assert "License-Expression: MIT\n" in metadata
+        assert "Requires-Python: >=3.11\n" in metadata
+        assert "Requires-Dist: plotly>=6.0\n" in metadata
+        assert "Requires-Dist: matplotlib" not in metadata.lower()
+        assert "Classifier: Operating System :: OS Independent\n" not in metadata
+        for classifier in (
+            "MacOS",
+            "Microsoft :: Windows",
+            "POSIX :: Linux",
+        ):
+            assert f"Classifier: Operating System :: {classifier}\n" in metadata

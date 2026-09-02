@@ -13,28 +13,27 @@ concurrency:
 
 jobs:
   quality:
-    name: Python ${{ matrix.python-version }}
+    name: Quality and Python 3.11
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
           cache: pip
 
       - name: Install package and development tools
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+          python -m pip check
 
       - name: Lint
         run: ruff check .
@@ -43,24 +42,164 @@ jobs:
         run: ruff format --check .
 
       - name: Check types
-        if: matrix.python-version == '3.11'
         run: mypy src/spathi
 
       - name: Run tests
         run: pytest -m "not distribution"
 
+  python-versions:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Run tests
+        run: pytest -m "not distribution"
+
+  minimum-direct-dependencies:
+    name: Minimum direct dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Derive direct lower-bound constraints
+        env:
+          MINIMUM_CONSTRAINTS: ${{ runner.temp }}/spathi-minimum-direct.txt
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          constraints = []
+          pattern = re.compile(r"([A-Za-z0-9][A-Za-z0-9_.-]*)>=(\d+(?:\.\d+)*)")
+          for requirement in metadata["project"]["dependencies"]:
+              match = pattern.fullmatch(requirement)
+              if match is None:
+                  raise SystemExit(
+                      "minimum-dependency CI requires one explicit >= lower bound per "
+                      f"direct dependency; unsupported requirement: {requirement!r}"
+                  )
+              constraints.append(f"{match.group(1)}=={match.group(2)}")
+          destination = Path(os.environ["MINIMUM_CONSTRAINTS"])
+          destination.write_text("\n".join(sorted(constraints)) + "\n", encoding="utf-8")
+          PY
+          cat "$MINIMUM_CONSTRAINTS"
+
+      - name: Install declared direct minima
+        env:
+          MINIMUM_CONSTRAINTS: ${{ runner.temp }}/spathi-minimum-direct.txt
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --constraint "$MINIMUM_CONSTRAINTS" -e ".[dev]"
+          python -m pip check
+
+      - name: Run tests against direct minima
+        run: pytest -m "not distribution"
+
+  platform-tests:
+    name: Python 3.11 on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Run cross-platform tests
+        run: pytest -m "not distribution"
+
+      - name: Smoke-test the installed command
+        env:
+          SPATHI_SMOKE_OUTPUT: ${{ runner.temp }}/spathi-platform-smoke
+        run: >-
+          spathi infer
+          --expression "${{ github.workspace }}/examples/minimal/expression.tsv"
+          --tf-list "${{ github.workspace }}/examples/minimal/tf_list.txt"
+          --groups "${{ github.workspace }}/examples/minimal/groups.tsv"
+          --output-dir "${{ runner.temp }}/spathi-platform-smoke"
+          --n-components 3
+          --n-estimators 4
+          --threads 1
+          --no-checkpoint
+          --no-report
+
+      - name: Verify smoke output
+        env:
+          SPATHI_SMOKE_OUTPUT: ${{ runner.temp }}/spathi-platform-smoke
+        run: >-
+          python -c
+          "import os; from pathlib import Path;
+          assert (Path(os.environ['SPATHI_SMOKE_OUTPUT']) / 'network.csv').is_file()"
+
   distribution:
     name: Build and install distributions
-    needs: quality
+    needs: [quality, python-versions, minimum-direct-dependencies, platform-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
           cache: pip
@@ -68,15 +207,19 @@ jobs:
       - name: Build wheel and source distribution
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build twine
+          python -m pip install build pytest twine
           python -m build
           python -m twine check --strict dist/*
+
+      - name: Verify wheel contents and metadata contract
+        run: python -m pytest tests/test_distribution.py
 
       - name: Install wheel in a clean environment
         run: |
           python -m venv "$RUNNER_TEMP/spathi-wheel-venv"
           "$RUNNER_TEMP/spathi-wheel-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/spathi-wheel-venv/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/spathi-wheel-venv/bin/python" -m pip check
 
       - name: Smoke-test installed command and example
         run: |
@@ -94,7 +237,7 @@ jobs:
           test -f "$RUNNER_TEMP/spathi-wheel-smoke/network.csv"
 
       - name: Upload distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: spathi-distributions
           path: dist/*
