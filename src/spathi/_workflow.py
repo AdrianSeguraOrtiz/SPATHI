@@ -9,8 +9,9 @@ from collections.abc import Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, localcontext
 from importlib.metadata import PackageNotFoundError, version
-from math import ceil
+from math import ceil, fsum
 from pathlib import Path
 from tempfile import TemporaryFile
 from time import perf_counter
@@ -46,6 +47,7 @@ from spathi.outputs import (
     write_json,
     write_tsv,
     write_tsv_gzip,
+    write_tsv_gzip_records,
     write_tsv_records,
 )
 from spathi.parallel import (
@@ -88,6 +90,21 @@ _GROUP_AFFINITY_COLUMNS = (
     "base_affinity",
     "group_size_factor",
 )
+_CENTROID_WEIGHT_COLUMNS = (
+    "cell",
+    "group",
+    "centroid_weight",
+    "normalized_centroid_weight",
+)
+_CENTROID_WEIGHT_DIAGNOSTIC_COLUMNS = (
+    "group",
+    "n_cells",
+    "weight_sum",
+    "min_weight",
+    "median_weight",
+    "max_weight",
+    "effective_sample_size",
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -101,6 +118,124 @@ class WorkflowSummary:
     failed_models: int
     resumed_models: int
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _CentroidWeightData:
+    """Aligned effective centroid weights and exact per-group summaries."""
+
+    cells: list[str]
+    groups: np.ndarray
+    raw: np.ndarray
+    normalized: np.ndarray
+    summaries: Mapping[str, Mapping[str, int | float | str]]
+
+
+def _raw_weight_sum(values: np.ndarray) -> float | str:
+    """Return a finite float sum, or a deterministic decimal when it exceeds float64."""
+
+    try:
+        return float(fsum(values))
+    except OverflowError:
+        with localcontext() as context:
+            context.prec = 25
+            total = sum((Decimal.from_float(float(value)) for value in values), Decimal(0))
+            return format(total, ".16E")
+
+
+def _positive_weight_median(values: np.ndarray) -> float:
+    """Return a median without overflowing the average of two large weights."""
+
+    ordered = np.sort(values)
+    midpoint = ordered.size // 2
+    if ordered.size % 2:
+        return float(ordered[midpoint])
+    lower = float(ordered[midpoint - 1])
+    upper = float(ordered[midpoint])
+    return lower + (upper - lower) / 2.0
+
+
+def _prepare_centroid_weight_data(
+    groups: pd.Series,
+    *,
+    cell_ids: list[str],
+    group_ids: list[str],
+    supplied: pd.Series | None,
+) -> _CentroidWeightData:
+    """Build diagnostics without changing the weights used by tree fitting."""
+
+    aligned_groups = groups.loc[cell_ids].astype(str).to_numpy(dtype=object, copy=False)
+    if supplied is None:
+        raw = np.ones(len(cell_ids), dtype=np.float64)
+    else:
+        raw = supplied.loc[cell_ids].to_numpy(dtype=np.float64, copy=False)
+    group_to_code = {group: code for code, group in enumerate(group_ids)}
+    group_codes = np.fromiter(
+        (group_to_code[str(group)] for group in aligned_groups),
+        dtype=np.int64,
+        count=len(cell_ids),
+    )
+    group_count = len(group_ids)
+    maxima = np.zeros(group_count, dtype=np.float64)
+    np.maximum.at(maxima, group_codes, raw)
+    scaled = raw / maxima[group_codes]
+    scaled_sums = np.bincount(group_codes, weights=scaled, minlength=group_count)
+    normalized = scaled / scaled_sums[group_codes]
+    squared_sums = np.bincount(
+        group_codes,
+        weights=np.square(scaled),
+        minlength=group_count,
+    )
+    effective_sample_sizes = np.square(scaled_sums) / squared_sums
+
+    sorter = np.argsort(group_codes, kind="stable")
+    sorted_weights = raw[sorter]
+    counts = np.bincount(group_codes, minlength=group_count)
+    boundaries = np.concatenate(([0], np.cumsum(counts)))
+    summaries: dict[str, dict[str, int | float | str]] = {}
+    for code, group in enumerate(group_ids):
+        values = sorted_weights[boundaries[code] : boundaries[code + 1]]
+        summaries[group] = {
+            "n_cells": int(counts[code]),
+            "weight_sum": _raw_weight_sum(values),
+            "min_weight": float(np.min(values)),
+            "median_weight": _positive_weight_median(values),
+            "max_weight": float(np.max(values)),
+            "effective_sample_size": float(effective_sample_sizes[code]),
+        }
+    return _CentroidWeightData(
+        cells=cell_ids,
+        groups=aligned_groups,
+        raw=raw,
+        normalized=normalized,
+        summaries=summaries,
+    )
+
+
+def _iter_centroid_weight_records(
+    data: _CentroidWeightData,
+) -> Iterator[dict[str, str | float]]:
+    for cell, group, raw, normalized in zip(
+        data.cells,
+        data.groups,
+        data.raw,
+        data.normalized,
+        strict=True,
+    ):
+        yield {
+            "cell": cell,
+            "group": group,
+            "centroid_weight": float(raw),
+            "normalized_centroid_weight": float(normalized),
+        }
+
+
+def _iter_centroid_weight_diagnostic_records(
+    summaries: Mapping[str, Mapping[str, int | float | str]],
+    group_ids: list[str],
+) -> Iterator[dict[str, str | int | float]]:
+    for group in group_ids:
+        yield {"group": group, **summaries[group]}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -186,6 +321,7 @@ class RunInputs:
     transcription_factors: tuple[str, ...]
     targets: tuple[str, ...]
     groups: pd.Series
+    centroid_weights: pd.Series | None
     input_fingerprints: Mapping[str, InputFingerprint]
 
     @classmethod
@@ -195,6 +331,7 @@ class RunInputs:
             transcription_factors=inputs.transcription_factors,
             targets=inputs.targets,
             groups=inputs.groups,
+            centroid_weights=inputs.centroid_weights,
             input_fingerprints=inputs.input_fingerprints,
         )
 
@@ -238,14 +375,52 @@ def dependency_versions(*, include_report: bool) -> dict[str, str]:
     return resolved
 
 
-def _report_run_parameters(config: SpathiConfig) -> dict[str, Any]:
+def _report_run_parameters(
+    config: SpathiConfig,
+    *,
+    centroid_weight_summaries: Mapping[str, Mapping[str, int | float | str]] | None = None,
+) -> dict[str, Any]:
     """Return report-safe settings without embedding local input or output paths."""
 
-    path_fields = {"expression", "tf_list", "groups", "target_list", "output_dir"}
+    path_fields = {
+        "expression",
+        "tf_list",
+        "groups",
+        "target_list",
+        "centroid_weights",
+        "output_dir",
+    }
     parameters = {key: value for key, value in config.to_dict().items() if key not in path_fields}
     parameters["target_selection"] = (
         "all-expression-genes" if config.target_list is None else "explicit-list"
     )
+    parameters.update(
+        _centroid_weight_parameters(
+            config,
+            summaries=centroid_weight_summaries,
+        )
+    )
+    return parameters
+
+
+def _centroid_weight_parameters(
+    config: SpathiConfig,
+    *,
+    summaries: Mapping[str, Mapping[str, int | float | str]] | None,
+) -> dict[str, Any]:
+    """Describe the centroid estimator without conflating it with model weights."""
+
+    explicit = config.centroid_weights is not None
+    parameters: dict[str, Any] = {
+        "centroid_method": "weighted_mean" if explicit else "arithmetic_mean",
+        "centroid_weight_source": "explicit" if explicit else "uniform",
+        "centroid_weight_normalization": "within-group-sum-to-one",
+        "centroid_weight_analysis_role": (
+            "explicit-sensitivity-analysis" if explicit else "primary"
+        ),
+    }
+    if summaries is not None:
+        parameters["centroid_weight_group_summaries"] = summaries
     return parameters
 
 
@@ -429,6 +604,8 @@ def _estimated_memory_bytes(
     tree_target_bytes: int,
     additional_tree_target_bytes: int,
     predictor_bytes: int,
+    centroid_weight_bytes: int,
+    normalized_centroid_weight_bytes: int,
     cell_distance_storage: str,
 ) -> dict[str, int]:
     cell_distance_logical = (
@@ -450,6 +627,8 @@ def _estimated_memory_bytes(
         "centroid_distances_float64": int(
             group_distances.memory_usage(index=False, deep=False).sum()
         ),
+        "centroid_weights_float64": centroid_weight_bytes,
+        "normalized_centroid_weights_float64": normalized_centroid_weight_bytes,
         # All-gene inference reuses the validated transpose. An explicit target
         # subset retains only those response columns in an additional contiguous
         # float64 allocation.
@@ -465,6 +644,8 @@ def _estimated_memory_bytes(
             "centroids_float64",
             "cell_centroid_distances_heap_float64",
             "centroid_distances_float64",
+            "centroid_weights_float64",
+            "normalized_centroid_weights_float64",
             "tree_targets_additional_float64",
             "tf_predictors_float32",
         )
@@ -689,6 +870,15 @@ def _run_workflow_impl(
     cell_names = list(map(str, expression_frame.columns))
     tf_names = list(inputs.transcription_factors)
     group_ids = sorted(map(str, pd.unique(inputs.groups)))
+    centroid_weight_data = _prepare_centroid_weight_data(
+        inputs.groups,
+        cell_ids=cell_names,
+        group_ids=group_ids,
+        supplied=inputs.centroid_weights,
+    )
+    centroid_weight_summaries = {
+        group: dict(centroid_weight_data.summaries[group]) for group in group_ids
+    }
     validate_group_configuration(config, group_count=len(group_ids))
     weighting_context = prepare_weighting_context(inputs.groups, cell_ids=cell_names)
     group_sizes = dict(
@@ -783,6 +973,7 @@ def _run_workflow_impl(
             representation,
             inputs.groups,
             group_order=group_ids,
+            centroid_weights=inputs.centroid_weights,
         )
         group_distances = compute_centroid_distances(
             centroids,
@@ -930,6 +1121,8 @@ def _run_workflow_impl(
         tree_target_bytes=tree_target_bytes,
         additional_tree_target_bytes=additional_tree_target_bytes,
         predictor_bytes=predictor_bytes,
+        centroid_weight_bytes=int(centroid_weight_data.raw.nbytes),
+        normalized_centroid_weight_bytes=int(centroid_weight_data.normalized.nbytes),
         cell_distance_storage=cell_distance_storage,
     )
     memory_estimate["centroid_distance_planned_persistent_upper_bound"] = (
@@ -1194,7 +1387,10 @@ def _run_workflow_impl(
         report_builder = InteractiveReportBuilder(
             report_embedding,
             group_sizes=group_sizes,
-            run_parameters=_report_run_parameters(config),
+            run_parameters=_report_run_parameters(
+                config,
+                centroid_weight_summaries=centroid_weight_summaries,
+            ),
         )
         if report_builder.sampled_cells != memory_estimate["report_sampled_cells"]:
             raise RuntimeError("report sampling does not match its memory plan")
@@ -1221,6 +1417,16 @@ def _run_workflow_impl(
         ),
         output_dir / "group_affinities.tsv",
         _GROUP_AFFINITY_COLUMNS,
+    )
+    write_tsv_gzip_records(
+        _iter_centroid_weight_records(centroid_weight_data),
+        output_dir / "centroid_weights.tsv.gz",
+        _CENTROID_WEIGHT_COLUMNS,
+    )
+    write_tsv_records(
+        _iter_centroid_weight_diagnostic_records(centroid_weight_summaries, group_ids),
+        output_dir / "centroid_weight_diagnostics.tsv",
+        _CENTROID_WEIGHT_DIAGNOSTIC_COLUMNS,
     )
     if representation.distance_space == "pca":
         embedding_component_count = min(3, representation.values.shape[1])
@@ -1316,6 +1522,7 @@ def _run_workflow_impl(
     # runs with an explicit target subset no longer retain the complete distance
     # matrix while the tree ensembles are fitted.
     del representation
+    del centroid_weight_data
 
     weighting_seconds = 0.0
     inference_seconds = 0.0
@@ -1574,7 +1781,10 @@ def _run_workflow_impl(
         "group_sizes": {group: int(group_sizes[group]) for group in group_ids},
         "requested_parameters": config.to_dict(),
         "effective_parameters": {
-            "centroid_method": "arithmetic_mean",
+            **_centroid_weight_parameters(
+                config,
+                summaries=centroid_weight_summaries,
+            ),
             "distance_space": representation_summary.distance_space,
             "distance_standardization": representation_summary.standardization,
             "pca_svd_solver_requested": representation_summary.pca_svd_solver,
@@ -1692,6 +1902,24 @@ def _run_workflow_impl(
         },
         "memory_estimate_bytes": memory_estimate,
         "artifact_semantics": {
+            "centroid_weights.tsv.gz": {
+                "scope": "centroid construction only",
+                "centroid_weight": "raw positive input weight, or one in uniform mode",
+                "normalized_centroid_weight": (
+                    "raw weight divided by its observed-group total; sums to one per group"
+                ),
+                "analysis_role": (
+                    "explicit-sensitivity-analysis"
+                    if config.centroid_weights is not None
+                    else "primary"
+                ),
+                "not_a_model_weight": True,
+                "authoritative_model_weights": "cell_weights.tsv.gz:final_weight",
+            },
+            "centroid_weight_diagnostics.tsv": {
+                "scope": "exact per-group centroid-weight summaries",
+                "effective_sample_size": "(sum(w)^2)/sum(w^2)",
+            },
             "group_affinities.tsv": {
                 "scope": "group-level diagnostic",
                 "base_affinity": (

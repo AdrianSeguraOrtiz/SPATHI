@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import gzip
 import json
 import subprocess
@@ -28,6 +27,8 @@ from spathi.progress import SpathiProgressEvent
 EXPECTED_ARTIFACTS = {
     "cell_embedding.tsv.gz",
     "cell_weights.tsv.gz",
+    "centroid_weight_diagnostics.tsv",
+    "centroid_weights.tsv.gz",
     "centroids.tsv",
     "group_affinities.tsv",
     "group_distances.tsv",
@@ -98,13 +99,58 @@ def test_report_parameters_exclude_local_paths(
     assert parameters["weight_mode"] == config.weight_mode
     assert parameters["report"] is True
     assert parameters["target_selection"] == "all-expression-genes"
+    assert parameters["centroid_method"] == "arithmetic_mean"
+    assert parameters["centroid_weight_source"] == "uniform"
+    assert parameters["centroid_weight_analysis_role"] == "primary"
     assert not {
         "expression",
         "tf_list",
         "groups",
         "target_list",
+        "centroid_weights",
         "output_dir",
     }.intersection(parameters)
+
+
+def test_centroid_weight_path_is_fingerprinted_not_a_scientific_parameter(
+    input_files: dict[str, Path], tmp_path: Path
+) -> None:
+    first = config_for(input_files, tmp_path / "output")
+    first = SpathiConfig(
+        **{
+            **first.to_dict(),
+            "centroid_weights": tmp_path / "first.tsv",
+        }
+    )
+    second = SpathiConfig(
+        **{
+            **first.to_dict(),
+            "centroid_weights": tmp_path / "moved.tsv",
+        }
+    )
+
+    assert core_module._checkpoint_scientific_parameters(first) == (
+        core_module._checkpoint_scientific_parameters(second)
+    )
+    assert "centroid_weights" not in core_module._checkpoint_scientific_parameters(first)
+
+
+def test_centroid_weight_diagnostics_are_stable_when_raw_sum_exceeds_float64() -> None:
+    maximum = np.finfo(np.float64).max
+    cells = ["c1", "c2", "c3"]
+    groups = pd.Series(["A", "A", "B"], index=cells, dtype="string")
+    supplied = pd.Series([maximum, maximum, 1.0], index=cells, dtype=np.float64)
+
+    diagnostics = workflow_module._prepare_centroid_weight_data(
+        groups,
+        cell_ids=cells,
+        group_ids=["A", "B"],
+        supplied=supplied,
+    )
+
+    np.testing.assert_allclose(diagnostics.normalized, [0.5, 0.5, 1.0])
+    assert diagnostics.summaries["A"]["weight_sum"] == "3.5953862697246314E+308"
+    assert diagnostics.summaries["A"]["effective_sample_size"] == 2.0
 
 
 def test_cell_distance_memory_plan_uses_live_headroom_below_size_threshold(
@@ -215,71 +261,6 @@ def test_cell_distance_headroom_is_measured_after_group_distances(
     assert observed_snapshots[:2] == [False, True]
 
 
-def test_atomic_publication_refuses_an_existing_empty_directory(tmp_path: Path) -> None:
-    source = tmp_path / "staged"
-    destination = tmp_path / "published"
-    source.mkdir()
-    destination.mkdir()
-    marker = source / "result.txt"
-    marker.write_text("complete", encoding="utf-8")
-
-    with pytest.raises(FileExistsError, match="will not be overwritten"):
-        core_module._publish_directory_no_replace(source, destination)
-
-    assert marker.read_text(encoding="utf-8") == "complete"
-    assert list(destination.iterdir()) == []
-
-
-def test_atomic_publication_preflight_uses_the_target_filesystem(tmp_path: Path) -> None:
-    publication_parent = tmp_path / "publication-parent"
-    publication_parent.mkdir()
-
-    core_module._preflight_atomic_publication(publication_parent)
-
-    assert list(publication_parent.iterdir()) == []
-
-
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux syscall fallback")
-def test_linux_atomic_publication_falls_back_when_libc_has_no_renameat2(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_library = ctypes.CDLL(None, use_errno=True)
-
-    class SyscallOnlyLibrary:
-        syscall = real_library.syscall
-
-    monkeypatch.setattr(core_module, "_process_c_library", SyscallOnlyLibrary)
-    source = tmp_path / "source"
-    destination = tmp_path / "destination"
-    source.mkdir()
-    destination.mkdir()
-
-    with pytest.raises(FileExistsError, match="will not be overwritten"):
-        core_module._publish_directory_no_replace(source, destination)
-    assert source.is_dir()
-    assert destination.is_dir()
-
-    destination.rmdir()
-    core_module._publish_directory_no_replace(source, destination)
-    assert not source.exists()
-    assert destination.is_dir()
-
-
-def test_linux_syscall_fallback_rejects_an_unknown_architecture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class SyscallOnlyLibrary:
-        def syscall(self) -> int:
-            raise AssertionError("unknown architectures must fail before invoking syscall")
-
-    monkeypatch.setattr(core_module, "_process_c_library", SyscallOnlyLibrary)
-    monkeypatch.setattr(core_module, "_linux_machine", lambda: "unknown-cpu")
-
-    with pytest.raises(RuntimeError, match="unsupported architecture"):
-        core_module._linux_rename_no_replace(Path("source"), Path("destination"))
-
-
 def test_atomic_publication_is_preflighted_before_input_loading(
     tmp_path: Path,
     input_files: dict[str, Path],
@@ -296,7 +277,7 @@ def test_atomic_publication_is_preflighted_before_input_loading(
         nonlocal loaded_inputs
         loaded_inputs = True
 
-    monkeypatch.setattr(core_module, "_preflight_atomic_publication", reject_publication)
+    monkeypatch.setattr(core_module, "preflight_atomic_publication", reject_publication)
     monkeypatch.setattr(io_module, "load_inputs", observe_input_load)
 
     with pytest.raises(RuntimeError, match="unsupported output filesystem"):
@@ -314,7 +295,7 @@ def test_infer_cannot_replace_output_created_during_publication_race(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output_dir = tmp_path / "publication-race"
-    original_occupied = core_module._path_is_occupied
+    original_occupied = core_module.path_is_occupied
     output_checks = 0
 
     def create_destination_after_last_check(path: Path) -> bool:
@@ -326,7 +307,7 @@ def test_infer_cannot_replace_output_created_during_publication_race(
                 return False
         return original_occupied(path)
 
-    monkeypatch.setattr(core_module, "_path_is_occupied", create_destination_after_last_check)
+    monkeypatch.setattr(core_module, "path_is_occupied", create_destination_after_last_check)
 
     with pytest.raises(FileExistsError, match="will not be overwritten"):
         infer(config_for(input_files, output_dir), checkpoint=False)
@@ -717,6 +698,122 @@ def test_public_core_writes_self_contained_deterministic_run(
 
 
 @pytest.mark.integration
+def test_explicit_centroid_weights_change_only_centroid_construction_and_are_audited(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    centroid_weights = tmp_path / "centroid_weights.tsv"
+    centroid_weights.write_text(
+        "cell\tcentroid_weight\ncell_1\t1\ncell_2\t3\ncell_3\t2\ncell_4\t1\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "weighted-centroids"
+    base = config_for(input_files, output_dir, report=True)
+    config = SpathiConfig(
+        **{
+            **base.to_dict(),
+            "centroid_weights": centroid_weights,
+            "distance_space": "expression",
+            "distance_metric": "euclidean",
+        }
+    )
+
+    infer(config, checkpoint=False)
+
+    centroids = pd.read_csv(output_dir / "centroids.tsv", sep="\t")
+    tf1 = centroids.loc[centroids["dimension"] == "TF1"].set_index("group")["centroid"]
+    assert tf1["A"] == pytest.approx(1.75)
+    assert tf1["B"] == pytest.approx(13.0 / 3.0)
+
+    with gzip.open(output_dir / "centroid_weights.tsv.gz", "rt", encoding="utf-8") as handle:
+        effective = pd.read_csv(handle, sep="\t")
+    assert effective.columns.tolist() == [
+        "cell",
+        "group",
+        "centroid_weight",
+        "normalized_centroid_weight",
+    ]
+    np.testing.assert_allclose(
+        effective["normalized_centroid_weight"],
+        [0.25, 0.75, 2.0 / 3.0, 1.0 / 3.0],
+    )
+    diagnostics = pd.read_csv(output_dir / "centroid_weight_diagnostics.tsv", sep="\t")
+    assert diagnostics.set_index("group").loc["A", "weight_sum"] == 4.0
+    assert diagnostics.set_index("group").loc["A", "effective_sample_size"] == pytest.approx(1.6)
+
+    metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["effective_parameters"]["centroid_method"] == "weighted_mean"
+    assert metadata["effective_parameters"]["centroid_weight_source"] == "explicit"
+    assert (
+        metadata["effective_parameters"]["centroid_weight_analysis_role"]
+        == "explicit-sensitivity-analysis"
+    )
+    assert "centroid_weights" in metadata["inputs"]
+    assert metadata["artifact_semantics"]["centroid_weights.tsv.gz"]["not_a_model_weight"] is True
+    report = (output_dir / "report.html").read_text(encoding="utf-8")
+    assert "explicit generic centroid weights" in report
+
+
+@pytest.mark.integration
+def test_default_centroid_weights_are_uniform_and_explicitly_audited(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    output_dir = tmp_path / "uniform-centroids"
+    infer(config_for(input_files, output_dir), checkpoint=False)
+
+    with gzip.open(output_dir / "centroid_weights.tsv.gz", "rt", encoding="utf-8") as handle:
+        effective = pd.read_csv(handle, sep="\t")
+    np.testing.assert_array_equal(effective["centroid_weight"], np.ones(4))
+    np.testing.assert_allclose(effective["normalized_centroid_weight"], np.full(4, 0.5))
+    diagnostics = pd.read_csv(output_dir / "centroid_weight_diagnostics.tsv", sep="\t")
+    np.testing.assert_allclose(diagnostics["effective_sample_size"], [2.0, 2.0])
+    metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["effective_parameters"]["centroid_method"] == "arithmetic_mean"
+    assert metadata["effective_parameters"]["centroid_weight_source"] == "uniform"
+    assert metadata["effective_parameters"]["centroid_weight_analysis_role"] == "primary"
+    assert "centroid_weights" not in metadata["inputs"]
+
+
+@pytest.mark.integration
+def test_groupwise_constant_centroid_weights_do_not_reweight_models_or_group_sizes(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    centroid_weights = tmp_path / "groupwise-constant-centroid-weights.tsv"
+    centroid_weights.write_text(
+        "cell\tcentroid_weight\ncell_1\t2\ncell_2\t2\ncell_3\t7\ncell_4\t7\n",
+        encoding="utf-8",
+    )
+    uniform_dir = tmp_path / "uniform-model-weights"
+    explicit_dir = tmp_path / "explicit-model-weights"
+    uniform = config_for(input_files, uniform_dir)
+    explicit = SpathiConfig(
+        **{
+            **config_for(input_files, explicit_dir).to_dict(),
+            "centroid_weights": centroid_weights,
+        }
+    )
+
+    infer(uniform, checkpoint=False)
+    infer(explicit, checkpoint=False)
+
+    uniform_weights = pd.read_csv(uniform_dir / "cell_weights.tsv.gz", sep="\t")
+    explicit_weights = pd.read_csv(explicit_dir / "cell_weights.tsv.gz", sep="\t")
+    pd.testing.assert_frame_equal(uniform_weights, explicit_weights)
+    uniform_metadata = json.loads((uniform_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    explicit_metadata = json.loads((explicit_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert (
+        uniform_metadata["group_sizes"]
+        == explicit_metadata["group_sizes"]
+        == {
+            "A": 2,
+            "B": 2,
+        }
+    )
+
+
+@pytest.mark.integration
 def test_core_uses_all_genes_for_distances_but_only_explicit_inference_targets(
     tmp_path: Path,
     input_files: dict[str, Path],
@@ -849,6 +946,9 @@ def test_core_is_equivalent_with_more_than_one_thread(
     assert (sequential_dir / "cell_weights.tsv.gz").read_bytes() == (
         threaded_dir / "cell_weights.tsv.gz"
     ).read_bytes()
+    assert (sequential_dir / "centroid_weights.tsv.gz").read_bytes() == (
+        threaded_dir / "centroid_weights.tsv.gz"
+    ).read_bytes()
 
 
 @pytest.mark.integration
@@ -869,6 +969,8 @@ def test_randomized_pca_scientific_artifacts_are_exact_across_thread_budgets(
     for name in (
         "network.csv",
         "cell_weights.tsv.gz",
+        "centroid_weights.tsv.gz",
+        "centroid_weight_diagnostics.tsv",
         "cell_embedding.tsv.gz",
         "group_distances.tsv",
     ):
@@ -1024,6 +1126,46 @@ def test_checkpoint_resume_reuses_only_committed_models_and_matches_clean_run(
     metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
     assert metadata["checkpoint"]["models_reused"] == 3
     assert metadata["models"]["processed_this_attempt"] == 5
+
+
+@pytest.mark.integration
+def test_resume_rejects_changed_centroid_weight_input(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    centroid_weights = tmp_path / "centroid_weights.tsv"
+    centroid_weights.write_text(
+        "cell\tcentroid_weight\ncell_1\t1\ncell_2\t2\ncell_3\t3\ncell_4\t4\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "changed-centroid-input"
+    base = config_for(input_files, output_dir)
+    config = SpathiConfig(
+        **{
+            **base.to_dict(),
+            "centroid_weights": centroid_weights,
+        }
+    )
+
+    def interrupt_after_first_model(event: SpathiProgressEvent) -> None:
+        if event.phase == "model_inference" and event.completed_models == 1:
+            raise RuntimeError("interrupt weighted run")
+
+    with pytest.raises(RuntimeError, match="interrupt weighted run"):
+        infer(config, progress_callback=interrupt_after_first_model)
+
+    checkpoint_dir = tmp_path / ".changed-centroid-input.checkpoint"
+    assert checkpoint_dir.is_dir()
+    centroid_weights.write_text(
+        "cell\tcentroid_weight\ncell_1\t2\ncell_2\t1\ncell_3\t3\ncell_4\t4\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint identity does not match"):
+        infer(config, resume=True)
+
+    assert checkpoint_dir.is_dir()
+    assert not output_dir.exists()
 
 
 @pytest.mark.integration
@@ -1524,6 +1666,8 @@ def test_report_switch_does_not_change_scientific_artifacts(
     for artifact in (
         "network.csv",
         "cell_weights.tsv.gz",
+        "centroid_weights.tsv.gz",
+        "centroid_weight_diagnostics.tsv",
         "centroids.tsv",
         "group_affinities.tsv",
         "group_distances.tsv",

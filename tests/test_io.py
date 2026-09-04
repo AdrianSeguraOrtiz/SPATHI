@@ -39,12 +39,14 @@ def test_input_data_requires_explicit_keyword_fields_and_resolved_targets() -> N
         transcription_factors=("G",),
         targets=("G",),
         groups=groups,
+        centroid_weights=None,
         input_fingerprints=fingerprints,
     )
 
     assert inputs.groups is groups
     assert inputs.input_fingerprints is fingerprints
     assert inputs.targets == ("G",)
+    assert inputs.centroid_weights is None
     with pytest.raises(TypeError):
         InputData(frame, ("G",), ("G",), groups)  # type: ignore[misc]
 
@@ -88,6 +90,115 @@ def test_explicit_target_list_preserves_order_and_records_fingerprint(
     fingerprint = inputs.input_fingerprints["target_list"]
     assert fingerprint["path"] == str(target_list.resolve())
     assert fingerprint["sha256"] == sha256(target_list.read_bytes()).hexdigest()
+
+
+def test_explicit_centroid_weights_are_aligned_and_fingerprinted(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    path = tmp_path / "centroid_weights.tsv"
+    path.write_text(
+        "cell\tcentroid_weight\ncell_3\t0.7\ncell_1\t0.9\ncell_4\t0.6\ncell_2\t0.8\n",
+        encoding="utf-8",
+    )
+
+    inputs = load_inputs(
+        input_files["expression"],
+        input_files["tf_list"],
+        input_files["groups"],
+        centroid_weights=path,
+    )
+
+    assert inputs.centroid_weights is not None
+    assert inputs.centroid_weights.index.tolist() == [
+        "cell_1",
+        "cell_2",
+        "cell_3",
+        "cell_4",
+    ]
+    assert inputs.centroid_weights.tolist() == [0.9, 0.8, 0.7, 0.6]
+    fingerprint = inputs.input_fingerprints["centroid_weights"]
+    assert fingerprint["path"] == str(path.resolve())
+    assert fingerprint["sha256"] == sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("cell\tweight\ncell_1\t1\n", "exactly two columns"),
+        (
+            "centroid_weight\tcell\n1\tcell_1\n",
+            "exactly two columns",
+        ),
+        (
+            "cell\tcentroid_weight\textra\ncell_1\t1\tx\n",
+            "exactly two columns",
+        ),
+        (
+            "cell\tcentroid_weight\ncell_1\t1\ncell_1\t2\ncell_2\t1\ncell_3\t1\ncell_4\t1\n",
+            "repeated",
+        ),
+        (
+            "cell\tcentroid_weight\ncell_1\t0\ncell_2\t1\ncell_3\t1\ncell_4\t1\n",
+            "positive finite",
+        ),
+        (
+            "cell\tcentroid_weight\ncell_1\t-1\ncell_2\t1\ncell_3\t1\ncell_4\t1\n",
+            "positive finite",
+        ),
+        (
+            "cell\tcentroid_weight\ncell_1\tNaN\ncell_2\t1\ncell_3\t1\ncell_4\t1\n",
+            "positive finite",
+        ),
+        (
+            "cell\tcentroid_weight\ncell_1\tvalue\ncell_2\t1\ncell_3\t1\ncell_4\t1\n",
+            "numeric",
+        ),
+        (
+            "cell\tcentroid_weight\ncell_1\t1\ncell_2\t1\ncell_3\t1\nunexpected\t1\n",
+            "cell_4.*unexpected",
+        ),
+    ],
+)
+def test_centroid_weight_contract(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+    content: str,
+    message: str,
+) -> None:
+    path = tmp_path / "invalid_centroid_weights.tsv"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(InputValidationError, match=message):
+        load_inputs(
+            input_files["expression"],
+            input_files["tf_list"],
+            input_files["groups"],
+            centroid_weights=path,
+        )
+
+
+def test_finite_centroid_weights_are_valid_even_when_their_raw_sum_exceeds_float64(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+) -> None:
+    path = tmp_path / "overflowing_centroid_weights.tsv"
+    path.write_text(
+        "cell\tcentroid_weight\n"
+        "cell_1\t1.7976931348623157e308\n"
+        "cell_2\t1.7976931348623157e308\n"
+        "cell_3\t1\n"
+        "cell_4\t1\n",
+        encoding="utf-8",
+    )
+    inputs = load_inputs(
+        input_files["expression"],
+        input_files["tf_list"],
+        input_files["groups"],
+        centroid_weights=path,
+    )
+
+    assert inputs.centroid_weights is not None
+    assert np.isfinite(inputs.centroid_weights).all()
 
 
 def test_csv_expression_is_rejected(tmp_path: Path) -> None:

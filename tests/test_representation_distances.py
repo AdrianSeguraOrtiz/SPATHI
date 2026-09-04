@@ -123,6 +123,22 @@ def test_weighted_centroids_remain_finite_at_float64_extremes() -> None:
     assert np.isfinite(centroids.to_numpy()).all()
 
 
+def test_weighted_centroids_tolerate_rescaled_weight_underflow() -> None:
+    representation = pd.DataFrame(
+        [[1.0], [2.0], [9.0]],
+        index=["c1", "c2", "c3"],
+        columns=["gene"],
+    )
+
+    centroids = compute_centroids(
+        representation,
+        ["A", "A", "A"],
+        centroid_weights=[1e-308, 1e-308, 1e308],
+    )
+
+    assert centroids.loc["A", "gene"] == 9.0
+
+
 def test_cell_and_centroid_distances_have_expected_values() -> None:
     representation, groups = toy_representation()
     centroids = compute_centroids(representation, groups)

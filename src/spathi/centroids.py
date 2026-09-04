@@ -159,10 +159,15 @@ def _compute_weighted_centroids(
 
         # A group-wide rescaling is mathematically inert and keeps both the
         # accumulated mass and each update finite even for weights near float64 max.
+        # Start at the maximum so smaller positive values that underflow to zero
+        # during rescaling can never leave the running mass at zero.
         scaled = group_weights / np.max(group_weights)
-        mean = np.array(values[positions[0]], dtype=np.float64, copy=True)
-        accumulated = float(scaled[0])
-        for position, weight in zip(positions[1:], scaled[1:], strict=True):
+        initial_offset = int(np.argmax(group_weights))
+        mean = np.array(values[positions[initial_offset]], dtype=np.float64, copy=True)
+        accumulated = 1.0
+        for offset, (position, weight) in enumerate(zip(positions, scaled, strict=True)):
+            if offset == initial_offset:
+                continue
             updated = accumulated + float(weight)
             fraction = float(weight) / updated
             mean = (1.0 - fraction) * mean + fraction * values[position]

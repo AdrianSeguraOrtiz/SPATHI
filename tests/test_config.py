@@ -47,6 +47,7 @@ def test_invalid_scalar_configuration_is_rejected(field: str, value: object) -> 
     [
         ("expression", 1),
         ("target_list", 1),
+        ("centroid_weights", 1),
         ("weight_mode", True),
         ("distance_space", None),
         ("n_components", 1.5),
@@ -118,6 +119,7 @@ def test_configuration_serializes_paths_and_defaults() -> None:
     assert values["n_estimators"] == 250
     assert values["max_features"] == "sqrt"
     assert values["target_list"] is None
+    assert values["centroid_weights"] is None
     assert values["report"] is True
     assert values["threads"] == -1
 
@@ -125,6 +127,11 @@ def test_configuration_serializes_paths_and_defaults() -> None:
 def test_configuration_serializes_optional_target_list_path() -> None:
     values = make_config(target_list=Path("targets.txt")).to_dict()
     assert values["target_list"] == "targets.txt"
+
+
+def test_configuration_serializes_optional_centroid_weights_path() -> None:
+    values = make_config(centroid_weights=Path("centroid_weights.tsv")).to_dict()
+    assert values["centroid_weights"] == "centroid_weights.tsv"
 
 
 def test_configuration_requires_explicit_keywords() -> None:

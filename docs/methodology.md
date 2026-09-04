@@ -6,17 +6,20 @@ implementation.
 
 ## Software boundary
 
-`spathi.core.infer` owns input validation, scientific computation, checkpointing,
-artifact writing, and atomic publication. The public package root exposes that function
-as the canonical `from spathi import infer` API together with `SpathiConfig`,
-`SpathiProgressEvent`, and `SpathiRunResult`. The `spathi infer` command is a thin
-adapter: it parses terminal arguments into `SpathiConfig`, renders logs and progress,
-and calls the core. There is no separate command-line inference path.
+`spathi.core.infer` coordinates input validation, scientific computation,
+checkpointing, artifact writing, and final publication. `spathi.preparation.prepare`
+independently coordinates generic 10x preparation. Both workflows share the same
+private atomic, never-overwrite publication primitive without coupling preparation to
+the inference core. The public package root exposes both functions as the canonical
+programmatic APIs. The `spathi infer` and `spathi prepare` commands are thin adapters:
+they parse terminal arguments into typed configurations, render logs and progress, and
+call the corresponding API. There is no separate command-line scientific path.
 
 ## Scope and notation
 
 Let the supplied expression matrix contain genes as rows and cells as columns. For
-cell \(i\), let \(x_i\) be its expression vector and \(g_i\) its assigned group. By
+cell \(i\), let \(x_i\) be its expression vector, \(g_i\) its assigned group, and
+\(q_i\) its optional centroid weight. By
 default every gene is modeled as a target; an explicit `target_list` selects a nonempty
 subset without changing the distance space. Candidate predictors are the genes listed
 in `tf_list`, except that a target is removed from its own predictors when it is also a
@@ -75,12 +78,27 @@ passed as `sample_weight`.
 
 ## Group centroids and distances
 
-Let \(z_i\) denote cell \(i\)'s vector in the configured distance space. SPATHI uses
-the arithmetic centroid:
+Let \(z_i\) denote cell \(i\)'s vector in the configured distance space. In the
+primary, uniform analysis, SPATHI uses the arithmetic centroid:
 
 \[
 \mu_c = \frac{1}{n_c}\sum_{i:g_i=c} z_i.
 \]
+
+An optional strict `centroid_weights.tsv` defines a positive finite \(q_i\) for every
+expression cell exactly once. That explicit sensitivity analysis instead uses:
+
+\[
+\mu_c^{(q)} =
+\frac{\sum_{i:g_i=c} q_i z_i}{\sum_{i:g_i=c} q_i}.
+\]
+
+Only relative values within a group matter. The implementation uses stable group-wise
+rescaling and online weighted means, while diagnostics report both the raw value and
+\(q_i / \sum_{j:g_j=g_i} q_j\). The input values are used only to locate centroids:
+they are not multiplied directly into the tree estimator's sample weights and do not
+change \(n_c\) for group-size correction. SPATHI assigns no dataset-specific meaning
+to this generic scalar.
 
 Centroids are computed once per run and reused by every target-group weighting pass.
 
@@ -103,7 +121,8 @@ fixed size threshold or whenever the live memory plan cannot safely retain the
 complete matrix on the heap. The mapping and its backing file are closed before
 staging cleanup even after an exception. Arithmetic centroids similarly retain the
 fast grouped mean and use a stable online mean only if finite extreme values overflow
-its internal sum.
+its internal sum. Explicitly weighted centroids use a stable online weighted mean
+after a mathematically inert within-group rescaling.
 
 `group-distance` never needs cell-to-centroid distances and therefore does not compute
 them. It uses only the centroid-to-centroid matrix. The per-cell `distance` in
@@ -123,10 +142,13 @@ forward-error bound for a dot product of the configured dimension are set to exa
 zero. This prevents numerical residue from becoming an artificial automatic bandwidth
 while preserving genuinely positive distances above that bound.
 
-With one observed group, PCA and standardized expression both make the only group
-centroid exactly zero. SPATHI therefore rejects either centered representation combined
-with cosine distance before preprocessing; unstandardized expression or Euclidean
-distance remains defined.
+With one observed group, cross-group sharing and group-size correction have no
+scientific meaning. SPATHI requires `cell-distance` and `group_size_correction=none`
+for that case; it rejects other requested modes rather than rewriting them silently.
+A centered distance space (PCA or standardized expression) additionally requires
+Euclidean distance under the single-group contract. Its primary uniform centroid is
+exactly zero; explicit centroid weights do not silently relax this declared geometry.
+Unstandardized expression or Euclidean distance remains defined.
 
 ## Kernels and global bandwidth
 

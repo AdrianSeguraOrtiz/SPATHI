@@ -44,6 +44,9 @@ class InputData:
         is supplied, this contains every expression gene in matrix order.
     groups:
         Cell-to-group mapping, reordered to match the expression columns.
+    centroid_weights:
+        Optional positive cell weights used only to locate group centroids,
+        reordered to match the expression columns.
     input_fingerprints:
         Resolved paths, byte sizes, and SHA-256 digests of the exact parsed files.
     """
@@ -52,6 +55,7 @@ class InputData:
     transcription_factors: tuple[str, ...]
     targets: tuple[str, ...]
     groups: pd.Series
+    centroid_weights: pd.Series | None
     input_fingerprints: Mapping[str, InputFingerprint]
 
 
@@ -579,6 +583,113 @@ def _read_groups_with_fingerprint(
     return groups, fingerprint
 
 
+def _read_centroid_weights_with_fingerprint(
+    path: Pathish,
+    expression_cells: Sequence[str],
+) -> tuple[pd.Series, InputFingerprint]:
+    """Read strict positive centroid weights in expression-cell order."""
+
+    description = "Centroid weights table"
+    file_path = _validated_input_path(path, description=description)
+    cells: list[str] = []
+    weights: list[float] = []
+    try:
+        with file_path.open("rb") as handle:
+            initial_stat = os.fstat(handle.fileno())
+            digest = sha256()
+            reader = csv.reader(_hashed_utf8_lines(handle, digest), delimiter="\t", strict=True)
+            try:
+                header = next(reader)
+            except StopIteration as exc:
+                raise InputValidationError(
+                    "Centroid weights table is empty; the exact header "
+                    "'cell\\tcentroid_weight' is required"
+                ) from exc
+            if header != ["cell", "centroid_weight"]:
+                raise InputValidationError(
+                    "Centroid weights table must have exactly two columns named "
+                    "'cell' and 'centroid_weight', in that order"
+                )
+            for row in reader:
+                line_number = reader.line_num
+                _validate_tsv_row(
+                    row,
+                    line_number=line_number,
+                    width=2,
+                    description=description,
+                )
+                cell = _validate_identifier(
+                    row[0], kind="cell", location=f"centroid weights line {line_number}"
+                )
+                try:
+                    weight = float(row[1])
+                except ValueError as exc:
+                    raise InputValidationError(
+                        f"Centroid weight must be numeric at centroid weights line {line_number}"
+                    ) from exc
+                if not np.isfinite(weight) or weight <= 0:
+                    raise InputValidationError(
+                        "Centroid weight must be a positive finite number at "
+                        f"centroid weights line {line_number}"
+                    )
+                cells.append(cell)
+                weights.append(weight)
+            fingerprint = _finish_fingerprint(
+                file_path,
+                handle,
+                digest,
+                initial_stat,
+                description=description,
+            )
+    except UnicodeDecodeError as exc:
+        raise InputValidationError(
+            f"Centroid weights table must be UTF-8 text: {file_path}"
+        ) from exc
+    except csv.Error as exc:
+        raise InputValidationError(f"Could not parse Centroid weights table as TSV: {exc}") from exc
+
+    if not cells:
+        raise InputValidationError("Centroid weights table has no cell rows")
+    duplicate_cells = sorted(value for value, count in Counter(cells).items() if count > 1)
+    if duplicate_cells:
+        raise InputValidationError(
+            "Centroid weights table contains repeated cells: " + _format_items(duplicate_cells)
+        )
+    series = pd.Series(
+        weights,
+        index=pd.Index(cells, name="cell"),
+        name="centroid_weight",
+        dtype=np.float64,
+    )
+    return _validate_centroid_weight_coverage(series, expression_cells), fingerprint
+
+
+def _validate_centroid_weight_coverage(
+    centroid_weights: pd.Series,
+    expression_cells: Sequence[str],
+) -> pd.Series:
+    expected = list(map(str, expression_cells))
+    expected_set = set(expected)
+    supplied_set = set(map(str, centroid_weights.index))
+    missing = [cell for cell in expected if cell not in supplied_set]
+    unexpected = [str(cell) for cell in centroid_weights.index if str(cell) not in expected_set]
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append(f"expression cells without a centroid weight: {_format_items(missing)}")
+        if unexpected:
+            details.append(
+                "centroid-weight rows absent from expression: " + _format_items(unexpected)
+            )
+        raise InputValidationError(
+            "centroid_weights.tsv must define every expression cell exactly once; "
+            + "; ".join(details)
+        )
+    aligned = centroid_weights.copy()
+    aligned.index = aligned.index.map(str)
+    return aligned.loc[expected].copy()
+
+
 def _check_joint_orientation(
     expression: pd.DataFrame,
     transcription_factors: Sequence[str],
@@ -605,6 +716,7 @@ def load_inputs(
     tf_list: Pathish,
     groups: Pathish,
     target_list: Pathish | None = None,
+    centroid_weights: Pathish | None = None,
 ) -> InputData:
     """Load all inputs and enforce their joint identifier contracts.
 
@@ -626,6 +738,16 @@ def load_inputs(
             expression_frame.index,
         )
     group_series = _validate_group_coverage(group_series, list(expression_frame.columns))
+    if centroid_weights is None:
+        centroid_weight_series = None
+        centroid_weights_fingerprint = None
+    else:
+        centroid_weight_series, centroid_weights_fingerprint = (
+            _read_centroid_weights_with_fingerprint(
+                centroid_weights,
+                list(expression_frame.columns),
+            )
+        )
     fingerprints = {
         "expression": expression_fingerprint,
         "tf_list": tf_fingerprint,
@@ -633,11 +755,14 @@ def load_inputs(
     }
     if target_fingerprint is not None:
         fingerprints["target_list"] = target_fingerprint
+    if centroid_weights_fingerprint is not None:
+        fingerprints["centroid_weights"] = centroid_weights_fingerprint
     return InputData(
         expression=expression_frame,
         transcription_factors=tuple(tf_ids),
         targets=tuple(target_ids),
         groups=group_series,
+        centroid_weights=centroid_weight_series,
         input_fingerprints=fingerprints,
     )
 

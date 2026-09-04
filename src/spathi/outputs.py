@@ -391,6 +391,23 @@ def write_tsv_records(
     return count
 
 
+def write_tsv_gzip_records(
+    records: Iterable[Mapping[str, object]],
+    path: Path,
+    columns: Sequence[str],
+) -> int:
+    """Stream canonical mapping records to a deterministic gzip TSV."""
+
+    count = 0
+    with _open_reproducible_gzip_text(path) as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow(columns)
+        for record in records:
+            writer.writerow(_clean_scalar(record[column]) for column in columns)
+            count += 1
+    return count
+
+
 def _json_compatible(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _json_compatible(item) for key, item in value.items()}

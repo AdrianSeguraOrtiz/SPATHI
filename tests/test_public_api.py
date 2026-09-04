@@ -52,10 +52,35 @@ def test_package_import_is_lazy_but_public_exports_remain_available() -> None:
             (
                 "import sys, spathi; "
                 "assert 'sklearn' not in sys.modules; "
-                "from spathi import SpathiConfig, SpathiProgressEvent, infer; "
+                "assert 'h5py' not in sys.modules; "
+                "from spathi import PrepareConfig, SpathiConfig, SpathiProgressEvent, infer; "
+                "assert PrepareConfig.__name__ == 'PrepareConfig'; "
                 "assert SpathiConfig.__name__ == 'SpathiConfig'; "
                 "assert SpathiProgressEvent.__name__ == 'SpathiProgressEvent'; "
                 "assert callable(infer)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_preparation_api_is_lazy_and_public() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, spathi; "
+                "assert 'h5py' not in sys.modules; "
+                "from spathi import PreparationInputError, PrepareResult, prepare; "
+                "assert PreparationInputError.__name__ == 'PreparationInputError'; "
+                "assert PrepareResult.__name__ == 'PrepareResult'; "
+                "assert callable(prepare); "
+                "assert 'h5py' in sys.modules; "
+                "assert 'spathi.core' not in sys.modules"
             ),
         ],
         check=False,

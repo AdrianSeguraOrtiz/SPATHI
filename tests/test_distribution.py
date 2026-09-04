@@ -26,8 +26,10 @@ def test_wheel_build_contains_package_and_console_entry_point(tmp_path: Path) ->
     with zipfile.ZipFile(wheels[0]) as archive:
         members = archive.namelist()
         assert "spathi/__init__.py" in members
+        assert "spathi/_publication.py" in members
         assert "spathi/_report.py" in members
         assert "spathi/core.py" in members
+        assert "spathi/preparation.py" in members
         assert "spathi/py.typed" in members
         assert "spathi/pipeline.py" not in members
         assert "spathi/prototypes.py" not in members
@@ -40,6 +42,8 @@ def test_wheel_build_contains_package_and_console_entry_point(tmp_path: Path) ->
         assert "License-Expression: MIT\n" in metadata
         assert "Requires-Python: >=3.11\n" in metadata
         assert "Requires-Dist: plotly>=6.0\n" in metadata
+        assert "Requires-Dist: h5py>=3.10\n" in metadata
+        assert "Requires-Dist: scipy>=1.11\n" in metadata
         assert "Requires-Dist: matplotlib" not in metadata.lower()
         assert "Classifier: Operating System :: OS Independent\n" not in metadata
         for classifier in (

@@ -597,6 +597,19 @@ class InteractiveReportBuilder:
             raise RuntimeError(f"report is missing target groups: {missing!r}")
         target_metrics = [metric for metric in self._target_metrics if metric is not None]
         sample = self.sample_indices
+        centroid_method = self.run_parameters.get("centroid_method", "arithmetic_mean")
+        if centroid_method == "weighted_mean":
+            centroid_interpretation = (
+                "Group centroids use the explicit generic centroid weights recorded in the run "
+                "parameters and centroid-weight diagnostics; these values locate centroids but "
+                "are not multiplied directly into model sample weights. This non-primary mode "
+                "is an explicit sensitivity analysis against the uniform-centroid baseline."
+            )
+        else:
+            centroid_interpretation = (
+                "Group centroids are arithmetic means, equivalent to a uniform centroid weight "
+                "for every cell."
+            )
         return {
             "schema_version": _REPORT_SCHEMA_VERSION,
             "projection": self.embedding.to_metadata(),
@@ -637,6 +650,7 @@ class InteractiveReportBuilder:
                 ),
             },
             "interpretation": [
+                centroid_interpretation,
                 "Weights shown in the target explorer are the final sample weights used by inference.",
                 "The continuous weight scale is fixed to 0–1 for every target group.",
                 "Scatter plots use one deterministic shared sample; aggregate values use all cells.",

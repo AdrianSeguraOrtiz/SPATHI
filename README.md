@@ -12,7 +12,7 @@ according to its transcriptomic proximity to the group of interest.
 > feature importance. An inferred edge is not evidence of causality, and SPATHI does
 > not infer whether regulation is activating or repressing.
 
-The project is independent of ANDREA. Its four input contracts and primary network
+The project is independent of ANDREA. Its input contracts and primary network
 output follow the same strict formats so an ANDREA container can install a pinned
 SPATHI release without coupling the two codebases.
 
@@ -30,7 +30,7 @@ weight observations, not to claim a biological direction between groups.
 For each target group, SPATHI:
 
 1. builds a cell representation for distance calculations;
-2. computes one centroid per group and reusable distances;
+2. computes one arithmetic or explicitly weighted centroid per group and reusable distances;
 3. converts distances to base weights with a kernel;
 4. optionally corrects external groups for multiplicity;
 5. trains one weighted tree ensemble per target gene on the supplied expression;
@@ -67,6 +67,72 @@ The wheel installs the `spathi` library and command. Example datasets and benchm
 utilities belong to the repository and source distribution, not to the installed
 wheel; commands below that reference `examples/` or `benchmarks/` therefore assume a
 source checkout or an unpacked source distribution.
+
+## Preparing a 10x matrix
+
+`spathi prepare` is an explicit stage for raw 10x Genomics feature-barcode H5
+matrices. It is deliberately separate from `spathi infer`: preparation makes
+normalization and filtering choices visible and produces the same strict TSV and text
+inputs accepted by SPATHI and ANDREA. `infer` does not read H5 files or silently alter
+raw counts.
+
+Preparation requires a study-independent annotation TSV with exactly these columns:
+
+```text
+cell    analysis_unit    cluster    centroid_weight
+cell_1  B_lineage        B_naive    0.92
+cell_2  B_lineage        B_memory   0.81
+```
+
+The fields shown aligned above are tabs. `cell`, `analysis_unit`, and `cluster` are
+required. `centroid_weight` is an optional positive finite value; when supplied for
+the complete table it is preserved as a separate `centroid_weights.tsv` artifact for
+each unit. No dataset-specific label or score name is built into SPATHI.
+
+Only cells listed in the annotation table are prepared. This makes exclusion of
+unclassified cells explicit: an annotation cell absent from the H5 is an error, while
+an H5 barcode absent from the annotations is counted as excluded in the manifest.
+Every annotated cell belongs to exactly one analysis unit and one cluster.
+
+For example:
+
+```bash
+spathi prepare \
+  --tenx-h5 data/filtered_feature_bc_matrix.h5 \
+  --annotations data/annotations.tsv \
+  --tf-list data/tf_list.txt \
+  --output-dir prepared/patient-01
+```
+
+The default transformation is library-size normalization to 10,000 counts followed
+by `log1p`. Library sizes use every `Gene Expression` feature before per-unit gene
+filtering. Units with fewer than 300 annotated cells are recorded but not emitted;
+override this study threshold explicitly with `--min-cells`. Genes detected in fewer
+than `--min-gene-cells` cells of a unit are omitted, and the supplied TF list is
+intersected with the retained genes while preserving its order.
+
+Repeated feature names are common in current human 10x references. With the default
+`--gene-identifier name --duplicate-gene-policy sum`, rows carrying the same symbol
+are collapsed by sparse summation before normalization and the decision is recorded.
+Use `--duplicate-gene-policy error` when aggregation is not appropriate.
+
+Outputs are written under `analysis_units/`, one directory per eligible unit:
+
+```text
+prepared/patient-01/
+├── prepare_manifest.json
+└── analysis_units/
+    └── unit-001-b-lineage/
+        ├── expression.tsv
+        ├── groups.tsv
+        ├── tf_list.txt
+        └── centroid_weights.tsv  # only when supplied
+```
+
+The H5 matrix remains sparse throughout processing. Writing the required dense TSV
+materializes only one gene row of one analysis unit at a time, never the complete
+patient matrix. See [the preparation contract](docs/preparation.md) for formulas,
+validation rules, output provenance, and all options.
 
 ## Input contracts
 
@@ -140,6 +206,31 @@ The fields shown aligned above are separated by tab characters in the actual fil
 Every expression cell must occur exactly once, and no extra cell is allowed. Cell IDs,
 cluster values, and group membership must be non-empty and valid.
 
+### Centroid weights
+
+`--centroid-weights` is an optional UTF-8 TSV with exactly these two columns in this
+order:
+
+```text
+cell    centroid_weight
+cell_1  0.92
+cell_2  0.81
+cell_3  0.76
+```
+
+Every expression cell must occur exactly once, no extra cell is allowed, and every
+weight must be numeric, finite, and strictly positive. Rows are aligned to expression
+columns by cell identifier. The exact file is fingerprinted for provenance and
+checkpoint identity.
+
+Omitting the file is the primary analysis: every group centroid is its arithmetic
+mean, equivalent to uniform centroid weights. Supplying the file changes only the
+location of each group centroid to its within-group weighted mean. SPATHI never
+multiplies these values directly into the tree ensemble's sample weights and does not
+use them to redefine observed group sizes. Explicit centroid weighting is therefore a
+sensitivity analysis, not a replacement for the uniform primary result. The generic
+field intentionally carries no dataset-specific score interpretation.
+
 See the
 [`examples/minimal`](https://github.com/AdrianSeguraOrtiz/SPATHI/tree/main/examples/minimal)
 directory for a complete small dataset.
@@ -185,9 +276,14 @@ than assigning an arbitrary similarity. Floating-point residues indistinguishabl
 zero under the documented dot-product error bound are canonicalized before bandwidth
 selection and weighting.
 
-A single observed group cannot be combined with cosine distance in a centered distance
-space (PCA or standardized expression), because its only centroid is necessarily zero.
-SPATHI rejects that geometry before allocating the scientific preprocessing state.
+A single observed group has no population-to-population borrowing to estimate. SPATHI
+therefore requires `cell-distance` with `--group-size-correction none`, preserving
+individual cell-to-centroid variation without applying a meaningless multiplicity
+correction. A centered distance space (PCA or standardized expression) additionally
+requires Euclidean distance under this single-group contract. The primary uniform
+centroid would be exactly zero there; supplying explicit centroid weights does not
+silently relax the declared single-group geometry. These contracts are validated
+before scientific preprocessing, and incompatible requested options are rejected.
 
 For PCA, the centered-data informative rank is capped at
 `min(n_genes, max(0, n_cells - 1))`; the one-cell case retains one structural
@@ -275,6 +371,19 @@ spathi infer \
   --target-list target_list.txt \
   --groups groups.tsv \
   --output-dir results/targeted-run
+```
+
+To run an explicit centroid-weight sensitivity analysis, repeat the otherwise
+identical primary command with a different output directory and add the optional
+input:
+
+```bash
+spathi infer \
+  --expression expression.tsv \
+  --tf-list tf_list.txt \
+  --groups groups.tsv \
+  --centroid-weights centroid_weights.tsv \
+  --output-dir results/weighted-centroid-sensitivity
 ```
 
 The output directory must not already exist; this prevents accidental replacement of a
@@ -371,9 +480,11 @@ Additional artifacts are:
 | File | Purpose |
 |---|---|
 | `cell_weights.tsv.gz` | authoritative long-form distances, base weights, size factors, and final model weights |
+| `centroid_weights.tsv.gz` | cell-aligned raw and within-group-normalized centroid weights; ones are written in primary uniform mode |
+| `centroid_weight_diagnostics.tsv` | exact per-group raw-weight sum, minimum, median, maximum, cell count, and effective sample size |
 | `group_distances.tsv` | pairwise centroid distances |
 | `group_affinities.tsv` | group-level centroid affinities and per-cell size-correction factors |
-| `centroids.tsv` | long-form `(group, dimension, centroid)` values for each reusable arithmetic centroid |
+| `centroids.tsv` | long-form `(group, dimension, centroid)` values for each reusable arithmetic or explicitly weighted centroid |
 | `weight_diagnostics.tsv` | authoritative effective weight mass, ranges, sample size, and source-group contributions |
 | `skipped_targets.tsv` | constant or otherwise non-trainable target models and reasons |
 | `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, fit status, and timing |
@@ -388,6 +499,11 @@ actual per-cell base model weight only in `group-distance` mode; it must not be 
 the effective contribution of a group in either cell-distance mode. The exact weights
 passed to the models are `cell_weights.tsv.gz:final_weight`, and their exact aggregate
 contributions are in `weight_diagnostics.tsv`.
+
+Likewise, `centroid_weights.tsv.gz:centroid_weight` is an input to centroid
+construction only. Its `normalized_centroid_weight` sums to one within each observed
+group and makes the fitted weighted mean auditable. Neither column is the estimator's
+sample weight; that remains `cell_weights.tsv.gz:final_weight`.
 
 Columns ending in `_json` contain compact JSON arrays. In particular, predictor names
 and warning messages remain unambiguous even when identifiers contain punctuation such

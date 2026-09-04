@@ -71,6 +71,15 @@ def test_cli_target_list_is_optional_and_typed_as_a_path() -> None:
     assert configured.target_list == Path("targets.txt")
 
 
+def test_cli_centroid_weights_are_optional_and_typed_as_a_path() -> None:
+    parser = build_parser()
+    assert config_from_args(parser.parse_args(BASE_ARGUMENTS)).centroid_weights is None
+    configured = config_from_args(
+        parser.parse_args([*BASE_ARGUMENTS, "--centroid-weights", "centroid_weights.tsv"])
+    )
+    assert configured.centroid_weights == Path("centroid_weights.tsv")
+
+
 def test_cli_report_is_enabled_unless_explicitly_disabled() -> None:
     parser = build_parser()
     assert config_from_args(parser.parse_args(BASE_ARGUMENTS)).report is True

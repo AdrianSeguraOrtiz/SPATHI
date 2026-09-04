@@ -1,4 +1,4 @@
-"""Typed configuration for SPATHI inference runs."""
+"""Typed configurations for SPATHI preparation and inference runs."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ GroupSizeCorrection: TypeAlias = Literal["none", "cap-to-target"]
 TreeMethod: TypeAlias = Literal["extra-trees", "random-forest"]
 Bandwidth: TypeAlias = Literal["auto"] | int | float
 MaxFeatures: TypeAlias = Literal["sqrt", "log2"] | int | float
+GeneIdentifier: TypeAlias = Literal["name", "id"]
+DuplicateGenePolicy: TypeAlias = Literal["sum", "error"]
+PreparationNormalization: TypeAlias = Literal["library-size-log1p"]
 
 WEIGHT_MODES: tuple[WeightMode, ...] = (
     "cell-distance",
@@ -36,6 +39,12 @@ MAX_RANDOM_SEED = 2**32 - 1
 DEFAULT_DISTANCE_METRIC: DistanceMetric = "cosine"
 DEFAULT_N_ESTIMATORS = 250
 DEFAULT_MAX_FEATURES: MaxFeatures = "sqrt"
+GENE_IDENTIFIERS: tuple[GeneIdentifier, ...] = ("name", "id")
+DUPLICATE_GENE_POLICIES: tuple[DuplicateGenePolicy, ...] = ("sum", "error")
+PREPARATION_NORMALIZATIONS: tuple[PreparationNormalization, ...] = ("library-size-log1p",)
+DEFAULT_PREPARE_MIN_CELLS = 300
+DEFAULT_PREPARE_MIN_GENE_CELLS = 1
+DEFAULT_PREPARE_TARGET_SUM = 10_000.0
 
 
 def _coerce_path(field_name: str, value: object) -> Path:
@@ -73,6 +82,64 @@ def _validate_integer(
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class PrepareConfig:
+    """Complete, immutable configuration for one generic preparation run.
+
+    The input is a 10x Genomics feature-barcode HDF5 matrix plus a generic
+    annotation table. Preparation selects annotated cells, splits them by
+    analysis unit, normalizes counts, and writes strict inference inputs.
+    """
+
+    tenx_h5: Path
+    annotations: Path
+    tf_list: Path
+    output_dir: Path
+    min_cells: int = DEFAULT_PREPARE_MIN_CELLS
+    min_gene_cells: int = DEFAULT_PREPARE_MIN_GENE_CELLS
+    normalization: PreparationNormalization = "library-size-log1p"
+    target_sum: float = DEFAULT_PREPARE_TARGET_SUM
+    gene_identifier: GeneIdentifier = "name"
+    duplicate_gene_policy: DuplicateGenePolicy = "sum"
+
+    def __post_init__(self) -> None:
+        """Reject invalid scalar configuration before opening any input."""
+
+        for field_name in ("tenx_h5", "annotations", "tf_list", "output_dir"):
+            object.__setattr__(
+                self,
+                field_name,
+                _coerce_path(field_name, getattr(self, field_name)),
+            )
+        _validate_integer("min_cells", self.min_cells, minimum=1)
+        _validate_integer("min_gene_cells", self.min_gene_cells, minimum=1)
+        _validate_choice(
+            "normalization",
+            self.normalization,
+            PREPARATION_NORMALIZATIONS,
+        )
+        _validate_choice("gene_identifier", self.gene_identifier, GENE_IDENTIFIERS)
+        _validate_choice(
+            "duplicate_gene_policy",
+            self.duplicate_gene_policy,
+            DUPLICATE_GENE_POLICIES,
+        )
+        if type(self.target_sum) not in {int, float}:
+            raise TypeError("target_sum must be a number")
+        target_sum = float(self.target_sum)
+        if not isfinite(target_sum) or target_sum <= 0:
+            raise ValueError("target_sum must be a positive finite number")
+        object.__setattr__(self, "target_sum", target_sum)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible representation of this configuration."""
+
+        values = asdict(self)
+        for key in ("tenx_h5", "annotations", "tf_list", "output_dir"):
+            values[key] = str(values[key])
+        return values
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SpathiConfig:
     """Complete, immutable configuration for one SPATHI run.
 
@@ -104,6 +171,7 @@ class SpathiConfig:
     threads: int = -1
     report: bool = True
     target_list: Path | None = None
+    centroid_weights: Path | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid scalar configuration before any input is read."""
@@ -119,6 +187,12 @@ class SpathiConfig:
                 self,
                 "target_list",
                 _coerce_path("target_list", self.target_list),
+            )
+        if self.centroid_weights is not None:
+            object.__setattr__(
+                self,
+                "centroid_weights",
+                _coerce_path("centroid_weights", self.centroid_weights),
             )
 
         _validate_choice("weight_mode", self.weight_mode, WEIGHT_MODES)
@@ -188,4 +262,6 @@ class SpathiConfig:
             values[key] = str(values[key])
         if values["target_list"] is not None:
             values["target_list"] = str(values["target_list"])
+        if values["centroid_weights"] is not None:
+            values["centroid_weights"] = str(values["centroid_weights"])
         return values

@@ -10,7 +10,12 @@ import pytest
 
 from spathi.diagnostics import compute_weight_diagnostics
 from spathi.inference import EdgeRecord, ModelStat, SkippedTargetRecord
-from spathi.outputs import IncrementalRunWriter, write_json, write_tsv_gzip
+from spathi.outputs import (
+    IncrementalRunWriter,
+    write_json,
+    write_tsv_gzip,
+    write_tsv_gzip_records,
+)
 from spathi.weighting import WeightingContext, WeightResult
 
 
@@ -160,6 +165,24 @@ def test_gzip_tsv_writer_preserves_requested_schema_and_is_reproducible(tmp_path
         observed = pd.read_csv(handle, sep="\t")
     assert observed.columns.tolist() == ["cell", "group", "PC1"]
     pd.testing.assert_frame_equal(observed, frame[["cell", "group", "PC1"]])
+
+
+def test_streaming_gzip_tsv_writer_is_reproducible(tmp_path: Path) -> None:
+    records = (
+        {"cell": "c1", "centroid_weight": 1.0},
+        {"cell": "c2", "centroid_weight": 0.5},
+    )
+    first = tmp_path / "first" / "centroid_weights.tsv.gz"
+    second = tmp_path / "second" / "centroid_weights.tsv.gz"
+    first.parent.mkdir()
+    second.parent.mkdir()
+
+    assert write_tsv_gzip_records(iter(records), first, ("cell", "centroid_weight")) == 2
+    assert write_tsv_gzip_records(iter(records), second, ("cell", "centroid_weight")) == 2
+
+    assert first.read_bytes() == second.read_bytes()
+    with gzip.open(first, "rt", encoding="utf-8") as handle:
+        assert handle.read() == "cell\tcentroid_weight\nc1\t1.0\nc2\t0.5\n"
 
 
 def test_gzip_outputs_are_byte_reproducible_and_have_zero_mtime(tmp_path: Path) -> None:

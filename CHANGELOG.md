@@ -8,6 +8,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Generic `spathi prepare` API and CLI stage for sparse 10x feature-barcode H5
+  matrices, strict study-independent annotations, explicit library-size-plus-log1p
+  normalization, per-analysis-unit filtering, TF intersection, optional centroid
+  weight preservation, complete provenance, and atomic ANDREA-compatible outputs.
+- Optional strict per-cell centroid weights for explicit sensitivity analyses, with
+  stable weighted centroids, checkpoint identity, cell-aligned raw and normalized
+  audit output, per-group effective-sample-size summaries, and report provenance. The
+  primary mode remains the uniform arithmetic centroid, and centroid weights are never
+  applied directly as estimator sample weights or as group-size corrections.
 - Initial standalone Python package, currently identified as `0.1.0.dev0`, with a
   CLI-independent inference core and the canonical
   `from spathi import SpathiConfig, SpathiProgressEvent, infer` API.

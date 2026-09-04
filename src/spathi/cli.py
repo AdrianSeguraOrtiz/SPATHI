@@ -20,14 +20,18 @@ from spathi.config import (
     DISTANCE_METRICS,
     DISTANCE_SPACES,
     DISTANCE_STANDARDIZATIONS,
+    DUPLICATE_GENE_POLICIES,
+    GENE_IDENTIFIERS,
     GROUP_SIZE_CORRECTIONS,
     KERNEL_NAMES,
     MAX_FEATURES_NAMES,
     MAX_RANDOM_SEED,
     PCA_SVD_SOLVERS,
+    PREPARATION_NORMALIZATIONS,
     TREE_METHODS,
     WEIGHT_MODES,
     MaxFeatures,
+    PrepareConfig,
     SpathiConfig,
 )
 from spathi.console import InferenceProgress, configure_logging, create_console, print_banner
@@ -35,15 +39,27 @@ from spathi.console import InferenceProgress, configure_logging, create_console,
 _CONFIG_DEFAULTS = {
     field.name: field.default for field in fields(SpathiConfig) if field.default is not MISSING
 }
+_PREPARE_CONFIG_DEFAULTS = {
+    field.name: field.default for field in fields(PrepareConfig) if field.default is not MISSING
+}
 
 
 def _config_default(field_name: str) -> Any:
-    """Return a scientific default from the canonical core configuration."""
+    """Return a scientific default from the canonical typed configuration."""
 
     try:
         return _CONFIG_DEFAULTS[field_name]
     except KeyError as exc:  # pragma: no cover - import-time developer error
         raise RuntimeError(f"SpathiConfig has no default for {field_name!r}") from exc
+
+
+def _prepare_config_default(field_name: str) -> Any:
+    """Return a preparation default from the canonical typed configuration."""
+
+    try:
+        return _PREPARE_CONFIG_DEFAULTS[field_name]
+    except KeyError as exc:  # pragma: no cover - import-time developer error
+        raise RuntimeError(f"PrepareConfig has no default for {field_name!r}") from exc
 
 
 class _HelpFormatter(RichHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -88,6 +104,16 @@ def _bandwidth(value: str) -> str | float:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number") from exc
+    if not isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
 def _max_features(value: str) -> MaxFeatures:
     if value in MAX_FEATURES_NAMES:
         return cast(MaxFeatures, value)
@@ -114,12 +140,94 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="spathi",
         description=(
-            "Infer group-specific gene-regulatory networks with transcriptomic similarity weights."
+            "Prepare single-cell inputs and infer group-specific gene-regulatory networks."
         ),
         formatter_class=_HelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"SPATHI {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare = subparsers.add_parser(
+        "prepare",
+        help="prepare a sparse 10x matrix as strict per-analysis-unit inference inputs",
+        description=(
+            "Select annotated cells from a 10x feature-barcode H5 matrix, split them by "
+            "analysis unit, normalize counts reproducibly, and write SPATHI/ANDREA inputs."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    prepare_inputs = prepare.add_argument_group("Inputs and outputs")
+    preprocessing = prepare.add_argument_group("Preprocessing")
+    prepare_execution = prepare.add_argument_group("Execution")
+    prepare_inputs.add_argument(
+        "--tenx-h5",
+        required=True,
+        type=Path,
+        help="10x Genomics feature-barcode H5 matrix containing raw counts",
+    )
+    prepare_inputs.add_argument(
+        "--annotations",
+        required=True,
+        type=Path,
+        help=(
+            "canonical TSV with cell, analysis_unit, and cluster columns; an optional "
+            "centroid_weight column is preserved in a separate output"
+        ),
+    )
+    prepare_inputs.add_argument(
+        "--tf-list",
+        required=True,
+        type=Path,
+        help="plain-text TF identifiers to intersect with each prepared expression matrix",
+    )
+    prepare_inputs.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help="new directory for prepared units; existing paths are never overwritten",
+    )
+    preprocessing.add_argument(
+        "--min-cells",
+        type=_positive_int,
+        default=_prepare_config_default("min_cells"),
+        help="minimum total annotated cells required to emit an analysis unit",
+    )
+    preprocessing.add_argument(
+        "--min-gene-cells",
+        type=_positive_int,
+        default=_prepare_config_default("min_gene_cells"),
+        help="minimum cells with non-zero counts required to retain a gene within a unit",
+    )
+    preprocessing.add_argument(
+        "--normalization",
+        choices=PREPARATION_NORMALIZATIONS,
+        default=_prepare_config_default("normalization"),
+        help="explicit count normalization applied before splitting outputs",
+    )
+    preprocessing.add_argument(
+        "--target-sum",
+        type=_positive_float,
+        default=_prepare_config_default("target_sum"),
+        help="per-cell library size before log1p in library-size-log1p normalization",
+    )
+    preprocessing.add_argument(
+        "--gene-identifier",
+        choices=GENE_IDENTIFIERS,
+        default=_prepare_config_default("gene_identifier"),
+        help="10x feature field used for expression rows and TF matching",
+    )
+    preprocessing.add_argument(
+        "--duplicate-gene-policy",
+        choices=DUPLICATE_GENE_POLICIES,
+        default=_prepare_config_default("duplicate_gene_policy"),
+        help="explicit handling of repeated selected gene identifiers",
+    )
+    prepare_execution.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="minimum log severity emitted to stderr",
+    )
 
     infer = subparsers.add_parser(
         "infer",
@@ -160,6 +268,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
         help="ANDREA-compatible TSV assigning every expression cell to a cluster",
+    )
+    inputs.add_argument(
+        "--centroid-weights",
+        type=Path,
+        help=(
+            "optional exact two-column TSV for an explicit centroid-only sensitivity "
+            "analysis; omitting it keeps primary arithmetic centroids"
+        ),
     )
     inputs.add_argument(
         "--output-dir",
@@ -323,6 +439,7 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         groups=args.groups,
         output_dir=args.output_dir,
         target_list=args.target_list,
+        centroid_weights=args.centroid_weights,
         weight_mode=args.weight_mode,
         distance_space=args.distance_space,
         n_components=args.n_components,
@@ -344,6 +461,23 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
     )
 
 
+def prepare_config_from_args(args: argparse.Namespace) -> PrepareConfig:
+    """Translate validated preparation CLI arguments to its immutable configuration."""
+
+    return PrepareConfig(
+        tenx_h5=args.tenx_h5,
+        annotations=args.annotations,
+        tf_list=args.tf_list,
+        output_dir=args.output_dir,
+        min_cells=args.min_cells,
+        min_gene_cells=args.min_gene_cells,
+        normalization=args.normalization,
+        target_sum=args.target_sum,
+        gene_identifier=args.gene_identifier,
+        duplicate_gene_policy=args.duplicate_gene_policy,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the SPATHI command line and return a process exit code."""
 
@@ -355,6 +489,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(cli_args)
     logger = configure_logging(console, args.log_level)
 
+    if args.command == "prepare":
+        try:
+            from spathi.preparation import prepare
+
+            prepare_result = prepare(prepare_config_from_args(args))
+        except KeyboardInterrupt:
+            logger.warning("Preparation interrupted by user; no output was published.")
+            return 130
+        except (MemoryError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.error("Preparation failed | %s", exc)
+            logger.debug("Preparation failure details", exc_info=True)
+            return 2
+        logger.info(
+            "Preparation complete | output=%s | prepared_units=%s | excluded_units=%s",
+            prepare_result.output_dir,
+            len(prepare_result.prepared_analysis_units),
+            len(prepare_result.excluded_analysis_units),
+        )
+        return 0
+
     if args.command == "infer":
         try:
             from spathi.core import infer
@@ -364,7 +518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 logger=logger,
                 enabled=args.progress,
             ) as progress:
-                result = infer(
+                inference_result = infer(
                     config_from_args(args),
                     progress_callback=progress.callback,
                     resume=args.resume,
@@ -382,7 +536,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger.error("Inference failed | %s", exc)
             logger.debug("Inference failure details", exc_info=True)
             return 2
-        logger.info("Run complete | output=%s | edges=%s", result.output_dir, result.n_edges)
+        logger.info(
+            "Run complete | output=%s | edges=%s",
+            inference_result.output_dir,
+            inference_result.n_edges,
+        )
         return 0
 
     parser.error(f"unknown command: {args.command}")
