@@ -301,9 +301,10 @@ all local input/output paths; the latter remain in `run_metadata.json`. Because
 cell identifiers can still encode sample or patient information, the report must follow
 the same data-governance policy as those identifiers when it is shared.
 
-In the target cell cloud, marker fill uses the same fixed 0–1 Cividis scale for every
-target group and encodes the exact `final_weight` passed to inference. Marker shape and
-outline identify the observed source group; a star marks the selected target centroid.
+In the target cell cloud, marker fill uses the same fixed 0–1 monochromatic blue scale
+for every target group and encodes the exact `final_weight` passed to inference. Marker
+shape identifies the observed source group, cell markers have no outline, and a star
+marks the selected target centroid.
 Group envelopes are deliberately absent because a two-dimensional PCA projection does
 not establish biological boundaries.
 

@@ -396,10 +396,11 @@ as semicolons or commas.
 `report.html` works offline: Plotly, styles, report data, and interaction logic are all
 embedded in that one file. Its **Target explorer** provides a group selector, warnings,
 summary cards, a PC1/PC2 cell cloud, distance-to-final-weight points, exact source-group
-mass bars, and exact full-data weight summaries. Marker fill uses one fixed 0–1 Cividis
-scale for `final_weight`; shape and outline identify the observed source group, and a
-star identifies the selected target centroid. Group envelopes are intentionally omitted
-because a two-dimensional PCA projection does not establish biological boundaries.
+mass bars, and exact full-data weight summaries. Marker fill uses one fixed 0–1
+monochromatic blue scale for `final_weight`; shape identifies the observed source group,
+cell markers have no outline, and a star identifies the selected target centroid. Group
+envelopes are intentionally omitted because a two-dimensional PCA projection does not
+establish biological boundaries.
 The cloud is not itself a plot of the configured metric: in particular, visual
 Euclidean separation in PC1/PC2 must not be read as cosine distance. Exact configured
 distances are shown in the adjacent distance-to-final-weight chart and in the tabular

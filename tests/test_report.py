@@ -279,6 +279,7 @@ def test_report_is_one_offline_html_with_all_interactive_views(
     assert 'id="target-status"' in document
     assert "the input identifiers of sampled cells" in document
     assert "not a plot of the configured distance" in document
+    assert "cell markers have no outline" in document
     for plot_id in (
         "target-pca",
         "distance-weight",
@@ -305,6 +306,11 @@ def test_plotly_layout_uses_current_title_objects() -> None:
     assert 'title:{text:"Cell groups in the shared PCA view"}' in javascript
     assert "xaxis:{title:{text:DATA.projection.x_label}}" in javascript
     assert 'colorbar:{title:{text:"Final weight"}}' in javascript
+    assert "colorscale:WEIGHT_COLORSCALE" in javascript
+    assert 'const WEIGHT_COLORSCALE=[[0,"#deebf7"]' in javascript
+    assert "Cividis" not in javascript
+    assert "line:{color:groupColor(g),width:1.2}" not in javascript
+    assert "symbol:SYMBOLS[g%SYMBOLS.length],line:{width:0}" in javascript
     assert "Auxiliary PCA explained variance (report only)" in javascript
     assert "groupLegend" in javascript
     assert 'event.key==="ArrowRight"' in javascript

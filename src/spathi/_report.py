@@ -710,6 +710,7 @@ _REPORT_APP_JAVASCRIPT = r"""
 "use strict";
 const DATA=JSON.parse(document.getElementById("spathi-report-data").textContent);
 const COLORS=["#0072B2","#D55E00","#009E73","#CC79A7","#E69F00","#56B4E9","#000000","#882255","#44AA99","#999933","#AA4499","#117733"];
+const WEIGHT_COLORSCALE=[[0,"#deebf7"],[.25,"#9ecae1"],[.5,"#6baed6"],[.75,"#3182bd"],[1,"#08519c"]];
 const SYMBOLS=["circle","square","triangle-up","triangle-down","cross","x","pentagon","hexagon","hourglass","bowtie"];
 const PLOT_CONFIG={responsive:true,displaylogo:false,scrollZoom:true,toImageButtonOptions:{format:"svg",filename:"spathi-plot"}};
 const BASE_LAYOUT={font:{family:'system-ui,-apple-system,"Segoe UI",sans-serif',color:"#132238"},paper_bgcolor:"#fff",plot_bgcolor:"#fff",margin:{l:72,r:32,t:64,b:72},hovermode:"closest"};
@@ -750,9 +751,9 @@ function renderOverview(){
 }
 function renderTarget(target){
  const weights=row(A.final_weight,target,S),distances=row(A.distance,target,S),base=row(A.base_weight,target,S),factors=row(A.group_size_factor,target,S),traces=[];
- for(let g=0;g<G;g++){const idx=groupRows[g],custom=idx.map(i=>[DATA.safe_sample_cells[i],safeGroup(g),Number(weights[i]),Number(distances[i]),Number(base[i]),Number(factors[i])]);traces.push({type:POINT_TRACE,mode:"markers",name:groupLegend(g),x:coord(idx,0),y:coord(idx,1),customdata:custom,hovertemplate:"<b>%{customdata[0]}</b><br>Source group: %{customdata[1]}<br>Final weight: %{customdata[2]:.6g}<br>Distance: %{customdata[3]:.6g}<br>Base weight: %{customdata[4]:.6g}<br>Size factor: %{customdata[5]:.6g}<extra></extra>",marker:{size:8,color:take(weights,idx),coloraxis:"coloraxis",symbol:SYMBOLS[g%SYMBOLS.length],line:{color:groupColor(g),width:1.2}}})}
+ for(let g=0;g<G;g++){const idx=groupRows[g],custom=idx.map(i=>[DATA.safe_sample_cells[i],safeGroup(g),Number(weights[i]),Number(distances[i]),Number(base[i]),Number(factors[i])]);traces.push({type:POINT_TRACE,mode:"markers",name:groupLegend(g),x:coord(idx,0),y:coord(idx,1),customdata:custom,hovertemplate:"<b>%{customdata[0]}</b><br>Source group: %{customdata[1]}<br>Final weight: %{customdata[2]:.6g}<br>Distance: %{customdata[3]:.6g}<br>Base weight: %{customdata[4]:.6g}<br>Size factor: %{customdata[5]:.6g}<extra></extra>",marker:{size:8,color:take(weights,idx),coloraxis:"coloraxis",symbol:SYMBOLS[g%SYMBOLS.length],line:{width:0}}})}
  traces.push({type:"scatter",mode:"markers",name:"Target centroid",x:[Number(A.centroids[target*2])],y:[Number(A.centroids[target*2+1])],hovertemplate:"Target centroid: "+safeGroup(target)+"<extra></extra>",marker:{size:19,symbol:"star",color:"#fff",line:{color:"#c43c35",width:3}}});
- Plotly.react("target-pca",traces,layout({title:{text:"Final weights for target "+safeGroup(target)},xaxis:{title:{text:DATA.projection.x_label}},yaxis:{title:{text:DATA.projection.y_label}},coloraxis:{colorscale:"Cividis",cmin:0,cmax:1,colorbar:{title:{text:"Final weight"}}},legend:{orientation:"h",y:-.2}}),PLOT_CONFIG);
+ Plotly.react("target-pca",traces,layout({title:{text:"Final weights for target "+safeGroup(target)},xaxis:{title:{text:DATA.projection.x_label}},yaxis:{title:{text:DATA.projection.y_label}},coloraxis:{colorscale:WEIGHT_COLORSCALE,cmin:0,cmax:1,colorbar:{title:{text:"Final weight"}}},legend:{orientation:"h",y:-.2}}),PLOT_CONFIG);
  const distanceTraces=[];for(let g=0;g<G;g++){const idx=groupRows[g];distanceTraces.push({type:POINT_TRACE,mode:"markers",name:groupLegend(g),x:take(distances,idx),y:take(weights,idx),customdata:idx.map(i=>[DATA.safe_sample_cells[i],Number(base[i]),Number(factors[i])]),hovertemplate:"<b>%{customdata[0]}</b><br>Distance: %{x:.6g}<br>Final weight: %{y:.6g}<br>Base weight: %{customdata[1]:.6g}<br>Size factor: %{customdata[2]:.6g}<extra></extra>",marker:{size:7,color:groupColor(g),symbol:SYMBOLS[g%SYMBOLS.length],opacity:.72}})}
  Plotly.react("distance-weight",distanceTraces,layout({title:{text:"Distance to final weight"},xaxis:{title:{text:"Weighting distance"},rangemode:"tozero"},yaxis:{title:{text:"Final weight"},range:[-.02,1.02]},legend:{orientation:"h",y:-.22}}),PLOT_CONFIG);
  const masses=Array.from(row(A.mass_percent,target,G),Number);
@@ -799,10 +800,10 @@ weights assigned to cells for every target group without leaving this file.</p><
 <div class="card plot wide" id="mass-heatmap" role="region" aria-label="Interactive heatmap of exact target-by-source final-weight mass"></div><div class="card plot wide" id="ess-overview" role="region" aria-label="Interactive effective sample size and target-group contribution by target group"></div></div></section>
 <section id="method-panel" class="panel" role="tabpanel" aria-labelledby="method-tab"><article class="card copy"><h2>How to read this report</h2>
 <p id="projection-note" class="notice"></p><ul id="interpretation-list"></ul>
-<h3>Visual encoding</h3><p>Marker fill uses one shared 0–1 Cividis scale for final weight.
-Marker shape and outline identify the observed source group; the star marks the selected
-target centroid. Group envelopes are deliberately omitted because a two-dimensional PCA
-projection does not establish biological boundaries.</p><h3>Data handling</h3><p class="notice">This file contains
+<h3>Visual encoding</h3><p>Marker fill uses one shared 0–1 monochromatic blue scale for final
+weight. Marker shape identifies the observed source group; cell markers have no outline,
+and the star marks the selected target centroid. Group envelopes are deliberately omitted
+because a two-dimensional PCA projection does not establish biological boundaries.</p><h3>Data handling</h3><p class="notice">This file contains
 the input identifiers of sampled cells, group labels, and derived coordinates, distances,
 weights, and summaries. It omits local input/output paths and the expression matrix. Treat the
 report according to the data-governance requirements for those identifiers.</p><h3>Run summary</h3><pre id="run-summary"></pre>
