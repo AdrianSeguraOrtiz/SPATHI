@@ -462,7 +462,7 @@ def test_single_group_pca_cosine_fails_before_scientific_preprocessing(
     output_dir = tmp_path / "single-group-pca-cosine"
     with pytest.raises(
         ValueError,
-        match="centered distance representation with cosine distance requires at least two groups",
+        match="single-group dataset must infer one individually cell-weighted network",
     ):
         infer(config_for(input_files, output_dir), checkpoint=False)
 
@@ -498,7 +498,7 @@ def test_single_group_standardized_expression_cosine_fails_before_preprocessing(
         }
     )
 
-    with pytest.raises(ValueError, match="centered distance representation with cosine"):
+    with pytest.raises(ValueError, match="centered distance spaces require"):
         infer(config, checkpoint=False)
 
     assert not output_dir.exists()
@@ -524,6 +524,8 @@ def test_single_group_remains_valid_outside_pca_cosine(
     config = SpathiConfig(
         **{
             **base.to_dict(),
+            "weight_mode": "cell-distance",
+            "group_size_correction": "none",
             "distance_space": distance_space,
             "distance_metric": distance_metric,
         }
@@ -532,6 +534,44 @@ def test_single_group_remains_valid_outside_pca_cosine(
     result = infer(config, checkpoint=False)
 
     assert result.total_models == 4
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"weight_mode": "cell-distance-group-anchored", "group_size_correction": "none"},
+            "weight_mode must be 'cell-distance'",
+        ),
+        (
+            {"weight_mode": "group-distance", "group_size_correction": "none"},
+            "weight_mode must be 'cell-distance'",
+        ),
+        (
+            {"weight_mode": "cell-distance", "group_size_correction": "cap-to-target"},
+            "group_size_correction must be 'none'",
+        ),
+    ],
+)
+def test_single_group_rejects_semantically_incompatible_weighting_before_checkpoint(
+    tmp_path: Path,
+    input_files: dict[str, Path],
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    input_files["groups"].write_text(
+        "sample\tcluster\ncell_1\tA\ncell_2\tA\ncell_3\tA\ncell_4\tA\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "invalid-single-group"
+    base = config_for(input_files, output_dir)
+    config = SpathiConfig(**{**base.to_dict(), **overrides})
+
+    with pytest.raises(ValueError, match=message):
+        infer(config)
+
+    assert not output_dir.exists()
+    assert not (tmp_path / ".invalid-single-group.checkpoint").exists()
 
 
 @pytest.mark.integration

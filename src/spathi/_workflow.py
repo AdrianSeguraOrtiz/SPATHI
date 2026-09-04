@@ -627,6 +627,37 @@ def run_workflow(
         )
 
 
+def validate_group_configuration(config: SpathiConfig, *, group_count: int) -> None:
+    """Reject weighting configurations that lose their meaning for one group.
+
+    A group-anchored or group-distance run collapses to unit weights when only one
+    group is observed.  That is a valid unweighted ensemble, but it is not the
+    requested SPATHI cell-to-centroid model.  Validate this data-dependent contract
+    explicitly instead of silently publishing a differently defined network.
+    """
+
+    if group_count < 1:
+        raise ValueError("at least one observed group is required")
+    if group_count != 1:
+        return
+
+    incompatible: list[str] = []
+    if config.weight_mode != "cell-distance":
+        incompatible.append("weight_mode must be 'cell-distance'")
+    if config.group_size_correction != "none":
+        incompatible.append("group_size_correction must be 'none'")
+    centered_distance_space = (
+        config.distance_space == "pca" or config.distance_standardization == "standard"
+    )
+    if centered_distance_space and config.distance_metric != "euclidean":
+        incompatible.append("centered distance spaces require distance_metric='euclidean'")
+    if incompatible:
+        raise ValueError(
+            "A single-group dataset must infer one individually cell-weighted network; "
+            + "; ".join(incompatible)
+        )
+
+
 def _run_workflow_impl(
     config: SpathiConfig,
     *,
@@ -658,15 +689,7 @@ def _run_workflow_impl(
     cell_names = list(map(str, expression_frame.columns))
     tf_names = list(inputs.transcription_factors)
     group_ids = sorted(map(str, pd.unique(inputs.groups)))
-    centered_distance_space = (
-        config.distance_space == "pca" or config.distance_standardization == "standard"
-    )
-    if len(group_ids) == 1 and centered_distance_space and config.distance_metric == "cosine":
-        raise ValueError(
-            "A centered distance representation with cosine distance requires at least two "
-            "groups: centering makes the only group centroid the zero vector; use euclidean "
-            "distance or unstandardized expression space"
-        )
+    validate_group_configuration(config, group_count=len(group_ids))
     weighting_context = prepare_weighting_context(inputs.groups, cell_ids=cell_names)
     group_sizes = dict(
         zip(weighting_context.group_ids, map(int, weighting_context.group_counts), strict=True)

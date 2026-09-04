@@ -444,6 +444,7 @@ def infer(
     )
     input_validation_seconds = perf_counter() - validation_started
     group_count = len(inputs.groups.unique())
+    workflow.validate_group_configuration(config, group_count=group_count)
 
     checkpoint_context: Any = nullcontext(None)
     if checkpoint:
