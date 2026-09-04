@@ -45,6 +45,84 @@ def test_arithmetic_centroids_remain_finite_at_float64_maximum() -> None:
     assert np.isfinite(centroids.to_numpy()).all()
 
 
+def test_centroids_support_explicit_cell_weights_aligned_by_identifier() -> None:
+    representation, groups = toy_representation()
+    weights = pd.Series([3.0, 1.0, 3.0, 1.0], index=["c4", "c3", "c2", "c1"])
+
+    centroids = compute_centroids(
+        representation,
+        groups,
+        centroid_weights=weights,
+    )
+
+    np.testing.assert_allclose(centroids.to_numpy(), [[1.5, 0.0], [5.5, 0.0]])
+
+
+def test_weighted_centroids_are_invariant_to_group_wide_weight_scaling() -> None:
+    representation, groups = toy_representation()
+    first = compute_centroids(
+        representation,
+        groups,
+        centroid_weights=[1.0, 3.0, 2.0, 1.0],
+    )
+    second = compute_centroids(
+        representation,
+        groups,
+        centroid_weights=[10.0, 30.0, 0.5, 0.25],
+    )
+
+    np.testing.assert_allclose(first, second)
+
+
+def test_weighted_centroid_of_one_positive_cell_is_that_cell() -> None:
+    representation, groups = toy_representation()
+    centroids = compute_centroids(
+        representation,
+        groups,
+        centroid_weights=[0.0, 4.0, 0.0, 2.0],
+    )
+
+    np.testing.assert_array_equal(centroids.to_numpy(), [[2.0, 0.0], [6.0, 0.0]])
+
+
+@pytest.mark.parametrize(
+    ("weights", "message"),
+    [
+        ([1.0, 2.0], "length does not match"),
+        ([1.0, -1.0, 1.0, 1.0], "must be non-negative"),
+        ([1.0, np.nan, 1.0, 1.0], "only finite"),
+        ([0.0, 0.0, 1.0, 1.0], "sum to zero for group 'A'"),
+    ],
+)
+def test_weighted_centroids_reject_invalid_weights(
+    weights: list[float],
+    message: str,
+) -> None:
+    representation, groups = toy_representation()
+
+    with pytest.raises(ValueError, match=message):
+        compute_centroids(representation, groups, centroid_weights=weights)
+
+
+def test_weighted_centroids_remain_finite_at_float64_extremes() -> None:
+    maximum = np.finfo(np.float64).max
+    representation = pd.DataFrame(
+        [[maximum, maximum], [maximum, -maximum], [maximum, maximum]],
+        index=["c1", "c2", "c3"],
+        columns=["same_sign", "mixed_sign"],
+    )
+
+    centroids = compute_centroids(
+        representation,
+        ["A", "A", "A"],
+        centroid_weights=[maximum, maximum, maximum],
+    )
+
+    assert centroids.loc["A", "same_sign"] == maximum
+    assert centroids.loc["A", "mixed_sign"] == pytest.approx(maximum / 3.0)
+    assert np.isfinite(centroids.to_numpy()).all()
+
+
 def test_cell_and_centroid_distances_have_expected_values() -> None:
     representation, groups = toy_representation()
     centroids = compute_centroids(representation, groups)

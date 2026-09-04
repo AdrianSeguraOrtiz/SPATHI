@@ -99,17 +99,103 @@ def _ordered_groups(
     return labels, order
 
 
+def _aligned_centroid_weights(
+    centroid_weights: pd.Series | Sequence[float],
+    cells: tuple[str, ...],
+) -> np.ndarray:
+    """Return finite non-negative centroid weights in representation order."""
+
+    if isinstance(centroid_weights, pd.Series):
+        if centroid_weights.index.has_duplicates:
+            raise ValueError("centroid_weights index contains duplicate cell identifiers")
+        string_index = pd.Index(map(str, centroid_weights.index))
+        indexed_cells = set(string_index)
+        represented_cells = set(cells)
+        if indexed_cells != represented_cells:
+            missing = [cell for cell in cells if cell not in indexed_cells]
+            unexpected = [cell for cell in string_index if cell not in represented_cells]
+            raise ValueError(
+                "centroid_weights must cover representation cells exactly; "
+                f"missing={missing!r}, unexpected={unexpected!r}"
+            )
+        aligned = centroid_weights.copy()
+        aligned.index = string_index
+        raw_weights = aligned.loc[list(cells)].to_numpy()
+    else:
+        raw_weights = np.asarray(list(centroid_weights))
+        if raw_weights.shape != (len(cells),):
+            raise ValueError(
+                "centroid_weights length does not match the number of represented cells"
+            )
+
+    try:
+        values = np.asarray(raw_weights, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("centroid_weights must contain only numeric values") from exc
+    if not np.isfinite(values).all():
+        raise ValueError("centroid_weights must contain only finite values")
+    if np.any(values < 0):
+        raise ValueError("centroid_weights must be non-negative")
+    return values
+
+
+def _compute_weighted_centroids(
+    values: np.ndarray,
+    labels: np.ndarray,
+    order: Sequence[Hashable],
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Compute scale-invariant weighted means without overflowing weight sums."""
+
+    result = np.empty((len(order), values.shape[1]), dtype=np.float64)
+    for group_index, group in enumerate(order):
+        positions = np.flatnonzero(labels == group)
+        group_weights = weights[positions]
+        positive = group_weights > 0
+        if not np.any(positive):
+            raise ValueError(f"centroid_weights sum to zero for group {group!r}")
+        positions = positions[positive]
+        group_weights = group_weights[positive]
+
+        # A group-wide rescaling is mathematically inert and keeps both the
+        # accumulated mass and each update finite even for weights near float64 max.
+        scaled = group_weights / np.max(group_weights)
+        mean = np.array(values[positions[0]], dtype=np.float64, copy=True)
+        accumulated = float(scaled[0])
+        for position, weight in zip(positions[1:], scaled[1:], strict=True):
+            updated = accumulated + float(weight)
+            fraction = float(weight) / updated
+            mean = (1.0 - fraction) * mean + fraction * values[position]
+            accumulated = updated
+        result[group_index] = mean
+    return result
+
+
 def compute_centroids(
     representation: RepresentationResult | pd.DataFrame | np.ndarray,
     groups: pd.Series | Sequence[Hashable],
     *,
     cell_ids: Sequence[str] | None = None,
     group_order: Sequence[Hashable] | None = None,
+    centroid_weights: pd.Series | Sequence[float] | None = None,
 ) -> pd.DataFrame:
-    """Compute one arithmetic-mean centroid per group."""
+    """Compute one arithmetic or explicitly weighted centroid per group."""
 
     values, cells, dimensions = _coerce_representation(representation, cell_ids)
     labels, order = _ordered_groups(groups, cells, group_order)
+
+    if centroid_weights is not None:
+        aligned_weights = _aligned_centroid_weights(centroid_weights, cells)
+        centroid_values = _compute_weighted_centroids(values, labels, order, aligned_weights)
+        centroids = pd.DataFrame(
+            centroid_values,
+            index=pd.Index(order, name="group"),
+            columns=dimensions,
+            copy=False,
+        )
+        if not np.isfinite(centroid_values).all():
+            raise ValueError("centroid calculation produced non-finite values")
+        return centroids
 
     frame = pd.DataFrame(values, index=cells, columns=dimensions, copy=False)
     grouped = frame.groupby(labels, sort=False, observed=True)
