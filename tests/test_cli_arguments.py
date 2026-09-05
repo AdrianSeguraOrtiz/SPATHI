@@ -133,6 +133,11 @@ def test_cli_rejects_invalid_numeric_options(arguments: list[str]) -> None:
         build_parser().parse_args(arguments)
 
 
+def test_cli_accepts_explicit_automatic_thread_budget() -> None:
+    configured = config_from_args(build_parser().parse_args([*BASE_ARGUMENTS, "--threads", "auto"]))
+    assert configured.threads == "auto"
+
+
 def test_cli_help_explains_ambiguous_max_features_and_automatic_bootstrap(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

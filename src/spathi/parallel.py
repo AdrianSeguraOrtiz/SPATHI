@@ -18,16 +18,20 @@ import hashlib
 import json
 import os
 from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass
-from itertools import islice
 from typing import Any, Literal, TypeVar, cast
 
-from joblib import Parallel, cpu_count, delayed
+from joblib import cpu_count
 from threadpoolctl import threadpool_limits
+
+from spathi.config import ThreadBudget
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+MAX_PENDING_TASKS_PER_WORKER = 2
 
 ParallelLevel = Literal["none", "tasks", "estimator"]
 
@@ -37,12 +41,12 @@ class ParallelPlan:
     """Resolved allocation of SPATHI's one public thread budget.
 
     ``effective_threads`` is the actual maximum allocation after resolving
-    ``-1``, process-visible CPUs, and any outer-concurrency cap. ``outer_jobs``
+    ``auto``, process-visible CPUs, and any outer-concurrency cap. ``outer_jobs``
     and ``model_n_jobs`` show where that allocation is spent. At most one of
     those fields can be greater than one.
     """
 
-    requested_threads: int
+    requested_threads: ThreadBudget
     available_threads: int
     effective_threads: int
     total_tasks: int
@@ -73,7 +77,7 @@ def available_cpu_count() -> int:
 
 
 def resolve_thread_budget(
-    threads: int,
+    threads: ThreadBudget,
     n_tasks: int,
     *,
     available_threads: int | None = None,
@@ -84,8 +88,8 @@ def resolve_thread_budget(
     Parameters
     ----------
     threads:
-        ``-1`` requests all available logical CPUs. A positive integer is a
-        maximum budget. Zero and values below ``-1`` are invalid.
+        ``"auto"`` requests all available logical CPUs. A positive integer is a
+        maximum budget.
     n_tasks:
         Number of independent model fits in the run.
     available_threads:
@@ -103,10 +107,10 @@ def resolve_thread_budget(
     budget is never multiplied through nested joblib pools.
     """
 
-    if isinstance(threads, bool) or not isinstance(threads, int):
-        raise TypeError("threads must be -1 or a positive integer")
-    if threads == 0 or threads < -1:
-        raise ValueError("threads must be -1 or a positive integer")
+    if threads != "auto" and (isinstance(threads, bool) or not isinstance(threads, int)):
+        raise TypeError("threads must be 'auto' or a positive integer")
+    if threads != "auto" and threads < 1:
+        raise ValueError("threads must be 'auto' or a positive integer")
     if isinstance(n_tasks, bool) or not isinstance(n_tasks, int):
         raise TypeError("n_tasks must be a non-negative integer")
     if n_tasks < 0:
@@ -124,7 +128,7 @@ def resolve_thread_budget(
     ):
         raise ValueError("max_outer_jobs must be a positive integer or None")
 
-    budget = capacity if threads == -1 else min(threads, capacity)
+    budget = capacity if threads == "auto" else min(threads, capacity)
     budget = max(1, budget)
 
     if n_tasks == 0 or budget == 1:
@@ -213,15 +217,13 @@ def execute_tasks(
     function: Callable[[T], R],
     tasks: Iterable[T],
     plan: ParallelPlan,
-    *,
-    verbose: int = 0,
 ) -> list[R]:
     """Execute tasks according to ``plan`` while limiting native thread pools.
 
-    Joblib preserves input ordering in the returned list, so result ordering does
-    not depend on completion timing. Native BLAS/OpenMP pools are constrained to
-    one thread; model-level tree parallelism remains controlled by the
-    estimator's joblib ``n_jobs`` setting.
+    :class:`PersistentTaskExecutor` restores input ordering in the returned list,
+    so result ordering does not depend on completion timing. Native BLAS/OpenMP
+    pools are constrained to one thread; model-level tree parallelism remains
+    controlled by the estimator's joblib ``n_jobs`` setting.
     """
 
     task_list = list(tasks)
@@ -230,10 +232,7 @@ def execute_tasks(
             "parallel plan/task mismatch: "
             f"plan has {plan.total_tasks} tasks, received {len(task_list)}"
         )
-    if isinstance(verbose, bool) or not isinstance(verbose, int) or verbose < 0:
-        raise ValueError("verbose must be a non-negative integer")
-
-    with PersistentTaskExecutor(plan, verbose=verbose) as executor:
+    with PersistentTaskExecutor(plan) as executor:
         return executor.execute(function, task_list)
 
 
@@ -245,15 +244,12 @@ class PersistentTaskExecutor:
     without materializing a result collection.
     """
 
-    def __init__(self, plan: ParallelPlan, *, verbose: int = 0) -> None:
+    def __init__(self, plan: ParallelPlan) -> None:
         if not isinstance(plan, ParallelPlan):
             raise TypeError("plan must be a ParallelPlan")
-        if isinstance(verbose, bool) or not isinstance(verbose, int) or verbose < 0:
-            raise ValueError("verbose must be a non-negative integer")
         self.plan = plan
-        self.verbose = verbose
         self._stack: ExitStack | None = None
-        self._parallel: Parallel | None = None
+        self._pool: ThreadPoolExecutor | None = None
 
     def __enter__(self) -> PersistentTaskExecutor:
         if self._stack is not None:
@@ -262,20 +258,17 @@ class PersistentTaskExecutor:
         try:
             stack.enter_context(threadpool_limits(limits=1))
             if self.plan.outer_jobs > 1:
-                parallel = Parallel(
-                    n_jobs=self.plan.outer_jobs,
-                    backend="threading",
-                    prefer="threads",
-                    require="sharedmem",
-                    verbose=self.verbose,
-                    return_as="generator_unordered",
+                pool = stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=self.plan.outer_jobs,
+                        thread_name_prefix="spathi-model",
+                    )
                 )
-                stack.enter_context(parallel)
-                self._parallel = parallel
+                self._pool = pool
         except BaseException:
             # ``threadpool_limits`` mutates process-wide native pool settings.
-            # Restore them even when constructing/entering Joblib's pool fails.
-            self._parallel = None
+            # Restore them even when constructing or entering the worker pool fails.
+            self._pool = None
             stack.close()
             raise
         self._stack = stack
@@ -284,9 +277,64 @@ class PersistentTaskExecutor:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         stack = self._stack
         self._stack = None
-        self._parallel = None
+        self._pool = None
         if stack is not None:
             stack.__exit__(exc_type, exc, traceback)
+
+    def _consume_rolling(
+        self,
+        function: Callable[[T], R],
+        tasks: Iterable[T],
+        *,
+        on_result: Callable[[int, R], None],
+    ) -> None:
+        """Run a bounded rolling task window and consume completions on this thread."""
+
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError("parallel worker pool is unavailable")
+
+        task_iterator = iter(tasks)
+        maximum_pending = self.plan.outer_jobs * MAX_PENDING_TASKS_PER_WORKER
+        pending: dict[Future[R], int] = {}
+        next_index = 0
+
+        def submit_one() -> bool:
+            nonlocal next_index
+            try:
+                task = next(task_iterator)
+            except StopIteration:
+                return False
+            future = pool.submit(function, task)
+            pending[future] = next_index
+            next_index += 1
+            return True
+
+        try:
+            while len(pending) < maximum_pending and submit_one():
+                pass
+            while pending:
+                completed, _not_completed = wait(pending, return_when=FIRST_COMPLETED)
+                # Consume exactly one completion before replenishing the window.
+                # Keeping a whole completed set alive while refilling every vacancy
+                # can temporarily retain two windows of dense ModelResult objects.
+                # Submission order is the deterministic tie-breaker when several
+                # futures completed before the caller regained control.
+                future = min(completed, key=pending.__getitem__)
+                task_index = pending.pop(future)
+                result = future.result()
+                # Drop every executor-owned reference to the completed Future
+                # before the callback and before admitting replacement work. This
+                # makes the configured rolling-window bound exact for dense results.
+                del future
+                del completed
+                on_result(task_index, result)
+                del result
+                submit_one()
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
 
     def execute(
         self,
@@ -304,18 +352,13 @@ class PersistentTaskExecutor:
         if self.plan.outer_jobs == 1:
             return [function(task) for task in task_list]
 
-        assert self._parallel is not None
-
-        def indexed(task_index: int, task: T) -> tuple[int, R]:
-            return task_index, function(task)
-
-        pending = self._parallel(
-            delayed(indexed)(task_index, task) for task_index, task in enumerate(task_list)
-        )
         missing = object()
         by_index: list[R | object] = [missing] * len(task_list)
-        for task_index, result in pending:
+
+        def collect(task_index: int, result: R) -> None:
             by_index[task_index] = result
+
+        self._consume_rolling(function, task_list, on_result=collect)
         if any(result is missing for result in by_index):
             raise RuntimeError("parallel execution returned an incomplete result set")
         return [cast(R, result) for result in by_index]
@@ -327,12 +370,12 @@ class PersistentTaskExecutor:
         *,
         on_result: Callable[[R], None],
     ) -> None:
-        """Process results with a strictly bounded completion backlog.
+        """Process results through a bounded rolling window.
 
-        Joblib's unordered generator does not apply backpressure while the caller
-        handles a completed result. Submit at most one outer-worker wave at a time
-        so slow checkpoint or output callbacks can never leave a batch-sized
-        collection of completed model results queued in memory.
+        At most two tasks per worker are submitted at once. The spare wave keeps
+        workers busy when model durations differ or the caller is committing a
+        completed result, while bounding both running work and completed results.
+        Callbacks always run on the caller's orchestration thread.
         """
 
         if self._stack is None:
@@ -345,17 +388,17 @@ class PersistentTaskExecutor:
                 on_result(function(task))
             return
 
-        assert self._parallel is not None
-        task_iterator = iter(tasks)
-        while task_wave := tuple(islice(task_iterator, self.plan.outer_jobs)):
-            pending = self._parallel(delayed(function)(task) for task in task_wave)
-            for result in pending:
-                on_result(result)
+        self._consume_rolling(
+            function,
+            tasks,
+            on_result=lambda _task_index, result: on_result(result),
+        )
 
 
 __all__ = [
     "ParallelPlan",
     "PersistentTaskExecutor",
+    "MAX_PENDING_TASKS_PER_WORKER",
     "available_cpu_count",
     "execute_tasks",
     "resolve_thread_budget",

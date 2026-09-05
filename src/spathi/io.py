@@ -583,11 +583,18 @@ def _read_groups_with_fingerprint(
     return groups, fingerprint
 
 
-def _read_centroid_weights_with_fingerprint(
+def read_centroid_weights_with_fingerprint(
     path: Pathish,
-    expression_cells: Sequence[str],
+    expected_cells: Sequence[str],
+    *,
+    expected_cell_source: str = "expression",
 ) -> tuple[pd.Series, InputFingerprint]:
-    """Read strict positive centroid weights in expression-cell order."""
+    """Read strict centroid weights for SPATHI's internal input pipelines.
+
+    This shared package-internal contract is used by both direct inference and
+    10x preparation. It is intentionally absent from :data:`__all__`; callers of
+    SPATHI's supported API should use :func:`load_inputs` or ``spathi prepare``.
+    """
 
     description = "Centroid weights table"
     file_path = _validated_input_path(path, description=description)
@@ -661,14 +668,23 @@ def _read_centroid_weights_with_fingerprint(
         name="centroid_weight",
         dtype=np.float64,
     )
-    return _validate_centroid_weight_coverage(series, expression_cells), fingerprint
+    return (
+        _validate_centroid_weight_coverage(
+            series,
+            expected_cells,
+            expected_cell_source=expected_cell_source,
+        ),
+        fingerprint,
+    )
 
 
 def _validate_centroid_weight_coverage(
     centroid_weights: pd.Series,
-    expression_cells: Sequence[str],
+    expected_cells: Sequence[str],
+    *,
+    expected_cell_source: str = "expression",
 ) -> pd.Series:
-    expected = list(map(str, expression_cells))
+    expected = list(map(str, expected_cells))
     expected_set = set(expected)
     supplied_set = set(map(str, centroid_weights.index))
     missing = [cell for cell in expected if cell not in supplied_set]
@@ -676,13 +692,16 @@ def _validate_centroid_weight_coverage(
     if missing or unexpected:
         details: list[str] = []
         if missing:
-            details.append(f"expression cells without a centroid weight: {_format_items(missing)}")
+            details.append(
+                f"{expected_cell_source} cells without a centroid weight: " + _format_items(missing)
+            )
         if unexpected:
             details.append(
-                "centroid-weight rows absent from expression: " + _format_items(unexpected)
+                f"centroid-weight rows absent from {expected_cell_source}: "
+                + _format_items(unexpected)
             )
         raise InputValidationError(
-            "centroid_weights.tsv must define every expression cell exactly once; "
+            f"centroid_weights.tsv must define every {expected_cell_source} cell exactly once; "
             + "; ".join(details)
         )
     aligned = centroid_weights.copy()
@@ -743,7 +762,7 @@ def load_inputs(
         centroid_weights_fingerprint = None
     else:
         centroid_weight_series, centroid_weights_fingerprint = (
-            _read_centroid_weights_with_fingerprint(
+            read_centroid_weights_with_fingerprint(
                 centroid_weights,
                 list(expression_frame.columns),
             )

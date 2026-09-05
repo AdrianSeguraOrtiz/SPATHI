@@ -1,4 +1,4 @@
-from threading import get_ident
+from threading import Event, get_ident
 
 import pytest
 
@@ -42,9 +42,9 @@ def test_thread_budget_respects_caller_supplied_outer_memory_cap() -> None:
     assert single_model.parallel_level == "estimator"
 
 
-def test_minus_one_resolves_to_available_cpu_capacity() -> None:
-    plan = resolve_thread_budget(-1, 20, available_threads=6)
-    assert plan.requested_threads == -1
+def test_auto_resolves_to_available_cpu_capacity() -> None:
+    plan = resolve_thread_budget("auto", 20, available_threads=6)
+    assert plan.requested_threads == "auto"
     assert plan.effective_threads == 6
 
 
@@ -88,35 +88,48 @@ def test_persistent_executor_can_consume_without_collecting_results() -> None:
     assert callback_threads == [caller_thread] * 3
 
 
-def test_persistent_executor_bounds_completed_result_backlog_to_one_worker_wave(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    submitted_wave_sizes: list[int] = []
-
-    class RecordingParallel:
-        def __init__(self, **kwargs: object) -> None:
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-        def __call__(self, jobs: object):
-            submitted = list(jobs)  # type: ignore[arg-type]
-            submitted_wave_sizes.append(len(submitted))
-            return (function(*args, **kwargs) for function, args, kwargs in submitted)
-
-    monkeypatch.setattr(parallel_module, "Parallel", RecordingParallel)
+def test_persistent_executor_uses_a_bounded_rolling_window() -> None:
     plan = resolve_thread_budget(3, 8, available_threads=3)
     observed: list[int] = []
+    yielded = 0
+    consumed = 0
+    maximum_ahead = 0
+
+    def tasks():
+        nonlocal yielded, maximum_ahead
+        for value in range(20):
+            yielded += 1
+            maximum_ahead = max(maximum_ahead, yielded - consumed)
+            yield value
+
+    def record(result: int) -> None:
+        nonlocal consumed
+        consumed += 1
+        observed.append(result)
 
     with PersistentTaskExecutor(plan) as executor:
-        executor.consume(lambda value: value * 2, range(8), on_result=observed.append)
+        executor.consume(lambda value: value * 2, tasks(), on_result=record)
 
-    assert submitted_wave_sizes == [3, 3, 2]
-    assert observed == [0, 2, 4, 6, 8, 10, 12, 14]
+    assert maximum_ahead == 6
+    assert sorted(observed) == [value * 2 for value in range(20)]
+
+
+def test_persistent_executor_does_not_wait_for_a_complete_worker_wave() -> None:
+    plan = resolve_thread_budget(2, 4, available_threads=2)
+    third_task_started = Event()
+
+    def work(value: int) -> int:
+        if value == 0 and not third_task_started.wait(timeout=2.0):
+            raise RuntimeError("rolling scheduler did not start the next task")
+        if value == 2:
+            third_task_started.set()
+        return value
+
+    observed: list[int] = []
+    with PersistentTaskExecutor(plan) as executor:
+        executor.consume(work, range(4), on_result=observed.append)
+
+    assert sorted(observed) == [0, 1, 2, 3]
 
 
 def test_persistent_executor_accepts_empty_batches() -> None:
@@ -139,7 +152,7 @@ def test_persistent_executor_restores_thread_limits_when_pool_opening_fails(
         def __exit__(self, *args: object) -> None:
             active_limits.pop()
 
-    class FailingParallel:
+    class FailingThreadPool:
         def __init__(self, **kwargs: object) -> None:
             pass
 
@@ -150,7 +163,7 @@ def test_persistent_executor_restores_thread_limits_when_pool_opening_fails(
             pass
 
     monkeypatch.setattr(parallel_module, "threadpool_limits", lambda **kwargs: FakeLimit())
-    monkeypatch.setattr(parallel_module, "Parallel", FailingParallel)
+    monkeypatch.setattr(parallel_module, "ThreadPoolExecutor", FailingThreadPool)
 
     with pytest.raises(RuntimeError, match="simulated pool failure"):
         PersistentTaskExecutor(plan).__enter__()

@@ -315,7 +315,7 @@ def infer(
             except BaseException:
                 if checkpoint_store is not None:
                     try:
-                        remove_empty_checkpoint = not checkpoint_store.completed_keys
+                        remove_empty_checkpoint = not checkpoint_store.has_completed_models
                     except Exception as inspection_error:
                         LOGGER.warning(
                             "Could not inspect failed checkpoint %s: %s",

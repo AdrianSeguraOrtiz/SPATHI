@@ -51,7 +51,7 @@ def _model_stat(
         n_samples=2,
         n_positive_weight_samples=2,
         weight_sum=1.5,
-        n_predictors_input=2,
+        n_predictors_input=2 + len(discarded_predictors),
         n_predictors_used=2,
         discarded_predictors=discarded_predictors,
         constant_predictors=constant_predictors,

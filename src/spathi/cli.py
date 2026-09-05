@@ -28,6 +28,7 @@ from spathi.config import (
     MAX_RANDOM_SEED,
     PCA_SVD_SOLVERS,
     PREPARATION_NORMALIZATIONS,
+    TARGET_ELIGIBILITY_MODES,
     TREE_METHODS,
     WEIGHT_MODES,
     MaxFeatures,
@@ -78,10 +79,12 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _threads(value: str) -> int:
+def _threads(value: str) -> str | int:
+    if value == "auto":
+        return value
     parsed = int(value)
-    if parsed == 0 or parsed < -1:
-        raise argparse.ArgumentTypeError("must be -1 or a positive integer")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be 'auto' or a positive integer")
     return parsed
 
 
@@ -111,6 +114,16 @@ def _positive_float(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a positive number") from exc
     if not isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
+def _unit_fraction(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+    if not isfinite(parsed) or not 0 < parsed <= 1:
+        raise argparse.ArgumentTypeError("must be a finite number in (0, 1]")
     return parsed
 
 
@@ -152,7 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare a sparse 10x matrix as strict per-analysis-unit inference inputs",
         description=(
             "Select annotated cells from a 10x feature-barcode H5 matrix, split them by "
-            "analysis unit, normalize counts reproducibly, and write SPATHI/ANDREA inputs."
+            "analysis unit, normalize counts reproducibly, and write SPATHI inputs with "
+            "an ANDREA-compatible core."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -169,9 +183,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--annotations",
         required=True,
         type=Path,
+        help="canonical TSV with exactly the cell, analysis_unit, and cluster columns",
+    )
+    prepare_inputs.add_argument(
+        "--centroid-weights",
+        type=Path,
         help=(
-            "canonical TSV with cell, analysis_unit, and cluster columns; an optional "
-            "centroid_weight column is preserved in a separate output"
+            "optional TSV with exactly cell and centroid_weight columns; values are "
+            "aligned to annotations and split into per-unit sensitivity inputs"
         ),
     )
     prepare_inputs.add_argument(
@@ -358,7 +377,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-estimators",
         type=_positive_int,
         default=DEFAULT_N_ESTIMATORS,
-        help="number of trees in every fitted ensemble",
+        help=(
+            "trees in every fixed ensemble, or the strict per-model maximum when "
+            "adaptive trees are enabled"
+        ),
     )
     model.add_argument(
         "--max-features",
@@ -379,13 +401,13 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument(
         "--max-depth",
         type=_positive_int,
-        default=argparse.SUPPRESS,
+        default=_config_default("max_depth"),
         help="maximum tree depth; omit for unbounded depth",
     )
     model.add_argument(
         "--bootstrap",
         action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
+        default=_config_default("bootstrap"),
         help=(
             "override estimator bootstrap sampling; if omitted, Extra-Trees disables it "
             "and Random Forest enables it"
@@ -400,11 +422,86 @@ def build_parser() -> argparse.ArgumentParser:
             "deterministic model seeds"
         ),
     )
+    model.add_argument(
+        "--adaptive-trees",
+        action=argparse.BooleanOptionalAction,
+        default=_config_default("adaptive_trees"),
+        help=(
+            "grow deterministic tree blocks and stop a target model after stable "
+            "importance estimates; n-estimators remains the strict maximum"
+        ),
+    )
+    model.add_argument(
+        "--adaptive-min-estimators",
+        type=_positive_int,
+        default=_config_default("adaptive_min_estimators"),
+        help="minimum trees required before adaptive convergence can stop a model",
+    )
+    model.add_argument(
+        "--adaptive-tree-step",
+        type=_positive_int,
+        default=_config_default("adaptive_tree_step"),
+        help="trees added between adaptive convergence checks",
+    )
+    model.add_argument(
+        "--adaptive-tolerance",
+        type=_unit_fraction,
+        default=_config_default("adaptive_tolerance"),
+        help="maximum total-variation change accepted between importance estimates",
+    )
+    model.add_argument(
+        "--adaptive-patience",
+        type=_positive_int,
+        default=_config_default("adaptive_patience"),
+        help=(
+            "number of preceding importance checkpoints that must all lie within "
+            "the convergence tolerance before stopping a model"
+        ),
+    )
+    model.add_argument(
+        "--target-eligibility",
+        choices=TARGET_ELIGIBILITY_MODES,
+        default=_config_default("target_eligibility"),
+        help=(
+            "use every requested target or automatically skip targets lacking enough "
+            "detectable expression; TF predictor eligibility is never changed"
+        ),
+    )
+    model.add_argument(
+        "--min-target-detected-cells",
+        type=_positive_int,
+        default=_config_default("min_target_detected_cells"),
+        help="absolute detected-cell requirement used by automatic target eligibility",
+    )
+    model.add_argument(
+        "--min-target-detected-fraction",
+        type=_unit_fraction,
+        default=_config_default("min_target_detected_fraction"),
+        help="relative detected-cell requirement used by automatic target eligibility",
+    )
+    model.add_argument(
+        "--min-target-weighted-detected-fraction",
+        type=_unit_fraction,
+        default=_config_default("min_target_weighted_detected_fraction"),
+        help=(
+            "minimum fraction of each target group's total model-weight mass carried "
+            "by cells in which the target is detected"
+        ),
+    )
+    model.add_argument(
+        "--min-target-weighted-detected-ess",
+        type=_positive_float,
+        default=_config_default("min_target_weighted_detected_ess"),
+        help=(
+            "minimum effective sample size among detected cells under each target-group "
+            "weight vector"
+        ),
+    )
     execution.add_argument(
         "--threads",
         type=_threads,
         default=_config_default("threads"),
-        help="single parallelism budget; -1 uses all available CPUs",
+        help="single parallelism budget; 'auto' uses all process-visible CPUs",
     )
     execution.add_argument(
         "--report",
@@ -453,8 +550,18 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         n_estimators=args.n_estimators,
         max_features=args.max_features,
         min_samples_leaf=args.min_samples_leaf,
-        max_depth=getattr(args, "max_depth", None),
-        bootstrap=getattr(args, "bootstrap", None),
+        max_depth=args.max_depth,
+        bootstrap=args.bootstrap,
+        adaptive_trees=args.adaptive_trees,
+        adaptive_min_estimators=args.adaptive_min_estimators,
+        adaptive_tree_step=args.adaptive_tree_step,
+        adaptive_tolerance=args.adaptive_tolerance,
+        adaptive_patience=args.adaptive_patience,
+        target_eligibility=args.target_eligibility,
+        min_target_detected_cells=args.min_target_detected_cells,
+        min_target_detected_fraction=args.min_target_detected_fraction,
+        min_target_weighted_detected_fraction=args.min_target_weighted_detected_fraction,
+        min_target_weighted_detected_ess=args.min_target_weighted_detected_ess,
         random_seed=args.random_seed,
         threads=args.threads,
         report=args.report,
@@ -469,6 +576,7 @@ def prepare_config_from_args(args: argparse.Namespace) -> PrepareConfig:
         annotations=args.annotations,
         tf_list=args.tf_list,
         output_dir=args.output_dir,
+        centroid_weights=args.centroid_weights,
         min_cells=args.min_cells,
         min_gene_cells=args.min_gene_cells,
         normalization=args.normalization,
@@ -509,42 +617,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    if args.command == "infer":
-        try:
-            from spathi.core import infer
+    # ``prepare`` returned above, and argparse accepts only the two registered
+    # required subcommands, so the remaining execution path is inference.
+    try:
+        from spathi.core import infer
 
-            with InferenceProgress(
-                console=console,
-                logger=logger,
-                enabled=args.progress,
-            ) as progress:
-                inference_result = infer(
-                    config_from_args(args),
-                    progress_callback=progress.callback,
-                    resume=args.resume,
-                    checkpoint=args.checkpoint,
-                )
-        except KeyboardInterrupt:
-            if args.checkpoint:
-                logger.warning(
-                    "Interrupted by user; rerun with --resume if completed models were checkpointed."
-                )
-            else:
-                logger.warning("Interrupted by user.")
-            return 130
-        except (MemoryError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            logger.error("Inference failed | %s", exc)
-            logger.debug("Inference failure details", exc_info=True)
-            return 2
-        logger.info(
-            "Run complete | output=%s | edges=%s",
-            inference_result.output_dir,
-            inference_result.n_edges,
-        )
-        return 0
-
-    parser.error(f"unknown command: {args.command}")
-    return 2
+        with InferenceProgress(
+            console=console,
+            logger=logger,
+            enabled=args.progress,
+        ) as progress:
+            inference_result = infer(
+                config_from_args(args),
+                progress_callback=progress.callback,
+                resume=args.resume,
+                checkpoint=args.checkpoint,
+            )
+    except KeyboardInterrupt:
+        if args.checkpoint:
+            logger.warning(
+                "Interrupted by user; rerun with --resume if completed models were checkpointed."
+            )
+        else:
+            logger.warning("Interrupted by user.")
+        return 130
+    except (MemoryError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.error("Inference failed | %s", exc)
+        logger.debug("Inference failure details", exc_info=True)
+        return 2
+    logger.info(
+        "Run complete | output=%s | edges=%s",
+        inference_result.output_dir,
+        inference_result.n_edges,
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

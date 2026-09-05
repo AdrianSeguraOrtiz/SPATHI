@@ -45,6 +45,14 @@ MODEL_DIAGNOSTIC_COLUMNS = (
     "n_edges",
     "importance_sum",
     "fit_seconds",
+    "target_detected_cells",
+    "target_detected_fraction",
+    "target_weighted_detected_fraction",
+    "target_weighted_detected_ess",
+    "n_estimators_fitted",
+    "adaptive_converged",
+    "convergence_delta",
+    "convergence_checks",
     "message",
 )
 WEIGHT_DIAGNOSTIC_COLUMNS = (
@@ -256,6 +264,14 @@ class IncrementalRunWriter:
                     record.n_edges,
                     record.importance_sum,
                     record.fit_seconds,
+                    record.target_detected_cells,
+                    record.target_detected_fraction,
+                    record.target_weighted_detected_fraction,
+                    record.target_weighted_detected_ess,
+                    record.n_estimators_fitted,
+                    record.adaptive_converged,
+                    record.convergence_delta,
+                    record.convergence_checks,
                     record.message,
                 )
             )

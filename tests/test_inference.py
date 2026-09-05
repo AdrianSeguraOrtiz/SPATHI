@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -41,8 +42,7 @@ def run_inference(
     *,
     target_names: list[str] | None = None,
     group_order: list[str] | None = None,
-    threads: int = -1,
-    verbose: int = 0,
+    threads: str | int = "auto",
     **model_options: Any,
 ) -> InferenceResult:
     """Exercise the same prepared, bounded-batch engine used by the core."""
@@ -60,7 +60,6 @@ def run_inference(
             target_batch_size=prepared.n_targets,
             group_order=group_order,
             threads=threads,
-            verbose=verbose,
         )
     )
     assert len(batches) == 1
@@ -193,6 +192,53 @@ def test_targets_retain_float64_variation_while_predictors_use_float32(
     np.testing.assert_array_equal(captured_targets[0], target)
 
 
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_predictors_are_copied_directly_to_the_final_float32_layout(order: str) -> None:
+    expression = np.array(
+        [[1.25, 2.5, 3.75], [4.0, 5.5, 6.25]],
+        dtype=np.float64,
+        order=order,
+    )
+
+    observed = inference_module._extract_tf_predictors(
+        expression,
+        np.array([2, 0], dtype=np.intp),
+    )
+
+    expected = np.array([[3.75, 1.25], [6.25, 4.0]], dtype=np.float32)
+    assert observed.dtype == np.float32
+    assert observed.flags.c_contiguous
+    np.testing.assert_array_equal(observed, expected)
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_target_subset_is_copied_directly_to_one_fortran_layout(order: str) -> None:
+    expression = np.array(
+        [[1.25, 2.5, 3.75], [4.0, 5.5, 6.25]],
+        dtype=np.float64,
+        order=order,
+    )
+
+    observed = inference_module._extract_target_responses(
+        expression,
+        np.array([2, 0], dtype=np.intp),
+    )
+
+    expected = np.array([[3.75, 1.25], [6.25, 4.0]], dtype=np.float64)
+    assert observed.dtype == np.float64
+    assert observed.flags.f_contiguous
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_bounded_finiteness_scan_checks_every_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(inference_module, "INFERENCE_VALIDATION_WORKING_MEMORY_BYTES", 4)
+    values = np.arange(12.0).reshape(3, 4)
+
+    assert inference_module._all_finite_bounded(values)
+    values.ravel()[-1] = np.nan
+    assert not inference_module._all_finite_bounded(values)
+
+
 def test_unexpected_resource_failures_are_not_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailingEstimator:
         def fit(self, *args: Any, **kwargs: Any) -> None:
@@ -213,6 +259,99 @@ def test_unexpected_resource_failures_are_not_hidden(monkeypatch: pytest.MonkeyP
             n_estimators=2,
             threads=1,
         )
+
+
+def test_compact_feature_importance_buffer_is_bitwise_sklearn_equivalent() -> None:
+    rng = np.random.default_rng(101)
+    predictors = rng.normal(size=(80, 7)).astype(np.float32)
+    response = rng.normal(size=80)
+    weights = rng.uniform(0.1, 1.0, size=80)
+    estimator = inference_module.create_tree_estimator(
+        "extra-trees",
+        n_estimators=31,
+        max_features="sqrt",
+        min_samples_leaf=1,
+        max_depth=None,
+        bootstrap=False,
+        random_state=19,
+        n_jobs=2,
+    )
+    estimator.fit(predictors, response, sample_weight=weights)
+    expected = np.asarray(estimator.feature_importances_, dtype=np.float64)
+
+    observed = inference_module._extract_feature_importances(estimator)
+
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_adaptive_fit_failure_retains_elapsed_time_and_completed_tree_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTree:
+        tree_ = SimpleNamespace(node_count=2)
+        feature_importances_ = np.array([1.0])
+
+    class FailingSecondBlockEstimator:
+        def __init__(self) -> None:
+            self.n_estimators = 10
+            self.estimators_: list[FakeTree] = []
+            self.calls = 0
+            self.n_features_in_ = 1
+
+        def fit(self, *args: Any, **kwargs: Any) -> FailingSecondBlockEstimator:
+            self.calls += 1
+            if self.calls == 2:
+                raise ValueError("simulated second-block failure")
+            self.estimators_.extend(FakeTree() for _ in range(self.n_estimators))
+            return self
+
+        def set_params(self, *, n_estimators: int) -> FailingSecondBlockEstimator:
+            self.n_estimators = n_estimators
+            return self
+
+    fake = FailingSecondBlockEstimator()
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: fake,
+    )
+    times = iter((10.0, 12.0, 20.0, 23.0))
+    monkeypatch.setattr(inference_module, "perf_counter", lambda: next(times))
+    context = inference_module._FitContext(
+        expression=np.arange(8.0)[:, np.newaxis],
+        tf_names=("TF",),
+        target_to_tf_position=(None,),
+        tree_method="extra-trees",
+        n_estimators=30,
+        adaptive_trees=True,
+        adaptive_min_estimators=10,
+        adaptive_tree_step=10,
+        adaptive_tolerance=0.01,
+        adaptive_patience=2,
+        target_eligibility_mode="all",
+        min_target_weighted_detected_fraction=0.01,
+        min_target_weighted_detected_ess=10.0,
+        max_features="sqrt",
+        min_samples_leaf=1,
+        max_depth=None,
+        bootstrap=False,
+        global_seed=1,
+        model_n_jobs=1,
+    )
+
+    with pytest.raises(inference_module._TreeFitFailure) as caught:
+        inference_module._fit_tree_model(
+            np.arange(8.0, dtype=np.float32)[:, np.newaxis],
+            np.arange(8.0),
+            np.ones(8),
+            context=context,
+            seed=1,
+        )
+
+    assert str(caught.value.error) == "simulated second-block failure"
+    assert caught.value.fit_seconds == 5.0
+    assert caught.value.n_estimators_fitted == 10
+    assert caught.value.convergence_checks == 0
 
 
 def test_weights_reproducibly_change_target_network() -> None:
@@ -485,6 +624,8 @@ def test_model_tasks_read_cached_weight_statistics_without_cell_reductions(
         None,
         n_cells=prepared.n_cells,
         tf_expression=prepared._tf_expression,
+        tf_names=prepared.tf_names,
+        compute_squared_weights=False,
     )[0]
     execution = prepared._prepare_model_execution(
         (group,),
@@ -541,6 +682,8 @@ def test_global_tf_ranges_are_calculated_once_for_all_positive_weight_groups(
         None,
         n_cells=4,
         tf_expression=tf_expression,
+        tf_names=("TF1", "TF2", "TF3"),
+        compute_squared_weights=False,
     )
 
     assert calls == ["global", "masked"]
@@ -575,6 +718,288 @@ def test_fixed_seed_is_equivalent_across_thread_counts() -> None:
     )
     assert edge_tuples(sequential) == edge_tuples(parallel)
     assert sequential.skipped_targets == parallel.skipped_targets
+
+
+def test_automatic_target_eligibility_does_not_remove_an_ineligible_tf_as_predictor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fitted_targets: list[np.ndarray] = []
+
+    class FakeEstimator:
+        feature_importances_: np.ndarray
+
+        def fit(self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray) -> FakeEstimator:
+            fitted_targets.append(y.copy())
+            self.feature_importances_ = np.full(x.shape[1], 1.0 / x.shape[1])
+            return self
+
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: FakeEstimator(),
+    )
+    n_cells = 100
+    rare_tf = np.zeros(n_cells)
+    rare_tf[:5] = np.linspace(1.0, 2.0, 5)
+    common_tf = np.linspace(1.0, 2.0, n_cells)
+    target = common_tf + rare_tf
+
+    result = run_inference(
+        np.column_stack([rare_tf, common_tf, target]),
+        ["TF_RARE", "TF_COMMON", "G"],
+        ["TF_RARE", "TF_COMMON"],
+        {"A": np.ones(n_cells)},
+        target_names=["TF_RARE", "G"],
+        target_eligibility="automatic",
+        min_target_detected_cells=20,
+        min_target_detected_fraction=0.01,
+        min_target_weighted_detected_ess=10.0,
+        n_estimators=2,
+        threads=1,
+    )
+
+    rare_stat = next(stat for stat in result.model_stats if stat.target == "TF_RARE")
+    target_stat = next(stat for stat in result.model_stats if stat.target == "G")
+    assert rare_stat.status == "target_not_estimable"
+    assert rare_stat.target_detected_cells == 5
+    assert target_stat.status == "trained"
+    assert target_stat.n_predictors_input == 2
+    assert {edge.source for edge in result.edges if edge.target == "G"} == {
+        "TF_RARE",
+        "TF_COMMON",
+    }
+    assert len(fitted_targets) == 1
+
+
+def test_automatic_rejection_messages_have_bounded_checkpoint_cardinality() -> None:
+    n_cells = 100
+    predictor = np.linspace(1.0, 2.0, n_cells)
+    rare_targets = []
+    for detected_count in range(1, 11):
+        target = np.zeros(n_cells)
+        target[:detected_count] = np.linspace(1.0, 2.0, detected_count)
+        rare_targets.append(target)
+
+    result = run_inference(
+        np.column_stack([predictor, *rare_targets]),
+        ["TF", *(f"G{index}" for index in range(10))],
+        ["TF"],
+        {"A": np.ones(n_cells)},
+        target_names=[f"G{index}" for index in range(10)],
+        target_eligibility="automatic",
+        min_target_detected_cells=20,
+        min_target_detected_fraction=0.01,
+        n_estimators=2,
+        threads=1,
+    )
+
+    assert {stat.status for stat in result.model_stats} == {"target_not_estimable"}
+    assert {stat.message for stat in result.model_stats} == {
+        "automatic target eligibility rejected the target: insufficient_detected_cells"
+    }
+
+
+def test_automatic_target_eligibility_applies_group_specific_detected_ess() -> None:
+    n_cells = 100
+    predictor = np.linspace(0.0, 1.0, n_cells)
+    target = predictor + 1.0
+    weights = np.zeros(n_cells)
+    weights[:5] = 1.0
+
+    result = run_inference(
+        np.column_stack([predictor, target]),
+        ["TF", "G"],
+        ["TF"],
+        {"A": weights},
+        target_names=["G"],
+        target_eligibility="automatic",
+        min_target_detected_cells=20,
+        min_target_detected_fraction=0.01,
+        min_target_weighted_detected_ess=10.0,
+        n_estimators=2,
+        threads=1,
+    )
+
+    stat = result.model_stats[0]
+    assert stat.status == "target_not_estimable"
+    assert stat.target_weighted_detected_ess == pytest.approx(5.0)
+    assert result.skipped_targets[0].reason == "target_not_estimable"
+
+
+def test_automatic_target_eligibility_rejects_negligible_detected_weight_mass() -> None:
+    n_cells = 100
+    predictor = np.linspace(0.0, 1.0, n_cells)
+    target = np.zeros(n_cells)
+    target[-20:] = np.linspace(1.0, 2.0, 20)
+    weights = np.ones(n_cells)
+    weights[-20:] = 1.0e-4
+
+    result = run_inference(
+        np.column_stack([predictor, target]),
+        ["TF", "G"],
+        ["TF"],
+        {"A": weights},
+        target_names=["G"],
+        target_eligibility="automatic",
+        min_target_detected_cells=20,
+        min_target_detected_fraction=0.01,
+        min_target_weighted_detected_fraction=0.01,
+        min_target_weighted_detected_ess=10.0,
+        n_estimators=2,
+        threads=1,
+    )
+
+    stat = result.model_stats[0]
+    assert stat.status == "target_not_estimable"
+    assert stat.target_weighted_detected_fraction == pytest.approx(0.002 / 80.002)
+    assert stat.target_weighted_detected_ess == pytest.approx(20.0)
+    assert stat.message == "automatic target eligibility rejected the group-specific model"
+    assert result.skipped_targets[0].detail == stat.message
+
+
+def test_adaptive_tree_budget_stops_after_repeated_stable_importances() -> None:
+    predictor = np.linspace(0.0, 1.0, 80)
+    target = 2.0 * predictor + 1.0
+
+    result = run_inference(
+        np.column_stack([predictor, target]),
+        ["TF", "G"],
+        ["TF"],
+        {"A": np.ones(predictor.size)},
+        target_names=["G"],
+        n_estimators=100,
+        adaptive_trees=True,
+        adaptive_min_estimators=20,
+        adaptive_tree_step=10,
+        adaptive_tolerance=1.0e-12,
+        adaptive_patience=2,
+        random_seed=17,
+        threads=1,
+    )
+
+    stat = result.model_stats[0]
+    assert stat.status == "trained"
+    assert stat.n_estimators_fitted == 30
+    assert stat.adaptive_converged is True
+    assert stat.convergence_delta == pytest.approx(0.0)
+    assert stat.convergence_checks == 2
+
+
+def test_global_target_ineligibility_precedes_group_sample_failure() -> None:
+    result = run_inference(
+        np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]),
+        ["TF", "G"],
+        ["TF"],
+        {"A": np.array([1.0, 0.0, 0.0])},
+        target_names=["G"],
+        n_estimators=2,
+        target_eligibility="automatic",
+        min_target_detected_cells=1,
+        min_target_detected_fraction=0.01,
+        min_target_weighted_detected_fraction=0.01,
+        min_target_weighted_detected_ess=1.0,
+        threads=1,
+    )
+
+    assert result.model_stats[0].status == "target_not_estimable"
+    assert result.skipped_targets[0].reason == "target_not_estimable"
+
+
+def test_adaptive_tree_budget_never_treats_empty_importances_as_convergence() -> None:
+    expression = np.zeros((100, 2), dtype=np.float64)
+    expression[0, :] = 1.0
+    result = run_inference(
+        expression,
+        ["TF", "G"],
+        ["TF"],
+        {"A": np.ones(expression.shape[0])},
+        target_names=["G"],
+        tree_method="random-forest",
+        n_estimators=100,
+        adaptive_trees=True,
+        adaptive_min_estimators=2,
+        adaptive_tree_step=1,
+        adaptive_tolerance=0.01,
+        adaptive_patience=2,
+        random_seed=31,
+        threads=1,
+    )
+
+    stat = result.model_stats[0]
+    assert stat.status == "trained"
+    assert stat.n_estimators_fitted > 3
+    assert any(edge.source == "TF" and edge.target == "G" for edge in result.edges)
+
+
+@pytest.mark.parametrize(
+    ("tree_method", "n_estimators", "tree_step"),
+    [
+        ("extra-trees", 31, 7),
+        ("random-forest", 32, 7),
+        ("extra-trees", 53, 13),
+    ],
+)
+def test_adaptive_budget_reaching_the_maximum_matches_one_shot_exactly(
+    tree_method: str,
+    n_estimators: int,
+    tree_step: int,
+) -> None:
+    expression, genes, tfs = inference_data()
+    weights = {"A": np.linspace(0.2, 1.0, expression.shape[0])}
+    common = {
+        "target_names": ["G"],
+        "tree_method": tree_method,
+        "n_estimators": n_estimators,
+        "max_features": 1.0,
+        "random_seed": 37,
+        "threads": 1,
+    }
+    fixed = run_inference(expression, genes, tfs, weights, **common)
+    adaptive = run_inference(
+        expression,
+        genes,
+        tfs,
+        weights,
+        adaptive_trees=True,
+        adaptive_min_estimators=tree_step,
+        adaptive_tree_step=tree_step,
+        adaptive_tolerance=1.0,
+        adaptive_patience=4,
+        **common,
+    )
+
+    assert edge_tuples(adaptive) == edge_tuples(fixed)
+    assert adaptive.model_stats[0].n_estimators_fitted == n_estimators
+    assert adaptive.model_stats[0].adaptive_converged is True
+
+
+def test_adaptive_results_are_deterministic_across_thread_budgets() -> None:
+    expression, genes, tfs = inference_data()
+    weights = {
+        "A": np.linspace(0.2, 1.0, expression.shape[0]),
+        "B": np.linspace(1.0, 0.2, expression.shape[0]),
+    }
+    options = {
+        "target_names": ["TF1", "TF2", "G"],
+        "n_estimators": 50,
+        "adaptive_trees": True,
+        "adaptive_min_estimators": 20,
+        "adaptive_tree_step": 10,
+        "adaptive_tolerance": 0.02,
+        "adaptive_patience": 2,
+        "random_seed": 41,
+    }
+
+    sequential = run_inference(expression, genes, tfs, weights, threads=1, **options)
+    parallel = run_inference(expression, genes, tfs, weights, threads=2, **options)
+
+    assert edge_tuples(sequential) == edge_tuples(parallel)
+    assert [stat.n_estimators_fitted for stat in sequential.model_stats] == [
+        stat.n_estimators_fitted for stat in parallel.model_stats
+    ]
+    assert [stat.convergence_delta for stat in sequential.model_stats] == [
+        stat.convergence_delta for stat in parallel.model_stats
+    ]
 
 
 def test_random_forest_uses_exact_evidence_label() -> None:
@@ -630,6 +1055,28 @@ def test_inference_rejects_seed_outside_sklearn_range() -> None:
     expression, genes, tfs = inference_data()
     with pytest.raises(ValueError, match="at most"):
         prepare_inference(expression, genes, tfs, random_seed=2**32)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        ("max_features", None, "max_features"),
+        ("min_samples_leaf", 0.25, "positive integer"),
+    ],
+)
+def test_prepared_inference_uses_the_canonical_model_parameter_contract(
+    parameter: str,
+    value: object,
+    message: str,
+) -> None:
+    expression, genes, tfs = inference_data()
+    with pytest.raises(TypeError, match=message):
+        prepare_inference(  # type: ignore[arg-type]
+            expression,
+            genes,
+            tfs,
+            **{parameter: value},
+        )
 
 
 def test_prepared_inference_reuses_matrices_across_progressive_groups(

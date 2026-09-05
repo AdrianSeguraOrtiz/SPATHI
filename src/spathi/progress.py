@@ -81,16 +81,6 @@ class SpathiProgressEvent:
         if self.current_group is not None and not isinstance(self.current_group, str):
             raise TypeError("current_group must be a string or None")
 
-    @property
-    def model_fraction(self) -> float | None:
-        """Return model completion in ``[0, 1]`` once the total is known."""
-
-        if self.total_models is None:
-            return None
-        if self.total_models == 0:
-            return 1.0
-        return self.completed_models / self.total_models
-
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation for adapters and tests."""
 

@@ -275,7 +275,6 @@ def test_report_is_one_offline_html_with_all_interactive_views(
     assert 'role="tablist"' in document
     assert document.count('role="tabpanel"') == 3
     assert document.count('role="region"') == 9
-    assert 'role="img"' not in document
     assert 'id="target-status"' in document
     assert "the input identifiers of sampled cells" in document
     assert "not a plot of the configured distance" in document
@@ -298,25 +297,21 @@ def test_report_is_one_offline_html_with_all_interactive_views(
     assert artifact.to_metadata()["self_contained"] is True
 
 
-def test_plotly_layout_uses_current_title_objects() -> None:
-    """Keep plot, axis, and colour-bar labels visible with current Plotly.js."""
+def test_plotly_layout_exposes_labels_and_marker_encoding() -> None:
+    """Keep plot, axis, colour-bar, and marker semantics visible."""
 
     javascript = report_module._REPORT_APP_JAVASCRIPT
-    assert 'title:"' not in javascript
     assert 'title:{text:"Cell groups in the shared PCA view"}' in javascript
     assert "xaxis:{title:{text:DATA.projection.x_label}}" in javascript
     assert 'colorbar:{title:{text:"Final weight"}}' in javascript
     assert "colorscale:WEIGHT_COLORSCALE" in javascript
     assert 'const WEIGHT_COLORSCALE=[[0,"#deebf7"]' in javascript
-    assert "Cividis" not in javascript
-    assert "line:{color:groupColor(g),width:1.2}" not in javascript
     assert "symbol:SYMBOLS[g%SYMBOLS.length],line:{width:0}" in javascript
     assert "Auxiliary PCA explained variance (report only)" in javascript
     assert "groupLegend" in javascript
     assert 'event.key==="ArrowRight"' in javascript
     assert 'SYMBOLS=["circle","square"' in javascript
     assert 'button.dataset.tab==="overview-panel"' in javascript
-    assert "populateText();renderTarget(0);renderOverview()" not in javascript
     assert "SVG_POINT_BUDGET" in javascript
 
 

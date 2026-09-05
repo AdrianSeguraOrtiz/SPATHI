@@ -3,7 +3,7 @@ import pytest
 from spathi.progress import SpathiProgressEvent
 
 
-def test_progress_event_exposes_fraction_and_json_fields() -> None:
+def test_progress_event_exposes_json_fields() -> None:
     event = SpathiProgressEvent(
         phase="model_inference",
         message="Fitted model 3/8",
@@ -15,7 +15,6 @@ def test_progress_event_exposes_fraction_and_json_fields() -> None:
         resumed_models=1,
     )
 
-    assert event.model_fraction == 3 / 8
     assert event.to_dict()["current_group"] == "A"
 
 

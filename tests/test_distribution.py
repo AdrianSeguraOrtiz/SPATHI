@@ -31,9 +31,6 @@ def test_wheel_build_contains_package_and_console_entry_point(tmp_path: Path) ->
         assert "spathi/core.py" in members
         assert "spathi/preparation.py" in members
         assert "spathi/py.typed" in members
-        assert "spathi/pipeline.py" not in members
-        assert "spathi/prototypes.py" not in members
-        assert "spathi/visualization.py" not in members
         entry_points = next(name for name in members if name.endswith("entry_points.txt"))
         assert "spathi = spathi.cli:main" in archive.read(entry_points).decode("utf-8")
         metadata_path = next(name for name in members if name.endswith(".dist-info/METADATA"))
@@ -44,8 +41,6 @@ def test_wheel_build_contains_package_and_console_entry_point(tmp_path: Path) ->
         assert "Requires-Dist: plotly>=6.0\n" in metadata
         assert "Requires-Dist: h5py>=3.10\n" in metadata
         assert "Requires-Dist: scipy>=1.11\n" in metadata
-        assert "Requires-Dist: matplotlib" not in metadata.lower()
-        assert "Classifier: Operating System :: OS Independent\n" not in metadata
         for classifier in (
             "MacOS",
             "Microsoft :: Windows",

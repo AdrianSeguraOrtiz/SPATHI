@@ -2,8 +2,9 @@
 
 This module deliberately knows nothing about Azimuth, CLL, or a particular
 cell-taxonomy.  Study-specific adapters produce the canonical annotation table;
-``prepare`` turns that table and a 10x feature-barcode matrix into one strict,
-ANDREA-compatible input directory per analysis unit.
+``prepare`` turns that table and a 10x feature-barcode matrix into one strict input
+directory per analysis unit.  Its expression, groups, and TF-list files form the
+ANDREA-compatible core; optional centroid weights remain SPATHI-specific.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
-from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -34,12 +34,12 @@ from spathi._publication import (
 )
 from spathi._version import __version__
 from spathi.config import PrepareConfig
+from spathi.io import InputValidationError, read_centroid_weights_with_fingerprint
 from spathi.outputs import write_json
 
 LOGGER = logging.getLogger(__name__)
 
 _ANNOTATION_REQUIRED_COLUMNS = ("cell", "analysis_unit", "cluster")
-_ANNOTATION_OPTIONAL_COLUMNS = ("centroid_weight",)
 _GENE_EXPRESSION_FEATURE_TYPE = "Gene Expression"
 _MANIFEST_SCHEMA_VERSION = 1
 _HASH_CHUNK_BYTES = 8 * 1024**2
@@ -90,13 +90,17 @@ class _Annotation:
     cell: str
     analysis_unit: str
     cluster: str
-    centroid_weight: float | None
 
 
 @dataclass(frozen=True, slots=True)
 class _AnnotationTable:
     records: tuple[_Annotation, ...]
-    has_centroid_weights: bool
+    fingerprint: Mapping[str, str | int]
+
+
+@dataclass(frozen=True, slots=True)
+class _CentroidWeightTable:
+    by_cell: Mapping[str, float]
     fingerprint: Mapping[str, str | int]
 
 
@@ -205,11 +209,7 @@ def _read_annotations(path: Path) -> _AnnotationTable:
             "Annotations table contains duplicate columns: " + ", ".join(duplicate_columns)
         )
     missing_columns = [name for name in _ANNOTATION_REQUIRED_COLUMNS if name not in header]
-    unknown_columns = [
-        name
-        for name in header
-        if name not in {*_ANNOTATION_REQUIRED_COLUMNS, *_ANNOTATION_OPTIONAL_COLUMNS}
-    ]
+    unknown_columns = [name for name in header if name not in _ANNOTATION_REQUIRED_COLUMNS]
     if missing_columns or unknown_columns:
         details: list[str] = []
         if missing_columns:
@@ -219,7 +219,6 @@ def _read_annotations(path: Path) -> _AnnotationTable:
         raise PreparationInputError("Invalid annotations header; " + "; ".join(details))
 
     positions = {name: header.index(name) for name in header}
-    has_weights = "centroid_weight" in positions
     records: list[_Annotation] = []
     seen_cells: set[str] = set()
     try:
@@ -247,33 +246,18 @@ def _read_annotations(path: Path) -> _AnnotationTable:
                     f"Annotations table contains repeated cell identifier: {cell!r}"
                 )
             seen_cells.add(cell)
-            centroid_weight: float | None = None
-            if has_weights:
-                supplied = row[positions["centroid_weight"]]
-                try:
-                    centroid_weight = float(supplied)
-                except ValueError as exc:
-                    raise PreparationInputError(
-                        f"centroid_weight must be numeric at annotations line {line_number}"
-                    ) from exc
-                if not isfinite(centroid_weight) or centroid_weight <= 0:
-                    raise PreparationInputError(
-                        "centroid_weight must be a positive finite number at annotations "
-                        f"line {line_number}"
-                    )
             records.append(
                 _Annotation(
                     cell=cell,
                     analysis_unit=analysis_unit,
                     cluster=cluster,
-                    centroid_weight=centroid_weight,
                 )
             )
     except csv.Error as exc:
         raise PreparationInputError(f"Could not parse annotations as TSV: {exc}") from exc
     if not records:
         raise PreparationInputError("Annotations table contains no cell rows")
-    return _AnnotationTable(tuple(records), has_weights, fingerprint)
+    return _AnnotationTable(tuple(records), fingerprint)
 
 
 def _read_tf_list(path: Path) -> _TfList:
@@ -563,14 +547,20 @@ def _write_groups(path: Path, records: Sequence[_Annotation]) -> None:
         writer.writerows((record.cell, record.cluster) for record in records)
 
 
-def _write_centroid_weights(path: Path, records: Sequence[_Annotation]) -> None:
+def _write_centroid_weights(
+    path: Path,
+    records: Sequence[_Annotation],
+    weights_by_cell: Mapping[str, float],
+) -> None:
     with path.open("x", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         writer.writerow(("cell", "centroid_weight"))
         for record in records:
-            if record.centroid_weight is None:  # pragma: no cover - internal invariant
-                raise RuntimeError("centroid weight output requested without complete weights")
-            writer.writerow((record.cell, repr(record.centroid_weight)))
+            try:
+                weight = weights_by_cell[record.cell]
+            except KeyError as exc:  # pragma: no cover - validated coverage invariant
+                raise RuntimeError("centroid weight alignment lost an annotated cell") from exc
+            writer.writerow((record.cell, repr(weight)))
 
 
 def _write_tf_list(path: Path, identifiers: Sequence[str]) -> None:
@@ -612,8 +602,22 @@ def _relative_fingerprint(path: Path, root: Path) -> dict[str, str | int]:
 
 
 def _prepare_into(config: PrepareConfig, output_dir: Path) -> _PreparationSummary:
-    LOGGER.info("Loading canonical annotations and TF identifiers")
+    LOGGER.info("Loading canonical annotations, optional centroid weights, and TF identifiers")
     annotations = _read_annotations(config.annotations)
+    centroid_weights: _CentroidWeightTable | None = None
+    if config.centroid_weights is not None:
+        try:
+            weights, fingerprint = read_centroid_weights_with_fingerprint(
+                config.centroid_weights,
+                [record.cell for record in annotations.records],
+                expected_cell_source="annotation",
+            )
+        except InputValidationError as exc:
+            raise PreparationInputError(str(exc)) from exc
+        centroid_weights = _CentroidWeightTable(
+            by_cell=weights.to_dict(),
+            fingerprint=fingerprint,
+        )
     tf_list = _read_tf_list(config.tf_list)
     LOGGER.info("Loading sparse 10x Gene Expression matrix")
     tenx = _load_tenx_h5(
@@ -755,7 +759,7 @@ def _prepare_into(config: PrepareConfig, output_dir: Path) -> _PreparationSummar
         groups_path = unit_dir / "groups.tsv"
         tf_path = unit_dir / "tf_list.txt"
         centroid_weights_path = (
-            unit_dir / "centroid_weights.tsv" if annotations.has_centroid_weights else None
+            unit_dir / "centroid_weights.tsv" if centroid_weights is not None else None
         )
         unit_matrix = unit_matrix_all_genes[retained_gene_positions, :].tocsr()
         unit_matrix.sort_indices()
@@ -773,7 +777,9 @@ def _prepare_into(config: PrepareConfig, output_dir: Path) -> _PreparationSummar
         _write_groups(groups_path, records)
         _write_tf_list(tf_path, unit_tfs)
         if centroid_weights_path is not None:
-            _write_centroid_weights(centroid_weights_path, records)
+            if centroid_weights is None:  # pragma: no cover - path construction invariant
+                raise RuntimeError("centroid weight output requested without input weights")
+            _write_centroid_weights(centroid_weights_path, records, centroid_weights.by_cell)
 
         outputs = {
             "expression": _relative_fingerprint(expression_path, output_dir),
@@ -835,8 +841,11 @@ def _prepare_into(config: PrepareConfig, output_dir: Path) -> _PreparationSummar
             },
         },
         "annotations": {
-            "centroid_weight_provided": annotations.has_centroid_weights,
             "cells_are_exclusive_across_analysis_units": True,
+        },
+        "centroid_weights": {
+            "provided": centroid_weights is not None,
+            "input_cells": (len(centroid_weights.by_cell) if centroid_weights is not None else 0),
         },
         "transcription_factors": {
             "supplied": len(tf_list.identifiers),
@@ -849,6 +858,8 @@ def _prepare_into(config: PrepareConfig, output_dir: Path) -> _PreparationSummar
         },
         "analysis_units": unit_records,
     }
+    if centroid_weights is not None:
+        manifest["inputs"]["centroid_weights"] = dict(centroid_weights.fingerprint)
     write_json(manifest, output_dir / "prepare_manifest.json")
     return _PreparationSummary(
         manifest=manifest,

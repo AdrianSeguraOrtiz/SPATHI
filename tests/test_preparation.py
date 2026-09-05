@@ -66,16 +66,26 @@ def preparation_inputs(tmp_path: Path) -> dict[str, Path]:
     )
     annotations = tmp_path / "annotations.tsv"
     annotations.write_text(
-        "cell\tanalysis_unit\tcluster\tcentroid_weight\n"
-        "c3\tB lineage\tmemory\t0.8\n"
-        "c1\tB lineage\tnaive\t0.9\n"
-        "c4\trare/type\tonly\t0.7\n"
-        "c2\tB lineage\tnaive\t1.0\n",
+        "cell\tanalysis_unit\tcluster\n"
+        "c3\tB lineage\tmemory\n"
+        "c1\tB lineage\tnaive\n"
+        "c4\trare/type\tonly\n"
+        "c2\tB lineage\tnaive\n",
+        encoding="utf-8",
+    )
+    centroid_weights = tmp_path / "centroid_weights.tsv"
+    centroid_weights.write_text(
+        "cell\tcentroid_weight\nc2\t1.0\nc4\t0.7\nc1\t0.9\nc3\t0.8\n",
         encoding="utf-8",
     )
     tf_list = tmp_path / "tf_list.txt"
     tf_list.write_text("MISSING\nTF1\n", encoding="utf-8")
-    return {"matrix": matrix, "annotations": annotations, "tf_list": tf_list}
+    return {
+        "matrix": matrix,
+        "annotations": annotations,
+        "centroid_weights": centroid_weights,
+        "tf_list": tf_list,
+    }
 
 
 def config_for(
@@ -107,7 +117,17 @@ def test_prepare_config_has_explicit_reproducible_defaults() -> None:
     assert config.target_sum == 10_000.0
     assert config.gene_identifier == "name"
     assert config.duplicate_gene_policy == "sum"
+    assert config.centroid_weights is None
     assert config.to_dict()["tenx_h5"] == "matrix.h5"
+
+    weighted = PrepareConfig(
+        tenx_h5=Path("matrix.h5"),
+        annotations=Path("annotations.tsv"),
+        tf_list=Path("tf_list.txt"),
+        output_dir=Path("prepared"),
+        centroid_weights=Path("weights.tsv"),
+    )
+    assert weighted.to_dict()["centroid_weights"] == "weights.tsv"
 
 
 @pytest.mark.parametrize(
@@ -118,6 +138,7 @@ def test_prepare_config_has_explicit_reproducible_defaults() -> None:
         ({"target_sum": float("nan")}, "target_sum"),
         ({"gene_identifier": "symbol"}, "gene_identifier"),
         ({"duplicate_gene_policy": "first"}, "duplicate_gene_policy"),
+        ({"centroid_weights": 1}, "centroid_weights"),
     ],
 )
 def test_prepare_config_rejects_invalid_values(overrides: dict[str, Any], error: str) -> None:
@@ -137,7 +158,13 @@ def test_prepare_writes_atomic_andrea_inputs_and_manifest(
     preparation_inputs: dict[str, Path],
 ) -> None:
     output_dir = tmp_path / "prepared"
-    result = prepare(config_for(preparation_inputs, output_dir))
+    result = prepare(
+        config_for(
+            preparation_inputs,
+            output_dir,
+            centroid_weights=preparation_inputs["centroid_weights"],
+        )
+    )
 
     assert isinstance(result, PrepareResult)
     assert result.output_dir == output_dir
@@ -158,11 +185,17 @@ def test_prepare_writes_atomic_andrea_inputs_and_manifest(
     groups = (unit_dir / "groups.tsv").read_text(encoding="utf-8").splitlines()
     # H5 barcode order is canonical, regardless of annotation row order.
     assert groups == ["cell\tcluster", "c1\tnaive", "c2\tnaive", "c3\tmemory"]
-    assert (unit_dir / "centroid_weights.tsv").read_text(encoding="utf-8").splitlines() == [
+    centroid_weight_rows = (
+        (unit_dir / "centroid_weights.tsv").read_text(encoding="utf-8").splitlines()
+    )
+    assert centroid_weight_rows == [
         "cell\tcentroid_weight",
         "c1\t0.9",
         "c2\t1.0",
         "c3\t0.8",
+    ]
+    assert [row.split("\t", maxsplit=1)[0] for row in centroid_weight_rows[1:]] == [
+        row.split("\t", maxsplit=1)[0] for row in groups[1:]
     ]
     assert (unit_dir / "tf_list.txt").read_text(encoding="utf-8") == "TF1\n"
 
@@ -192,6 +225,8 @@ def test_prepare_writes_atomic_andrea_inputs_and_manifest(
         "target_sum": 10_000.0,
     }
     assert manifest["matrix"]["gene_expression_features"] == 3
+    assert manifest["centroid_weights"] == {"input_cells": 4, "provided": True}
+    assert manifest["inputs"]["centroid_weights"]["path"].endswith("centroid_weights.tsv")
     assert manifest["transcription_factors"]["absent_from_gene_expression_features"] == ["MISSING"]
     assert [unit["status"] for unit in manifest["analysis_units"]] == [
         "prepared",
@@ -208,7 +243,13 @@ def test_prepared_unit_runs_through_the_public_inference_api(
     tmp_path: Path,
     preparation_inputs: dict[str, Path],
 ) -> None:
-    prepared = prepare(config_for(preparation_inputs, tmp_path / "prepared"))
+    prepared = prepare(
+        config_for(
+            preparation_inputs,
+            tmp_path / "prepared",
+            centroid_weights=preparation_inputs["centroid_weights"],
+        )
+    )
     unit = prepared.analysis_unit_directories[0]
 
     result = infer(
@@ -245,7 +286,8 @@ def test_prepare_without_optional_weights_does_not_invent_them(
     unit_dir = result.analysis_unit_directories[0]
     assert not (unit_dir / "centroid_weights.tsv").exists()
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["annotations"]["centroid_weight_provided"] is False
+    assert manifest["centroid_weights"] == {"input_cells": 0, "provided": False}
+    assert "centroid_weights" not in manifest["inputs"]
     assert "centroid_weights" not in manifest["analysis_units"][0]["outputs"]
 
 
@@ -288,10 +330,6 @@ def test_gene_filtering_is_per_unit_and_tf_intersection_follows_it(
         ("cell\tanalysis_unit\n c1\tB\n", "missing required columns"),
         ("cell\tanalysis_unit\tcluster\textra\nc1\tB\tA\tx\n", "unsupported columns"),
         ("cell\tanalysis_unit\tcluster\nc1\tB\tA\nc1\tB\tB\n", "repeated cell"),
-        (
-            "cell\tanalysis_unit\tcluster\tcentroid_weight\nc1\tB\tA\t0\n",
-            "positive finite",
-        ),
     ],
 )
 def test_annotations_contract_is_strict(
@@ -303,6 +341,56 @@ def test_annotations_contract_is_strict(
     preparation_inputs["annotations"].write_text(content, encoding="utf-8")
     with pytest.raises(PreparationInputError, match=message):
         prepare(config_for(preparation_inputs, tmp_path / "prepared", min_cells=1))
+    assert not (tmp_path / "prepared").exists()
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("centroid_weight\tcell\n1\tc1\n", "exactly two columns"),
+        ("cell\tcentroid_weight\textra\nc1\t1\tx\n", "exactly two columns"),
+        (
+            "cell\tcentroid_weight\nc1\t1\nc1\t2\nc2\t1\nc3\t1\nc4\t1\n",
+            "repeated cell",
+        ),
+        (
+            "cell\tcentroid_weight\nc1\t0\nc2\t1\nc3\t1\nc4\t1\n",
+            "positive finite",
+        ),
+        (
+            "cell\tcentroid_weight\nc1\tNaN\nc2\t1\nc3\t1\nc4\t1\n",
+            "positive finite",
+        ),
+        (
+            "cell\tcentroid_weight\nc1\tvalue\nc2\t1\nc3\t1\nc4\t1\n",
+            "must be numeric",
+        ),
+        (
+            "cell\tcentroid_weight\nc1\t1\nc2\t1\nc3\t1\n",
+            "annotation cells without a centroid weight: 'c4'",
+        ),
+        (
+            "cell\tcentroid_weight\nc1\t1\nc2\t1\nc3\t1\nc4\t1\nextra\t1\n",
+            "rows absent from annotation: 'extra'",
+        ),
+    ],
+)
+def test_prepare_centroid_weights_contract_is_strict_and_cell_aligned(
+    tmp_path: Path,
+    preparation_inputs: dict[str, Path],
+    content: str,
+    message: str,
+) -> None:
+    preparation_inputs["centroid_weights"].write_text(content, encoding="utf-8")
+    with pytest.raises(PreparationInputError, match=message):
+        prepare(
+            config_for(
+                preparation_inputs,
+                tmp_path / "prepared",
+                min_cells=1,
+                centroid_weights=preparation_inputs["centroid_weights"],
+            )
+        )
     assert not (tmp_path / "prepared").exists()
 
 
@@ -492,6 +580,8 @@ def test_prepare_cli_builds_config_and_delegates_to_preparation_api(
         "matrix.h5",
         "--annotations",
         "annotations.tsv",
+        "--centroid-weights",
+        "weights.tsv",
         "--tf-list",
         "tf_list.txt",
         "--output-dir",
@@ -513,6 +603,7 @@ def test_prepare_cli_builds_config_and_delegates_to_preparation_api(
     assert parsed.target_sum == 5_000.0
     assert parsed.gene_identifier == "id"
     assert parsed.duplicate_gene_policy == "error"
+    assert parsed.centroid_weights == Path("weights.tsv")
 
     received: dict[str, PrepareConfig] = {}
 

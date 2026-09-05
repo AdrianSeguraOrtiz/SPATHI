@@ -239,10 +239,8 @@ def test_expression_rejects_exact_andrea_first_column_names(
         read_expression_matrix(path)
 
 
-@pytest.mark.parametrize("first_header", ["barcode", "cellid", "cell_id", "cell-id"])
-def test_expression_does_not_add_non_andrea_header_heuristics(
-    tmp_path: Path, first_header: str
-) -> None:
+def test_expression_preserves_an_arbitrary_gene_axis_header(tmp_path: Path) -> None:
+    first_header = "feature_name"
     path = tmp_path / "valid_header.tsv"
     path.write_text(f"{first_header}\tcell_1\nG1\t1\n", encoding="utf-8")
     expression = read_expression_matrix(path)
