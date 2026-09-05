@@ -10,8 +10,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Generic `spathi prepare` API and CLI stage for sparse 10x feature-barcode H5
   matrices, strict study-independent annotations, explicit library-size-plus-log1p
-  normalization, per-analysis-unit filtering, TF intersection, optional centroid
-  weight preservation, complete provenance, and atomic ANDREA-compatible outputs.
+  normalization, per-analysis-unit filtering, TF intersection, an optional separate
+  centroid-weight sidecar with exact annotation-cell alignment, complete provenance,
+  and atomic outputs with an ANDREA-compatible expression/groups/TF-list core.
 - Optional strict per-cell centroid weights for explicit sensitivity analyses, with
   stable weighted centroids, checkpoint identity, cell-aligned raw and normalized
   audit output, per-group effective-sample-size summaries, and report provenance. The
@@ -37,11 +38,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Calibrated defaults shared by core and CLI: cosine distance, 250 trees, and
   `max_features=sqrt`.
 - One process-wide thread budget, non-nested parallelism, a reusable worker pool,
-  bounded model-result backpressure, deterministic single-thread preprocessing, and
-  memory-aware group/target batching.
+  a continuously replenished deterministic rolling queue with exact model-result
+  backpressure, deterministic single-thread preprocessing, and memory-aware
+  group/target batching.
+- Optional, default-off automatic target eligibility with global detected-cell and
+  exact-variability checks, contextual weighted detected-mass and Kish-ESS gates,
+  unchanged TF/distance spaces, and complete global/per-model audit artifacts.
+- Optional, default-off adaptive tree budgets that grow the same seeded ensemble in
+  blocks up to a strict ceiling, stop on predeclared feature-importance stability, and
+  record the actual tree count, convergence schedule, and savings per model.
+- Compact checksummed binary checkpoint payloads with interned strings, columnar
+  numeric edge storage, and group-bounded resume indexes.
 - `MemAvailable`- and cgroup-aware memory planning, live-headroom-sized distance
   chunks, exception-safe disk-backed cell-distance storage selected by size or memory
-  pressure, streamed outputs, and early release of redundant expression allocations.
+  pressure, streamed outputs, direct-to-final TF predictor and target-subset
+  extraction, bounded finiteness masks, inference-allocation preflight, and early
+  release of redundant expression allocations.
 - Structured phase/model progress callbacks and exact SQLite checkpoints with input,
   parameter, dependency, implementation, and per-group weight identity validation.
 - Private staging followed by atomic no-replace publication, an early target-filesystem
@@ -56,8 +68,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `report=True`/`report=False` control generation without changing inference, while
   `SpathiRunResult.report_path` exposes the published artifact.
 - Unit, numerical, integration, CLI, checkpoint, concurrency, distribution, and
-  interruption tests, plus developer documentation, a minimal example, CI, and a
-  reproducible scaling benchmark with target subsets, balanced schedules, wall time,
-  peak process-tree RSS, persistent logs, and safe child-process cancellation.
+  interruption tests, plus developer documentation, a minimal example, CI, and
+  reproducible scaling suites with target subsets, balanced schedules,
+  per-phase timings, child wall time, sampled process-tree CPU/RSS and transient disk,
+  exact final disk footprints and input hashes, immutable harness/package/profile
+  snapshots, persistent logs, inner and outer timeouts, disk/CPU preflight, and safe
+  child-process cancellation. A separate local CLL equivalence harness compares
+  scientific artifacts across two implementations while measuring time, memory, disk,
+  batching, and effective execution decisions on hashed prepared-data slices.
 
 No SPATHI version has been published yet.

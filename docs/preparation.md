@@ -38,17 +38,29 @@ have a positive Gene Expression library size.
 | `cell` | yes | Unique barcode present in the H5 |
 | `analysis_unit` | yes | Independent dataset to be passed to one inference run |
 | `cluster` | yes | Context for which that run will infer a network |
-| `centroid_weight` | no | Positive finite generic value retained for weighted-centroid sensitivity analysis |
 
-If `centroid_weight` is present, it must be present and valid on every row. Unknown
-columns are rejected so misspelled scientific fields cannot be ignored accidentally.
-A cell cannot occur in more than one analysis unit. If a study intentionally needs
-overlapping analyses, its adapter must create distinct preparation runs and record
-that design explicitly.
+Unknown columns are rejected so misspelled scientific fields cannot be ignored
+accidentally. A cell cannot occur in more than one analysis unit. If a study
+intentionally needs overlapping analyses, its adapter must create distinct
+preparation runs and record that design explicitly.
 
 Cells present in the H5 but absent from the table are excluded and counted. Cells in
 the table but absent from the H5 are rejected. Preparation does not invent an
 `unannotated` cluster.
+
+### Optional centroid weights
+
+`--centroid-weights` accepts a separate UTF-8 TSV with exactly this header and order:
+
+```text
+cell    centroid_weight
+```
+
+It is an explicit sensitivity input, not annotation metadata. Every annotation cell
+must occur exactly once, no other cells are accepted, and every value must be positive
+and finite. Row order need not match the annotations or H5 because preparation aligns
+values by cell identifier before splitting them by analysis unit. SPATHI assigns no
+dataset-specific meaning to the scalar.
 
 ### TF list
 
@@ -93,7 +105,7 @@ Every eligible unit contains:
 - `expression.tsv`: normalized genes by cells, accepted by `spathi infer` and ANDREA;
 - `groups.tsv`: exact `cell` and `cluster` columns with one row per expression cell;
 - `tf_list.txt`: unit-specific TF intersection; and
-- `centroid_weights.tsv`, only if the optional annotation column was supplied.
+- `centroid_weights.tsv`, only if `--centroid-weights` was supplied.
 
 `prepare_manifest.json` records:
 
@@ -115,6 +127,7 @@ sparse; dense storage is bounded to a single output row while serializing the TS
 spathi prepare \
   --tenx-h5 filtered_feature_bc_matrix.h5 \
   --annotations annotations.tsv \
+  --centroid-weights centroid_weights.tsv \
   --tf-list tf_list.txt \
   --output-dir prepared/patient \
   --min-cells 300 \
@@ -126,6 +139,7 @@ spathi prepare \
 ```
 
 The generated `expression.tsv`, `groups.tsv`, and `tf_list.txt` are then ordinary
-`spathi infer` inputs. When emitted, `centroid_weights.tsv` can be passed explicitly as
-`--centroid-weights`; omitting it retains the primary uniform-centroid analysis.
+`spathi infer` inputs. When emitted, per-unit `centroid_weights.tsv` can be passed
+explicitly as `--centroid-weights`; omitting both preparation and inference options
+retains the primary uniform-centroid analysis.
 Direct H5 input is intentionally unavailable on `infer`.

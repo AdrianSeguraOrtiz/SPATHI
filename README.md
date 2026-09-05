@@ -79,15 +79,24 @@ raw counts.
 Preparation requires a study-independent annotation TSV with exactly these columns:
 
 ```text
-cell    analysis_unit    cluster    centroid_weight
-cell_1  B_lineage        B_naive    0.92
-cell_2  B_lineage        B_memory   0.81
+cell    analysis_unit    cluster
+cell_1  B_lineage        B_naive
+cell_2  B_lineage        B_memory
 ```
 
-The fields shown aligned above are tabs. `cell`, `analysis_unit`, and `cluster` are
-required. `centroid_weight` is an optional positive finite value; when supplied for
-the complete table it is preserved as a separate `centroid_weights.tsv` artifact for
-each unit. No dataset-specific label or score name is built into SPATHI.
+The fields shown aligned above are tabs. No additional annotation columns are
+accepted. Optional centroid sensitivity values use a separate strict TSV supplied
+with `--centroid-weights`:
+
+```text
+cell    centroid_weight
+cell_1  0.92
+cell_2  0.81
+```
+
+This file must cover every annotation cell exactly once with a positive finite value.
+Preparation aligns it by cell identifier and emits one `centroid_weights.tsv` per
+eligible analysis unit. No dataset-specific label or score name is built into SPATHI.
 
 Only cells listed in the annotation table are prepared. This makes exclusion of
 unclassified cells explicit: an annotation cell absent from the H5 is an error, while
@@ -103,6 +112,9 @@ spathi prepare \
   --tf-list data/tf_list.txt \
   --output-dir prepared/patient-01
 ```
+
+For an explicitly weighted-centroid sensitivity run, add
+`--centroid-weights data/centroid_weights.tsv`.
 
 The default transformation is library-size normalization to 10,000 counts followed
 by `log1p`. Library sizes use every `Gene Expression` feature before per-unit gene
@@ -126,7 +138,7 @@ prepared/patient-01/
         ├── expression.tsv
         ├── groups.tsv
         ├── tf_list.txt
-        └── centroid_weights.tsv  # only when supplied
+        └── centroid_weights.tsv  # only with --centroid-weights
 ```
 
 The H5 matrix remains sparse throughout processing. Writing the required dense TSV
@@ -188,6 +200,34 @@ Restricting targets changes only which response models and corresponding network
 produced. PCA or expression-space distances still use the complete expression matrix,
 and candidate predictors still come from the complete `--tf-list`. The exact target
 file is fingerprinted in `run_metadata.json`.
+
+### Optional automatic target eligibility
+
+The primary, exact-scope policy is `--target-eligibility all`, which attempts every
+requested target and is the default. For very large all-gene analyses,
+`--target-eligibility automatic` can avoid fitting responses that have too little
+observable support. A target must then:
+
+- be non-zero in at least `--min-target-detected-cells` cells and the fraction set by
+  `--min-target-detected-fraction` over the complete input;
+- vary over the complete input; and
+- for each target-group model, carry at least
+  `--min-target-weighted-detected-fraction` of that model's total weight and reach
+  `--min-target-weighted-detected-ess` Kish effective detected-cell sample size.
+
+The delivered thresholds are 20 cells, 0.01 unweighted fraction, 0.01 weighted
+fraction, and ESS 10. Detection means a value greater than zero, and automatic mode
+therefore requires non-negative, zero-preserving target expression such as the output
+of `spathi prepare`; centered or otherwise signed inputs must use `all`. Global
+decisions are written to `target_eligibility.tsv.gz`; contextual values
+and every skipped model are written to `model_diagnostics.tsv.gz` and
+`skipped_targets.tsv`.
+
+This policy changes only whether a gene is fitted as a response. It never removes an
+eligible TF from another target's predictor set and never changes the genes used for
+PCA or expression-space distances. Because it intentionally changes the inferred
+target universe, it remains opt-in until its accuracy and coverage gates have been
+validated on an independent benchmark.
 
 ### Groups
 
@@ -398,7 +438,9 @@ committed, repeat the same command with `--resume`; SPATHI revalidates the exact
 fingerprints, scientific parameters, implementation, dependency versions, and
 recalculated group weights before reusing any model. A failed attempt with no committed
 model removes its empty checkpoint automatically, so the ordinary command remains
-immediately retryable.
+immediately retryable. Model payloads use a checksummed, compressed columnar codec, and
+resume loads completed target identities only for the active bounded group batch rather
+than retaining the full groups-by-targets key set in memory.
 
 ```bash
 spathi infer \
@@ -486,8 +528,9 @@ Additional artifacts are:
 | `group_affinities.tsv` | group-level centroid affinities and per-cell size-correction factors |
 | `centroids.tsv` | long-form `(group, dimension, centroid)` values for each reusable arithmetic or explicitly weighted centroid |
 | `weight_diagnostics.tsv` | authoritative effective weight mass, ranges, sample size, and source-group contributions |
-| `skipped_targets.tsv` | constant or otherwise non-trainable target models and reasons |
-| `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, fit status, and timing |
+| `target_eligibility.tsv.gz` | global per-target automatic-eligibility decisions and their measured support |
+| `skipped_targets.tsv` | constant, automatically ineligible, or otherwise non-trainable target models and reasons |
+| `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, target support, actual tree count, convergence, fit status, and timing |
 | `cell_embedding.tsv.gz` | cells, groups, and report coordinates: retained PCs for PCA-distance runs, or auxiliary PCs for expression-distance runs when reporting is enabled |
 | `pca_explained_variance.tsv` | per-PC and cumulative ratios for the fitted or auxiliary PCA; absent only for expression-distance runs with `--no-report` |
 | `report.html` | single self-contained interactive report with the Plotly runtime and run data embedded; omitted with `--no-report` |
@@ -576,9 +619,12 @@ remaining TF predictor that is constant among positive-weight cells. Predictor n
 importances, and diagnostic counts retain the resulting filtered-column mapping.
 
 Target responses remain `float64`, preserving valid expression differences smaller
-than one `float32` unit. Only the reusable TF predictor matrix is converted once to
-the `float32` representation used by scikit-learn's tree implementation. Distance,
-weight, and `sample_weight` calculations also remain `float64`.
+than one `float32` unit. The reusable TF predictor matrix is copied directly into its
+final C-contiguous `float32` allocation, without first materializing the complete
+selection as a second `float64` matrix. An explicit target subset is likewise copied
+directly into one final Fortran-contiguous response matrix. SPATHI preflights both
+persistent allocations against live memory and bounds their finiteness masks to
+64 MiB. Distance, weight, and `sample_weight` calculations remain `float64`.
 
 When neither `--bootstrap` nor `--no-bootstrap` is supplied, SPATHI uses the
 estimator-appropriate default: bootstrap sampling is disabled for Extra-Trees and
@@ -586,12 +632,25 @@ enabled for Random Forest. An explicit CLI flag overrides that choice.
 `parameters.json` retains the requested value (`null` means automatic), while
 `run_metadata.json` records the effective boolean used for training.
 
-`--threads` is the only public parallelism budget: `-1` uses all logical CPUs, `1` is
+`--adaptive-trees` is an opt-in compute policy. It grows the same seeded ensemble in
+deterministic blocks, up to the strict `--n-estimators` ceiling, and stops a model only
+after its normalized TF-importance vector remains within the configured total-variation
+`--adaptive-tolerance` over `--adaptive-patience` prior checkpoints. The first possible
+stop is constrained by `--adaptive-min-estimators`; `--adaptive-tree-step` controls the
+block size. Delivered controls are 100, 50, 0.01, and 2 respectively. The actual tree
+count and convergence diagnostics are persisted per model and summarized in metadata.
+Importance stability is a computational stopping rule, not proof that the result equals
+the maximum-tree ensemble, so this option is disabled by default pending formal
+non-inferiority validation.
+
+`--threads` is the only public parallelism budget: `auto` uses all logical CPUs, `1` is
 sequential, and a positive integer caps available workers. Independent
-`(target group, target gene)` tasks are scheduled with Joblib. Ensembles run with one
+`(target group, target gene)` tasks use one persistent, bounded rolling thread queue.
+At most two tasks per worker are pending, completed work is replenished immediately,
+and results return to canonical order before serialization. Ensembles run with one
 worker when outer parallelism is active, while threadpoolctl limits numerical-library
-thread pools to avoid nested oversubscription. Per-task seeds depend on the global
-seed, group ID, and target ID—not scheduler completion order.
+thread pools to avoid nested oversubscription. Per-task seeds depend on the global seed,
+group ID, and target ID—not scheduler completion order.
 
 Before fitting, SPATHI estimates the conservative memory cost of one ensemble and
 detects available host or cgroup memory when the platform exposes it. On Linux it uses
@@ -640,19 +699,70 @@ synthetic scaling benchmark with, for example:
 
 ```bash
 python benchmarks/benchmark_scaling.py \
-  --threads 1 2 -1 \
+  --threads 1 2 auto \
   --targets 20 80 \
+  --n-estimators 25 \
+  --n-components 20 \
   --warmups 1 \
   --repeats 2 \
+  --case-timeout-seconds 3600 \
   --no-checkpoint \
   --no-report
 ```
 
-It executes complete CLI child processes in balanced, reproducibly shuffled orders and
-writes machine-readable CSV measurements for wall time and peak process-tree RSS to
-standard output. Warm-ups are identified separately, target subsets are generated from
-the same synthetic dataset, and checkpointing or report generation can be included
-explicitly. Benchmarks are intentionally excluded from ordinary tests and CI.
+The explicit 25-tree/20-component settings above are a reduced development scout, not
+the 250-tree/50-component production defaults. It executes complete CLI child processes
+in balanced, reproducibly shuffled orders and
+writes machine-readable CSV measurements to standard output and to a synchronously
+flushed `benchmark-results.csv` inside the reported workspace. Each row includes child
+wall time; sampled process-tree user/system CPU (a lower bound for descendants that
+start and finish between samples); sampled peak process-tree RSS and transient run
+storage; and exact final logical/allocated sizes for inputs, published output, and all
+retained run artifacts. Exact input hashes, implementation and harness hashes, package
+and dependency versions, requested controls, and effective controls make a row
+auditable even when its successful workspace is later discarded. The benchmark also
+flattens the current `run_metadata.json` contract into columns for phase timings, model
+and edge counts, effective dimensions, batching, and parallelism. This keeps CLI
+overhead visible while making scientific phases separately attributable.
+
+Every SPATHI child has a positive finite timeout (one hour by default). A timeout
+terminates its contained process tree, retains diagnostic artifacts, writes a
+`status=timeout` row, and then continues the schedule. `Ctrl-C` and external
+termination use the same cleanup path and preserve rows already fsynced. Use
+`--keep-work-dir` to retain successful direct-benchmark artifacts as well. Warm-ups are
+identified separately, target subsets are generated from the same synthetic dataset,
+and checkpointing or report generation can be included explicitly. Benchmarks are
+intentionally excluded from ordinary tests and CI.
+
+For the validated multi-axis suites, use the orchestration entry point:
+
+```bash
+python benchmarks/run_scaling_suite.py --profile smoke
+python benchmarks/run_scaling_suite.py --profile progressive
+python benchmarks/run_scaling_suite.py --profile cll-envelope
+```
+
+`smoke` checks the measurement path, `progressive` varies cells, genes, TFs, targets,
+trees, multigroup counts, a separate one-group contract, coupled full-network
+sizes, and thread budgets. `cll-envelope` exercises a bounded target sample at four
+representative dimensions selected from all six eligible prepared CLL units. Its
+checked-in source snapshot pins the three H5, adapter-manifest, prepare-manifest, and TF
+catalog hashes together with every observed unit dimension and the case-selection
+rationale. The profile still generates balanced synthetic data, writes dense
+ANDREA-compatible TSV inputs, and is intentionally expensive; run it only after
+`progressive` succeeds.
+
+Add `--dry-run` to validate profiles and inspect every command, outer case timeout, and
+conservative disk estimate without creating output. Each executed suite first checks
+that its thread budgets remain distinct on the current host and that each case fits the
+available disk. It then snapshots the exact profile, benchmark harness, optional source
+observations, and importable SPATHI package used by every child. It writes an
+interruption-safe manifest, per-case logs, and one aggregate `results.csv` under the
+reported output directory. Successful dense inputs and individual run directories are
+discarded by default; pass `--keep-workspaces` only when those potentially large
+artifacts are needed. Each complete benchmark case has an outer timeout covering data
+generation plus all scheduled SPATHI children. Profiles describe their synthetic-data
+limitations explicitly and do not replace measurements on prepared biological inputs.
 
 ## Scientific interpretation and limitations
 
