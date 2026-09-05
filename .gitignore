@@ -1,0 +1,38 @@
+# Python bytecode and native extensions
+__pycache__/
+*.py[cod]
+*.so
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and local configuration
+.env
+.envrc
+.venv/
+venv/
+
+# Test, coverage, and static-analysis state
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.nox/
+.pytest_cache/
+.ruff_cache/
+.tox/
+
+# Editor and notebook state
+.idea/
+.ipynb_checkpoints/
+.vscode/
+
+# Local SPATHI runs and publishing credentials
+results/
+.*.checkpoint/
+.*.staging-*/
+.pypirc

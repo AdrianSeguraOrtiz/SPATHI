@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "name": "large-scale",
+  "description": "Generic high-cost synthetic scaling scout over rounded analysis-unit dimensions.",
+  "limitations": [
+    "The benchmark generator writes dense TSV inputs in bounded gene blocks because SPATHI consumes the ANDREA-compatible dense input contract. These cases measure a conservative synthetic envelope, not sparse H5 ingestion.",
+    "The dimensions are independently declared, deliberately rounded engineering workloads. They are not measurements or projections of any private biological dataset.",
+    "Only eight targets, ten trees per model, and twenty PCA components are used. Target-count and estimator-count extrapolations must be derived from the progressive profile and validated separately.",
+    "Groups are balanced synthetic populations and therefore do not model biological class imbalance.",
+    "Run this profile only after the progressive scout succeeds; the largest dense synthetic expression TSV can approach two gigabytes and require several gigabytes of transient memory."
+  ],
+  "source_snapshot": null,
+  "defaults": {
+    "n_estimators": 10,
+    "n_components": 20,
+    "targets": [8],
+    "threads": [8],
+    "warmups": 0,
+    "repeats": 1,
+    "seed": 1729,
+    "checkpoint": false,
+    "report": false,
+    "resource_sample_ms": 50.0,
+    "case_timeout_seconds": 3600.0,
+    "case_process_timeout_seconds": 7200.0
+  },
+  "cases": [
+    {
+      "id": "single-group-rounded",
+      "description": "Rounded small one-group workload: 500 cells x 15,000 genes x 1,000 TFs.",
+      "tags": ["large-scale", "single-group"],
+      "cells": 500,
+      "genes": 15000,
+      "tfs": 1000,
+      "groups": 1
+    },
+    {
+      "id": "two-group-rounded",
+      "description": "Rounded medium two-group workload: 1,500 cells x 18,000 genes x 1,000 TFs.",
+      "tags": ["large-scale"],
+      "cells": 1500,
+      "genes": 18000,
+      "tfs": 1000,
+      "groups": 2
+    },
+    {
+      "id": "wide-rounded",
+      "description": "Rounded wide workload: 5,000 cells x 25,000 genes x 1,500 TFs x three groups.",
+      "tags": ["large-scale", "wide"],
+      "cells": 5000,
+      "genes": 25000,
+      "tfs": 1500,
+      "groups": 3
+    },
+    {
+      "id": "many-cells-rounded",
+      "description": "Rounded high-cell workload: 10,000 cells x 20,000 genes x 1,200 TFs x three groups.",
+      "tags": ["large-scale", "many-cells"],
+      "cells": 10000,
+      "genes": 20000,
+      "tfs": 1200,
+      "groups": 3
+    }
+  ]
+}

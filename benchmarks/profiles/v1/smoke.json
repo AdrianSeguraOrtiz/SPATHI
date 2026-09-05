@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "smoke",
+  "description": "Fast end-to-end validation of the scaling harness and its resource measurements.",
+  "limitations": [
+    "This profile validates the measurement pipeline; it is too small for performance conclusions."
+  ],
+  "source_snapshot": null,
+  "defaults": {
+    "n_estimators": 5,
+    "n_components": 10,
+    "targets": [12],
+    "threads": [1],
+    "warmups": 0,
+    "repeats": 1,
+    "seed": 1729,
+    "checkpoint": false,
+    "report": false,
+    "resource_sample_ms": 20.0,
+    "case_timeout_seconds": 180.0,
+    "case_process_timeout_seconds": 300.0
+  },
+  "cases": [
+    {
+      "id": "smoke",
+      "description": "Small deterministic dataset with three groups.",
+      "tags": ["validation"],
+      "cells": 120,
+      "genes": 80,
+      "tfs": 12,
+      "groups": 3
+    }
+  ]
+}
