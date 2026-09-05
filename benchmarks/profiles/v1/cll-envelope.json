@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "name": "cll-envelope",
+  "description": "Explicit high-cost scout at representative CLL analysis-unit dimensions with a bounded target universe.",
+  "limitations": [
+    "The benchmark generator writes a dense TSV in bounded gene blocks because SPATHI consumes the ANDREA-compatible dense input contract. These cases measure a conservative synthetic envelope, not sparse H5 ingestion.",
+    "Only eight targets, ten trees per model, and twenty PCA components are used. Target-count, estimator-count, and production-default extrapolations must be derived from the progressive profile and validated separately.",
+    "The observed ET29/CD8 unit has one group and is run with SPATHI's required cell-distance, Euclidean, no-group-correction configuration; multigroup cases use the group-anchored configuration.",
+    "Groups are balanced synthetic populations, unlike the strongly imbalanced observed CLL groups.",
+    "Run this profile only after the progressive scout succeeds; the largest dense synthetic expression TSV is expected to approach two gigabytes and can require several gigabytes of transient memory."
+  ],
+  "source_snapshot": {
+    "path": "sources/cll-observed-v1.json",
+    "sha256": "83399f2a70c70669e733defabde0be4ec29dd05ae77b096ea24bf7848cc12c25"
+  },
+  "defaults": {
+    "n_estimators": 10,
+    "n_components": 20,
+    "targets": [8],
+    "threads": [8],
+    "warmups": 0,
+    "repeats": 1,
+    "seed": 1729,
+    "checkpoint": false,
+    "report": false,
+    "resource_sample_ms": 50.0,
+    "case_timeout_seconds": 3600.0,
+    "case_process_timeout_seconds": 7200.0
+  },
+  "cases": [
+    {
+      "id": "et29-cd8-single-group",
+      "description": "ET29/CD8 dimensions: 319 cells x 14,058 genes x 1,000 TFs x one group.",
+      "tags": ["cll-envelope", "single-group"],
+      "cells": 319,
+      "genes": 14058,
+      "tfs": 1000,
+      "groups": 1
+    },
+    {
+      "id": "p34638-cd4-medium",
+      "description": "P34638/CD4 dimensions: 1,156 cells x 17,188 genes x 1,107 TFs x two groups.",
+      "tags": ["cll-envelope"],
+      "cells": 1156,
+      "genes": 17188,
+      "tfs": 1107,
+      "groups": 2
+    },
+    {
+      "id": "p34638-b-widest-model-universe",
+      "description": "P34638/B dimensions: 4,616 cells x 22,315 genes x 1,249 TFs x three groups; highest observed full target-universe model count.",
+      "tags": ["cll-envelope"],
+      "cells": 4616,
+      "genes": 22315,
+      "tfs": 1249,
+      "groups": 3
+    },
+    {
+      "id": "e20141-b-largest-cells",
+      "description": "E20141/B dimensions: 9,806 cells x 21,659 genes x 1,233 TFs x three groups; highest observed cell count.",
+      "tags": ["cll-envelope", "largest-cell-count"],
+      "cells": 9806,
+      "genes": 21659,
+      "tfs": 1233,
+      "groups": 3
+    }
+  ]
+}

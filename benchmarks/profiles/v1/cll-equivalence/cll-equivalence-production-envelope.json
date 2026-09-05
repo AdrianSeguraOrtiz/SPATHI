@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "name": "cll-equivalence-production-envelope",
+  "description": "Opt-in full-target reference/candidate envelope on explicitly selected prepared CLL units.",
+  "minimum_datasets": 1,
+  "maximum_datasets": 1,
+  "allow_identical_implementations": false,
+  "limitations": [
+    "This profile verifies computational equivalence and measures engineering cost; it does not estimate biological accuracy.",
+    "Every expression gene is inferred as a target without passing target-list, using 250 trees and checkpointing.",
+    "One warm-up pair plus four measured pairs means ten complete SPATHI executions per selected dataset and may require days.",
+    "Run exactly one explicitly selected dataset first, only after smoke and progressive profiles succeed.",
+    "The disk preflight assumes maximally dense networks and retained reference/candidate outputs for every failed comparison; measured peaks remain sampled lower bounds."
+  ],
+  "scientific_parameters": {
+    "single_group_weight_mode": "cell-distance",
+    "multi_group_weight_mode": "cell-distance-group-anchored",
+    "distance_space": "pca",
+    "distance_standardization": "none",
+    "pca_svd_solver": "auto",
+    "single_group_distance_metric": "euclidean",
+    "multi_group_distance_metric": "cosine",
+    "kernel": "gaussian",
+    "bandwidth": "auto",
+    "single_group_size_correction": "none",
+    "multi_group_size_correction": "cap-to-target",
+    "tree_method": "extra-trees",
+    "max_features": "sqrt",
+    "min_samples_leaf": 1,
+    "max_depth": null,
+    "bootstrap": false,
+    "adaptive_trees": false,
+    "adaptive_min_estimators": 100,
+    "adaptive_tree_step": 50,
+    "adaptive_tolerance": 0.01,
+    "adaptive_patience": 2,
+    "target_eligibility": "all",
+    "min_target_detected_cells": 20,
+    "min_target_detected_fraction": 0.01,
+    "min_target_weighted_detected_fraction": 0.01,
+    "min_target_weighted_detected_ess": 10.0
+  },
+  "defaults": {
+    "target_counts": ["all"],
+    "n_estimators": [250],
+    "threads": [8],
+    "n_components": 50,
+    "warmups": 1,
+    "repeats": 4,
+    "seed": 1729,
+    "checkpoint": true,
+    "report": false,
+    "resource_sample_ms": 250.0,
+    "run_timeout_seconds": 172800.0
+  },
+  "comparison": {
+    "absolute_tolerance": 1e-12,
+    "relative_tolerance": 1e-10
+  },
+  "cases": [
+    {
+      "id": "all-targets-production",
+      "description": "All expression genes, 250 trees, and checkpointing on one explicitly selected real analysis unit.",
+      "dataset_ids": []
+    }
+  ]
+}

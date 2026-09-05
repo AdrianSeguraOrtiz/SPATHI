@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "name": "progressive",
+  "description": "Safe scout that varies one principal scaling axis at a time before expensive CLL-envelope runs.",
+  "limitations": [
+    "Cases are synthetic and dense; they isolate computational scaling rather than biological realism.",
+    "A single measured repeat is intended for scouting. Confirm important points with additional repeats before reporting them.",
+    "Checkpointing and the interactive report are disabled so that inference scaling is measured separately from optional artifacts."
+  ],
+  "source_snapshot": null,
+  "defaults": {
+    "n_estimators": 10,
+    "n_components": 20,
+    "targets": [32],
+    "threads": [8],
+    "warmups": 0,
+    "repeats": 1,
+    "seed": 1729,
+    "checkpoint": false,
+    "report": false,
+    "resource_sample_ms": 20.0,
+    "case_timeout_seconds": 900.0,
+    "case_process_timeout_seconds": 3900.0
+  },
+  "cases": [
+    {
+      "id": "cells-250",
+      "description": "Cell-count axis: 250 cells.",
+      "tags": ["cells-axis"],
+      "cells": 250,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3
+    },
+    {
+      "id": "cells-1000",
+      "description": "Cell-count axis: 1,000 cells.",
+      "tags": ["cells-axis", "tf-axis", "groups-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3
+    },
+    {
+      "id": "cells-3000",
+      "description": "Cell-count axis: 3,000 cells.",
+      "tags": ["cells-axis"],
+      "cells": 3000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3
+    },
+    {
+      "id": "genes-250",
+      "description": "Expression-width axis: 250 genes.",
+      "tags": ["genes-axis"],
+      "cells": 1000,
+      "genes": 250,
+      "tfs": 100,
+      "groups": 3
+    },
+    {
+      "id": "genes-1000",
+      "description": "Expression-width axis: 1,000 genes.",
+      "tags": ["genes-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 100,
+      "groups": 3
+    },
+    {
+      "id": "genes-4000",
+      "description": "Expression-width axis: 4,000 genes.",
+      "tags": ["genes-axis"],
+      "cells": 1000,
+      "genes": 4000,
+      "tfs": 100,
+      "groups": 3
+    },
+    {
+      "id": "tfs-50",
+      "description": "Candidate-regulator axis: 50 TFs.",
+      "tags": ["tf-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 50,
+      "groups": 3
+    },
+    {
+      "id": "tfs-800",
+      "description": "Candidate-regulator axis: 800 TFs.",
+      "tags": ["tf-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 800,
+      "groups": 3
+    },
+    {
+      "id": "targets-axis",
+      "description": "Nested target subsets share one generated input dataset.",
+      "tags": ["targets-axis", "trees-axis-anchor", "input-reuse"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3,
+      "targets": [16, 64, 256]
+    },
+    {
+      "id": "threads-axis",
+      "description": "Thread budgets share one generated input dataset and target subset.",
+      "tags": ["threads-axis", "input-reuse"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3,
+      "targets": [64],
+      "threads": [1, 2, 4, 8]
+    },
+    {
+      "id": "groups-1",
+      "description": "Separate one-group contract using SPATHI's individually cell-weighted mode.",
+      "tags": ["single-group-contract"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 1
+    },
+    {
+      "id": "groups-2",
+      "description": "Group-count axis: two groups.",
+      "tags": ["groups-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 2
+    },
+    {
+      "id": "groups-6",
+      "description": "Group-count axis: six groups.",
+      "tags": ["groups-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 6
+    },
+    {
+      "id": "trees-50",
+      "description": "Estimator-count scout at 50 trees per model and a small target universe.",
+      "tags": ["trees-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3,
+      "targets": [16],
+      "n_estimators": 50
+    },
+    {
+      "id": "trees-250",
+      "description": "Estimator-count scout at the production default and a small target universe.",
+      "tags": ["trees-axis"],
+      "cells": 1000,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3,
+      "targets": [16],
+      "n_estimators": 250
+    },
+    {
+      "id": "full-targets-250",
+      "description": "Coupled network-size scout with 250 genes, 50 TFs, and every gene targeted.",
+      "tags": ["coupled-network-size-axis"],
+      "cells": 500,
+      "genes": 250,
+      "tfs": 50,
+      "groups": 3,
+      "targets": null
+    },
+    {
+      "id": "full-targets-500",
+      "description": "Coupled network-size scout with 500 genes, 100 TFs, and every gene targeted.",
+      "tags": ["coupled-network-size-axis"],
+      "cells": 500,
+      "genes": 500,
+      "tfs": 100,
+      "groups": 3,
+      "targets": null
+    },
+    {
+      "id": "full-targets-1000",
+      "description": "Coupled network-size scout with 1,000 genes, 200 TFs, and every gene targeted.",
+      "tags": ["coupled-network-size-axis"],
+      "cells": 500,
+      "genes": 1000,
+      "tfs": 200,
+      "groups": 3,
+      "targets": null
+    }
+  ]
+}

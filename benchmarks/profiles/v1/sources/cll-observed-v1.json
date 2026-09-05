@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "description": "Auditable dimensions observed after adapting and preparing the three local CLL patients; no expression values or cell identifiers are stored here.",
+  "observed_on": "2026-09-04",
+  "preparation_contract": {
+    "gene_identifier": "name",
+    "duplicate_gene_policy": "sum",
+    "normalization": "library-size-log1p",
+    "target_sum": 10000.0,
+    "min_cells": 300,
+    "min_gene_cells": 1,
+    "centroid_weights": false,
+    "tf_catalog": {
+      "description": "Canonical one-identifier-per-line form used by SPATHI preparation.",
+      "sha256": "ddc47f22ec27f0df5613449b9b3d2d5860f50eb8f8f1bf9dcbf8dc5c94e9592b",
+      "size_bytes": 10198
+    }
+  },
+  "patients": [
+    {
+      "patient": "E20141_T3",
+      "input_h5_sha256": "7d25f493758def60f12b05e97cf7f52bce59fdbf287403c2756a96faefd77312",
+      "adapter_manifest_sha256": "94e107e949bf1fe6c599d7b6f23bd9cb9ba1876a3bb01e324152bbdb0ea365f3",
+      "prepare_manifest_sha256": "0a745d0037e964f3ea95495a4924ac6de5150f6cc2881eafb8cba9386d028a30",
+      "eligible_analysis_units": [
+        {
+          "analysis_unit": "b_cell_maturation",
+          "cells": 9806,
+          "genes": 21659,
+          "transcription_factors": 1233,
+          "groups": 3,
+          "group_sizes": {
+            "B naive": 1607,
+            "B intermediate": 8150,
+            "B memory": 49
+          }
+        }
+      ]
+    },
+    {
+      "patient": "ET29_T2",
+      "input_h5_sha256": "1b17b8eab280e44e5ee43e0880a73d9a702c034c04016aecff38a44a125b13bb",
+      "adapter_manifest_sha256": "02ce87b493774c8bccc2a2de75526de49af312619922e74bd5cbd4fde77ae813",
+      "prepare_manifest_sha256": "d85ab4deb1752785d0f0f8195a94541a5b7241f704b74f38f98474b980ed6d56",
+      "eligible_analysis_units": [
+        {
+          "analysis_unit": "b_cell_maturation",
+          "cells": 3739,
+          "genes": 21499,
+          "transcription_factors": 1230,
+          "groups": 3,
+          "group_sizes": {
+            "B naive": 2,
+            "B intermediate": 3736,
+            "B memory": 1
+          }
+        },
+        {
+          "analysis_unit": "cd8_maturation",
+          "cells": 319,
+          "genes": 14058,
+          "transcription_factors": 1000,
+          "groups": 1,
+          "group_sizes": {
+            "CD8 TEM": 319
+          }
+        }
+      ]
+    },
+    {
+      "patient": "P34638_T1",
+      "input_h5_sha256": "9a42abc207ac7b91d331ac47eaa390c74ddc51c4728a91d11b7127f5ff31403a",
+      "adapter_manifest_sha256": "b8c30e2860ae2867679c2904307d2076a69e728057bc394d199972f4ba3e464f",
+      "prepare_manifest_sha256": "4b220a1c80054ef943e9301dd702243cc762437e1e72d8aac4b5c54b35805c1b",
+      "eligible_analysis_units": [
+        {
+          "analysis_unit": "b_cell_maturation",
+          "cells": 4616,
+          "genes": 22315,
+          "transcription_factors": 1249,
+          "groups": 3,
+          "group_sizes": {
+            "B naive": 63,
+            "B intermediate": 4497,
+            "B memory": 56
+          }
+        },
+        {
+          "analysis_unit": "cd4_conventional",
+          "cells": 1156,
+          "genes": 17188,
+          "transcription_factors": 1107,
+          "groups": 2,
+          "group_sizes": {
+            "CD4 TCM": 1139,
+            "CD4 TEM": 17
+          }
+        },
+        {
+          "analysis_unit": "cd8_maturation",
+          "cells": 998,
+          "genes": 16878,
+          "transcription_factors": 1104,
+          "groups": 3,
+          "group_sizes": {
+            "CD8 Naive": 32,
+            "CD8 TCM": 51,
+            "CD8 TEM": 915
+          }
+        }
+      ]
+    }
+  ],
+  "profile_case_selection": {
+    "et29-cd8-single-group": "Smallest eligible unit and the observed one-group contract.",
+    "p34638-cd4-medium": "Intermediate eligible shape and the observed two-group contract.",
+    "p34638-b-widest-model-universe": "Largest observed gene, TF, and full-universe G x target model counts.",
+    "e20141-b-largest-cells": "Largest observed cell count.",
+    "omitted_units": "ET29/B and P34638/CD8 are bounded component-wise by selected three-group B cases; their group imbalance remains a biological limitation not represented by the balanced synthetic generator."
+  }
+}
