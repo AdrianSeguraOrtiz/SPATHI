@@ -527,13 +527,13 @@ Additional artifacts are:
 
 | File | Purpose |
 |---|---|
-| `cell_weights.tsv.gz` | authoritative long-form distances, base weights, size factors, and final model weights |
+| `cell_weights.tsv.gz` | authoritative long-form distances, base weights, size factors, final model weights, and per-cell numerical canonicalization flags |
 | `centroid_weights.tsv.gz` | cell-aligned raw and within-group-normalized centroid weights; ones are written in primary uniform mode |
 | `centroid_weight_diagnostics.tsv` | exact per-group raw-weight sum, minimum, median, maximum, cell count, and effective sample size |
 | `group_distances.tsv` | pairwise centroid distances |
 | `group_affinities.tsv` | group-level centroid affinities and per-cell size-correction factors |
 | `centroids.tsv` | long-form `(group, dimension, centroid)` values for each reusable arithmetic or explicitly weighted centroid |
-| `weight_diagnostics.tsv` | authoritative effective weight mass, ranges, sample size, and source-group contributions |
+| `weight_diagnostics.tsv` | authoritative raw/effective weight mass, numerical canonicalization, sample size, ESS, and source-group contributions |
 | `target_eligibility.tsv.gz` | global per-target automatic-eligibility decisions and their measured support |
 | `skipped_targets.tsv` | constant, automatically ineligible, or otherwise non-trainable target models and reasons |
 | `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, target support, actual tree count, convergence, fit status, and timing |
@@ -548,6 +548,14 @@ actual per-cell base model weight only in `group-distance` mode; it must not be 
 the effective contribution of a group in either cell-distance mode. The exact weights
 passed to the models are `cell_weights.tsv.gz:final_weight`, and their exact aggregate
 contributions are in `weight_diagnostics.tsv`.
+
+Before masks, weighted-support checks, ESS calculations, or model fitting, SPATHI maps
+a positive weight whose normalized share of total mass is at or below binary64 machine
+epsilon to exact zero. Such a weight cannot affect an accumulation at the total-mass
+scale but can destabilize weighted tree impurity arithmetic. Retained weights are not
+renormalized. The fixed, scale-invariant rule, its absolute threshold, removed mass,
+and affected cells are recorded in the two weight artifacts and `run_metadata.json`;
+it is an implementation-level numerical contract rather than a tunable parameter.
 
 Likewise, `centroid_weights.tsv.gz:centroid_weight` is an input to centroid
 construction only. Its `normalized_centroid_weight` sums to one within each observed

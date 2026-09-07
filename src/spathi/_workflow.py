@@ -80,6 +80,8 @@ from spathi.targeting import (
     unfiltered_target_eligibility,
 )
 from spathi.weighting import (
+    SAMPLE_WEIGHT_CANONICALIZATION_RULE,
+    SAMPLE_WEIGHT_RELATIVE_PRECISION,
     WeightingContext,
     compute_weights,
     iter_group_affinity_records,
@@ -1121,6 +1123,14 @@ def _execute_model_phase(
                     group_distances=group_distances,
                 )
                 diagnostics = compute_weight_diagnostics(weights, emit_warnings=False)
+                if diagnostics.canonicalized_cell_count:
+                    LOGGER.info(
+                        "Canonicalized %d/%d numerically ineffective positive sample "
+                        "weight(s) for target group %r before fitting",
+                        diagnostics.canonicalized_cell_count,
+                        diagnostics.raw_positive_cell_count,
+                        target_group,
+                    )
                 for warning in diagnostics.warnings:
                     contextual = f"Target group {target_group!r}: {warning}"
                     warning_messages.append(contextual)
@@ -2284,6 +2294,19 @@ def _run_workflow_impl(
             "distance_memory_available_bytes_at_planning": (distance_memory_plan.available_bytes),
             "distance_memory_usable_bytes_at_planning": distance_memory_plan.usable_bytes,
             "bandwidth": asdict(bandwidth),
+            "sample_weight_canonicalization": {
+                "rule": SAMPLE_WEIGHT_CANONICALIZATION_RULE,
+                "relative_precision": SAMPLE_WEIGHT_RELATIVE_PRECISION,
+                "scale_invariant": True,
+                "applied_before": [
+                    "positive_weight_mask",
+                    "constant_predictor_screening",
+                    "target_weighted_detection",
+                    "effective_sample_size",
+                    "tree_fitting",
+                ],
+                "retained_weights_renormalized": False,
+            },
             "tree_target_dtype": tree_target_dtype,
             "tree_predictor_dtype": tree_predictor_dtype,
             "inference_preparation_performed": prepared is not None,
@@ -2431,6 +2454,21 @@ def _run_workflow_impl(
         },
         "memory_estimate_bytes": memory_estimate_metadata,
         "artifact_semantics": {
+            "cell_weights.tsv.gz": {
+                "scope": "one effective model weight per target-group and cell",
+                "final_weight": "authoritative sample weight supplied to tree fitting",
+                "canonicalized_for_fitting": (
+                    "whether a positive kernel-derived weight was at or below the declared "
+                    "float64 normalized-mass precision boundary and set to exact zero"
+                ),
+            },
+            "weight_diagnostics.tsv": {
+                "scope": "effective weight-mass diagnostics per target and source group",
+                "canonicalization": (
+                    "exact rule, threshold, affected-cell count and removed mass applied "
+                    "before masks, weighted detection, ESS and fitting"
+                ),
+            },
             "target_eligibility.tsv.gz": {
                 "scope": "one global eligibility decision per requested target",
                 "mode": config.target_eligibility,

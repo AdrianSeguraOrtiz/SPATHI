@@ -284,12 +284,25 @@ external group; it does not upweight smaller groups and does not modify distance
 `cell-distance`, the final maximum-one normalization follows this multiplication. In
 the two anchored modes, \(\widetilde{w}\) is already the final vector.
 
+### Numerical sample-weight boundary
+
+Let `u` be binary64 machine epsilon and `S_c = sum_i(w_i)` for target group `c`.
+Before any positive-weight mask, weighted-support statistic, ESS calculation, or tree
+fit, SPATHI maps `w_i` to exact zero whenever `0 < w_i <= u * S_c`.
+
+Weights at this scale cannot change a binary64 accumulation of the total mass but can
+create numerically invalid weighted-impurity nodes in tree estimators. The rule is
+invariant to a common positive rescaling and retained weights are not renormalized. It
+is not a scientific hyperparameter. `cell_weights.tsv.gz` identifies affected cells;
+`weight_diagnostics.tsv` records the raw and effective support, threshold, removed
+mass, and rule; and `run_metadata.json` records the run-wide contract.
+
 ## Weight diagnostics
 
 Diagnostics are computed once per target-group weight vector, not once per gene. They
-include target-group size, total weight, target and per-external-group mass, target and
-external mass percentages, minimum, maximum, mean, median, positive-weight count, and
-effective sample size:
+include target-group size, raw and effective total weight, target and per-external-group
+effective mass, target and external mass percentages, minimum, maximum, mean, median,
+raw/effective positive-weight counts, canonicalized mass, and effective sample size:
 
 \[
 \operatorname{ESS}(w) =

@@ -28,6 +28,7 @@ CELL_WEIGHT_COLUMNS = (
     "base_weight",
     "group_size_factor",
     "final_weight",
+    "canonicalized_for_fitting",
 )
 SKIPPED_COLUMNS = ("target_group", "target", "reason", "detail")
 MODEL_DIAGNOSTIC_COLUMNS = (
@@ -68,7 +69,14 @@ WEIGHT_DIAGNOSTIC_COLUMNS = (
     "max_weight",
     "mean_weight",
     "median_weight",
+    "raw_weight_sum",
+    "raw_positive_cell_count",
     "positive_cell_count",
+    "canonicalized_cell_count",
+    "canonicalized_weight_mass",
+    "canonicalization_threshold",
+    "canonicalization_rule",
+    "canonicalization_relative_precision",
     "effective_sample_size",
     "warnings_json",
     "source_group",
@@ -302,6 +310,7 @@ class IncrementalRunWriter:
                     _clean_scalar(base),
                     _clean_scalar(factor),
                     _clean_scalar(final),
+                    bool(final == 0.0 and base > 0.0 and factor > 0.0),
                 )
             )
             count += 1
@@ -339,7 +348,14 @@ class IncrementalRunWriter:
                     diagnostics.max_weight,
                     diagnostics.mean_weight,
                     diagnostics.median_weight,
+                    diagnostics.raw_weight_sum,
+                    diagnostics.raw_positive_cell_count,
                     diagnostics.positive_cell_count,
+                    diagnostics.canonicalized_cell_count,
+                    diagnostics.canonicalized_weight_mass,
+                    diagnostics.canonicalization_threshold,
+                    diagnostics.canonicalization_rule,
+                    diagnostics.canonicalization_relative_precision,
                     diagnostics.effective_sample_size,
                     warning_text,
                     source_group,

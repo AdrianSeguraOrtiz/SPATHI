@@ -16,7 +16,7 @@ from spathi.outputs import (
     write_tsv_gzip,
     write_tsv_gzip_records,
 )
-from spathi.weighting import WeightingContext, WeightResult
+from spathi.weighting import WeightingContext, WeightResult, canonicalize_sample_weights
 
 
 def _make_output_dir(tmp_path: Path, name: str) -> Path:
@@ -62,6 +62,7 @@ def _model_stat(
 
 
 def _weights() -> WeightResult:
+    final_weight, canonicalization = canonicalize_sample_weights(np.array([1.0, 0.5]))
     return WeightResult(
         context=WeightingContext(
             cells=("cell_1", "cell_2"),
@@ -74,8 +75,9 @@ def _weights() -> WeightResult:
         distance=np.array([0.0, 1.0]),
         base_weight=np.array([1.0, 0.5]),
         group_size_factor=np.ones(2),
-        final_weight=np.array([1.0, 0.5]),
+        final_weight=final_weight,
         mode="cell-distance",
+        canonicalization=canonicalization,
     )
 
 
@@ -127,9 +129,46 @@ def test_incremental_writer_produces_exact_schemas_and_canonical_order(tmp_path:
             "base_weight",
             "group_size_factor",
             "final_weight",
+            "canonicalized_for_fitting",
         ]
     weight_diagnostics = pd.read_csv(output_dir / "weight_diagnostics.tsv", sep="\t")
     assert weight_diagnostics["source_group"].tolist() == ["A", "B"]
+    assert weight_diagnostics["canonicalized_cell_count"].tolist() == [0, 0]
+
+
+def test_weight_artifacts_identify_each_numerically_canonicalized_cell(tmp_path: Path) -> None:
+    context = WeightingContext(
+        cells=("cell_1", "cell_2"),
+        cell_groups=("A", "B"),
+        group_ids=("A", "B"),
+        group_codes=np.array([0, 1]),
+        group_counts=np.array([1, 1]),
+    )
+    raw = np.array([1.0, np.finfo(np.float64).eps / 2.0])
+    effective, canonicalization = canonicalize_sample_weights(raw)
+    weights = WeightResult(
+        context=context,
+        target_group="A",
+        distance=np.array([0.0, 10.0]),
+        base_weight=raw,
+        group_size_factor=np.ones(2),
+        final_weight=effective,
+        mode="cell-distance",
+        canonicalization=canonicalization,
+    )
+    output_dir = _make_output_dir(tmp_path, "canonicalized")
+
+    with IncrementalRunWriter(output_dir) as writer:
+        writer.write_weights(weights)
+        writer.write_weight_diagnostics(
+            compute_weight_diagnostics(weights, emit_warnings=False)
+        )
+
+    cells = pd.read_csv(output_dir / "cell_weights.tsv.gz", sep="\t")
+    assert cells["final_weight"].tolist() == [1.0, 0.0]
+    assert cells["canonicalized_for_fitting"].tolist() == [False, True]
+    diagnostics = pd.read_csv(output_dir / "weight_diagnostics.tsv", sep="\t")
+    assert diagnostics["canonicalized_cell_count"].tolist() == [1, 1]
 
 
 def test_json_writer_handles_paths_and_has_terminal_newline(tmp_path: Path) -> None:

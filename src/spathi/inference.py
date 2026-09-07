@@ -58,6 +58,7 @@ from spathi.targeting import (
     assess_target_eligibility,
     weighted_detected_context_statistics,
 )
+from spathi.weighting import canonicalize_sample_weights
 
 INFERENCE_VALIDATION_WORKING_MEMORY_BYTES = 64 * 1024**2
 
@@ -1427,7 +1428,7 @@ def _prepare_groups(
             raise ValueError(f"weights for group {group!r} contain non-finite values")
         if np.any(weights < 0.0):
             raise ValueError(f"weights for group {group!r} contain negative values")
-        weights = np.ascontiguousarray(weights)
+        weights, _ = canonicalize_sample_weights(weights)
         positive_mask = np.ascontiguousarray(weights > 0.0)
         n_positive_weight_samples, weight_sum = _group_weight_statistics(
             weights,

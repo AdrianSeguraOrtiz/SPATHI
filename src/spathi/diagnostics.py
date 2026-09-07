@@ -27,7 +27,14 @@ class WeightDiagnostics:
     max_weight: float
     mean_weight: float
     median_weight: float
+    raw_weight_sum: float
+    raw_positive_cell_count: int
     positive_cell_count: int
+    canonicalized_cell_count: int
+    canonicalized_weight_mass: float
+    canonicalization_threshold: float
+    canonicalization_rule: str
+    canonicalization_relative_precision: float
     effective_sample_size: float
     group_weight_mass: Mapping[str, float]
     group_mass_percent: Mapping[str, float]
@@ -164,7 +171,14 @@ def compute_weight_diagnostics(
         max_weight=maximum,
         mean_weight=mean,
         median_weight=median,
+        raw_weight_sum=weights.canonicalization.raw_weight_sum,
+        raw_positive_cell_count=weights.canonicalization.raw_positive_cell_count,
         positive_cell_count=positive_count,
+        canonicalized_cell_count=weights.canonicalization.canonicalized_cell_count,
+        canonicalized_weight_mass=weights.canonicalization.canonicalized_weight_mass,
+        canonicalization_threshold=weights.canonicalization.absolute_threshold,
+        canonicalization_rule=weights.canonicalization.rule,
+        canonicalization_relative_precision=weights.canonicalization.relative_precision,
         effective_sample_size=ess,
         group_weight_mass=group_mass,
         group_mass_percent=group_percent,

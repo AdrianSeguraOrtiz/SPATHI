@@ -11,6 +11,9 @@ import pandas as pd
 from .config import GroupSizeCorrection, WeightMode
 from .kernels import BandwidthSelection, apply_kernel
 
+SAMPLE_WEIGHT_CANONICALIZATION_RULE = "zero_normalized_mass_at_or_below_float64_epsilon"
+SAMPLE_WEIGHT_RELATIVE_PRECISION = float(np.finfo(np.float64).eps)
+
 
 class DegenerateWeightsError(ValueError):
     """Raised when no positive sample weight remains for model fitting."""
@@ -71,6 +74,21 @@ class WeightingContext:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class WeightCanonicalization:
+    """Audit record for the numerical sample-weight boundary used by fitting."""
+
+    rule: str
+    relative_precision: float
+    absolute_threshold: float
+    raw_positive_cell_count: int
+    effective_positive_cell_count: int
+    canonicalized_cell_count: int
+    raw_weight_sum: float
+    effective_weight_sum: float
+    canonicalized_weight_mass: float
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WeightResult:
     """All interpretable stages of one target group's sample weights.
 
@@ -88,6 +106,7 @@ class WeightResult:
     group_size_factor: np.ndarray
     final_weight: np.ndarray
     mode: WeightMode
+    canonicalization: WeightCanonicalization
     normalization_factor: float = 1.0
 
     def __post_init__(self) -> None:
@@ -110,6 +129,29 @@ class WeightResult:
             )
         if self.target_group not in self.context.group_ids:
             raise ValueError(f"target group {self.target_group!r} has no cells")
+        final = np.asarray(self.final_weight, dtype=np.float64)
+        audit = self.canonicalization
+        effective_positive = int(np.count_nonzero(final > 0.0))
+        effective_sum = float(np.sum(final, dtype=np.float64))
+        if audit.rule != SAMPLE_WEIGHT_CANONICALIZATION_RULE:
+            raise ValueError("unsupported sample-weight canonicalization rule")
+        if audit.relative_precision != SAMPLE_WEIGHT_RELATIVE_PRECISION:
+            raise ValueError("sample-weight canonicalization precision is inconsistent")
+        if (
+            not np.isfinite(audit.absolute_threshold)
+            or audit.absolute_threshold < 0.0
+            or audit.raw_positive_cell_count < effective_positive
+            or audit.effective_positive_cell_count != effective_positive
+            or audit.canonicalized_cell_count
+            != audit.raw_positive_cell_count - audit.effective_positive_cell_count
+            or not np.isfinite(audit.raw_weight_sum)
+            or not np.isfinite(audit.effective_weight_sum)
+            or audit.raw_weight_sum < audit.effective_weight_sum
+            or audit.effective_weight_sum != effective_sum
+            or not np.isfinite(audit.canonicalized_weight_mass)
+            or audit.canonicalized_weight_mass < 0.0
+        ):
+            raise ValueError("sample-weight canonicalization audit is inconsistent")
 
     @property
     def cells(self) -> tuple[str, ...]:
@@ -122,6 +164,75 @@ class WeightResult:
         """Canonical group label for each cell in :attr:`cells`."""
 
         return self.context.cell_groups
+
+
+def canonicalize_sample_weights(
+    weights: np.ndarray | Sequence[float],
+) -> tuple[np.ndarray, WeightCanonicalization]:
+    """Map numerically ineffective positive sample weights to exact zero.
+
+    A positive weight whose share of total mass is at or below float64 machine epsilon
+    cannot change an accumulation at the total-mass scale. Treating such a value
+    as a positive observation nevertheless exposes it to tree split arithmetic,
+    where it can produce non-finite impurity importances. The decision is based on
+    ``weight / sum(weight)`` and is therefore invariant to a common positive scale.
+    Retained weights are never renormalized.
+    """
+
+    try:
+        values = np.asarray(weights, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sample weights must be numeric") from exc
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("sample weights must be a non-empty one-dimensional vector")
+    if not np.isfinite(values).all():
+        raise ValueError("sample weights contain non-finite values")
+    if np.any(values < 0.0):
+        raise ValueError("sample weights contain negative values")
+
+    raw_weight_sum = float(np.sum(values, dtype=np.float64))
+    if not np.isfinite(raw_weight_sum):
+        raise ValueError("sample weights have a non-finite total")
+    raw_positive_cell_count = int(np.count_nonzero(values > 0.0))
+    absolute_threshold = SAMPLE_WEIGHT_RELATIVE_PRECISION * raw_weight_sum
+    canonicalized_mask = np.zeros(values.shape, dtype=np.bool_)
+    if raw_weight_sum > 0.0:
+        np.less_equal(
+            values,
+            absolute_threshold,
+            out=canonicalized_mask,
+            where=values > 0.0,
+        )
+    canonicalized_cell_count = int(np.count_nonzero(canonicalized_mask))
+
+    effective = np.ascontiguousarray(values)
+    if canonicalized_cell_count:
+        # The input may be a caller-owned array or a read-only view. Copy only
+        # on the exceptional canonicalization path; unchanged vectors preserve
+        # the existing zero-copy behaviour.
+        effective = np.array(values, dtype=np.float64, order="C", copy=True)
+        canonicalized_weight_mass = float(
+            np.sum(effective, where=canonicalized_mask, dtype=np.float64)
+        )
+        effective[canonicalized_mask] = 0.0
+    else:
+        canonicalized_weight_mass = 0.0
+
+    effective_positive_cell_count = int(np.count_nonzero(effective > 0.0))
+    effective_weight_sum = float(np.sum(effective, dtype=np.float64))
+    if raw_positive_cell_count and effective_positive_cell_count == 0:
+        raise DegenerateWeightsError("sample-weight canonicalization removed all positive mass")
+    return effective, WeightCanonicalization(
+        rule=SAMPLE_WEIGHT_CANONICALIZATION_RULE,
+        relative_precision=SAMPLE_WEIGHT_RELATIVE_PRECISION,
+        absolute_threshold=absolute_threshold,
+        raw_positive_cell_count=raw_positive_cell_count,
+        effective_positive_cell_count=effective_positive_cell_count,
+        canonicalized_cell_count=canonicalized_cell_count,
+        raw_weight_sum=raw_weight_sum,
+        effective_weight_sum=effective_weight_sum,
+        canonicalized_weight_mass=canonicalized_weight_mass,
+    )
 
 
 def _validate_mode(mode: str) -> WeightMode:
@@ -444,6 +555,7 @@ def compute_weights(
         raise AssertionError(
             "anchored and group-distance target-cell weights must remain exactly one"
         )
+    effective, canonicalization = canonicalize_sample_weights(final)
 
     return WeightResult(
         context=context,
@@ -453,8 +565,9 @@ def compute_weights(
         # full set of per-cell vectors at the return boundary.
         base_weight=np.asarray(base, dtype=np.float64),
         group_size_factor=np.asarray(factors, dtype=np.float64),
-        final_weight=np.asarray(final, dtype=np.float64),
+        final_weight=effective,
         mode=validated_mode,
+        canonicalization=canonicalization,
         normalization_factor=float(normalization_factor),
     )
 
@@ -520,8 +633,12 @@ __all__ = [
     "DegenerateWeightsError",
     "GroupSizeCorrection",
     "WeightMode",
+    "WeightCanonicalization",
     "WeightResult",
     "WeightingContext",
+    "SAMPLE_WEIGHT_CANONICALIZATION_RULE",
+    "SAMPLE_WEIGHT_RELATIVE_PRECISION",
+    "canonicalize_sample_weights",
     "compute_weights",
     "iter_group_affinity_records",
     "prepare_weighting_context",

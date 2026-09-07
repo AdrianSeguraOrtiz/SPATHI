@@ -32,7 +32,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kernels, reproducible global bandwidth selection, and a positive relative scale for
   the automatically selected bandwidth while explicit numeric bandwidths remain final.
 - Cell-distance, group-anchored cell-distance, and group-distance weighting modes,
-  with optional group-size correction and complete per-cell and per-group diagnostics.
+  with optional group-size correction, a fixed scale-invariant binary64 boundary for
+  numerically ineffective sample weights, and complete per-cell and per-group
+  diagnostics.
 - Weighted Extra-Trees and Random-Forest inference with deterministic task seeds,
   strict target subsets, constant-predictor filtering, and positive unsigned edge
   scores.

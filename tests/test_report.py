@@ -16,7 +16,11 @@ import spathi._report as report_module
 from spathi._report import InteractiveReportBuilder, prepare_report_embedding
 from spathi.diagnostics import compute_weight_diagnostics
 from spathi.representation import RepresentationResult
-from spathi.weighting import WeightResult, prepare_weighting_context
+from spathi.weighting import (
+    WeightResult,
+    canonicalize_sample_weights,
+    prepare_weighting_context,
+)
 
 CELLS = ("c1", "c2", "c3", "c4")
 GROUPS = ("A", "A", "B", "B")
@@ -87,7 +91,7 @@ def weights_for(target: str) -> WeightResult:
         distance = np.array([3.5, 2.5, 0.5, 0.5])
         base = np.array([0.3, 0.2, 1.0, 1.0])
         factor = np.array([0.7, 0.7, 1.0, 1.0])
-    final = base * factor
+    final, canonicalization = canonicalize_sample_weights(base * factor)
     return WeightResult(
         context=CONTEXT,
         target_group=target,
@@ -96,6 +100,7 @@ def weights_for(target: str) -> WeightResult:
         group_size_factor=factor,
         final_weight=final,
         mode="cell-distance-group-anchored",
+        canonicalization=canonicalization,
     )
 
 
@@ -381,14 +386,16 @@ def test_untrusted_identifiers_cannot_close_the_embedded_data_script(
     builder = InteractiveReportBuilder(embedding)
     for target in embedding.group_ids:
         values = np.ones(4, dtype=np.float64)
+        final, canonicalization = canonicalize_sample_weights(values)
         weights = WeightResult(
             context=context,
             target_group=target,
             distance=np.zeros(4),
             base_weight=values,
             group_size_factor=values,
-            final_weight=values,
+            final_weight=final,
             mode="group-distance",
+            canonicalization=canonicalization,
         )
         builder.add_target(weights, compute_weight_diagnostics(weights, emit_warnings=False))
 
@@ -425,14 +432,16 @@ def test_builder_validates_group_sizes_and_weight_alignment() -> None:
     builder = InteractiveReportBuilder(embedding_for())
     inconsistent_context = prepare_weighting_context(("B", "A", "B", "A"), cell_ids=CELLS)
     base = weights_for("A")
+    final, canonicalization = canonicalize_sample_weights(base.final_weight)
     inconsistent = WeightResult(
         context=inconsistent_context,
         target_group="A",
         distance=base.distance,
         base_weight=base.base_weight,
         group_size_factor=base.group_size_factor,
-        final_weight=base.final_weight,
+        final_weight=final,
         mode=base.mode,
+        canonicalization=canonicalization,
     )
     with pytest.raises(ValueError, match="cell-group assignments"):
         builder.add_target(

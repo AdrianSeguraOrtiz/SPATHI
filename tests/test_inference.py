@@ -150,6 +150,35 @@ def test_estimator_receives_exact_sample_weight(monkeypatch: pytest.MonkeyPatch)
         np.testing.assert_array_equal(supplied, weights)
 
 
+def test_tree_fitting_canonicalizes_machine_precision_weight_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard the ExtraTrees impurity failure reproduced by Gaussian tail weights."""
+
+    rng = np.random.default_rng(0)
+    regulator = rng.normal(size=10)
+    target = rng.normal(size=10)
+    weights = np.concatenate((np.ones(5), np.full(5, 1.0e-16)))
+    monkeypatch.setattr(inference_module, "stable_task_seed", lambda *_: 42)
+
+    result = run_inference(
+        np.column_stack((regulator, target)),
+        ["TF", "G"],
+        ["TF"],
+        {"A": weights},
+        target_names=["G"],
+        n_estimators=100,
+        threads=1,
+    )
+
+    assert len(result.model_stats) == 1
+    stat = result.model_stats[0]
+    assert stat.status == "trained"
+    assert stat.n_positive_weight_samples == 5
+    assert stat.weight_sum == 5.0
+    assert all(np.isfinite(edge.score) for edge in result.edges)
+
+
 def test_targets_retain_float64_variation_while_predictors_use_float32(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -12,7 +12,12 @@ from spathi.kernels import (
     resolve_bandwidth,
     resolve_bandwidth_for_mode,
 )
-from spathi.weighting import compute_weights, prepare_weighting_context
+from spathi.weighting import (
+    SAMPLE_WEIGHT_CANONICALIZATION_RULE,
+    canonicalize_sample_weights,
+    compute_weights,
+    prepare_weighting_context,
+)
 
 
 def test_gaussian_and_exponential_kernels_match_equations() -> None:
@@ -233,6 +238,36 @@ def test_cell_distance_pins_every_maximum_tie_to_exactly_one() -> None:
         cell_distances=np.array([0.25, 0.25]),
     )
     np.testing.assert_array_equal(result.final_weight, [1.0, 1.0])
+
+
+def test_numerically_ineffective_weights_are_canonicalized_before_fitting() -> None:
+    epsilon = np.finfo(np.float64).eps
+    values = np.array([1.0, 4.0 * epsilon, epsilon, epsilon / 2.0, 0.0])
+
+    effective, audit = canonicalize_sample_weights(values)
+
+    np.testing.assert_array_equal(
+        effective,
+        np.array([1.0, 4.0 * epsilon, 0.0, 0.0, 0.0]),
+    )
+    assert audit.rule == SAMPLE_WEIGHT_CANONICALIZATION_RULE
+    assert audit.raw_positive_cell_count == 4
+    assert audit.effective_positive_cell_count == 2
+    assert audit.canonicalized_cell_count == 2
+    assert audit.canonicalized_weight_mass == 1.5 * epsilon
+    assert audit.absolute_threshold == pytest.approx(epsilon)
+
+
+def test_sample_weight_canonicalization_is_invariant_to_common_scale() -> None:
+    epsilon = np.finfo(np.float64).eps
+    values = np.array([1.0, 8.0 * epsilon, epsilon / 4.0, 0.0])
+    effective, audit = canonicalize_sample_weights(values)
+    scaled, scaled_audit = canonicalize_sample_weights(values * 1.0e100)
+
+    np.testing.assert_allclose(scaled, effective * 1.0e100, rtol=0.0, atol=0.0)
+    assert scaled_audit.canonicalized_cell_count == audit.canonicalized_cell_count
+    assert scaled_audit.effective_positive_cell_count == audit.effective_positive_cell_count
+    assert scaled_audit.absolute_threshold == pytest.approx(audit.absolute_threshold * 1.0e100)
 
 
 def test_group_anchored_mode_anchors_target_and_keeps_external_cells_individual() -> None:
