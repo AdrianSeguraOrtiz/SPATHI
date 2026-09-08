@@ -307,6 +307,26 @@ class InferenceResult:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InferencePrefixResult:
+    """One exact estimator-count prefix from a shared maximum forest.
+
+    Prefixes are fitted by extending the same deterministic scikit-learn
+    ensemble.  ``inference`` therefore contains exactly the network that an
+    independent fixed-budget SPATHI fit would produce at ``n_estimators``, while
+    avoiding regeneration of trees already present in smaller prefixes.
+    """
+
+    n_estimators: int
+    inference: InferenceResult
+
+    def __post_init__(self) -> None:
+        if isinstance(self.n_estimators, bool) or not isinstance(self.n_estimators, Integral):
+            raise TypeError("n_estimators must be a positive integer")
+        if self.n_estimators < 1:
+            raise ValueError("n_estimators must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InferenceBatchSummary:
     """Lightweight accounting for a streamed model batch.
 
@@ -481,6 +501,32 @@ class _TreeFitFailure(RuntimeError):
         self.convergence_checks = convergence_checks
 
 
+def _normalise_estimator_prefixes(
+    estimator_counts: Sequence[int],
+    *,
+    maximum: int,
+) -> tuple[int, ...]:
+    """Validate an ordered sequence of exact forest-prefix sizes."""
+
+    if isinstance(estimator_counts, (str, bytes)):
+        raise TypeError("estimator_counts must be a sequence of positive integers")
+    counts = tuple(estimator_counts)
+    if not counts:
+        raise ValueError("estimator_counts cannot be empty")
+    if any(isinstance(count, bool) or not isinstance(count, Integral) for count in counts):
+        raise TypeError("estimator_counts must contain only positive integers")
+    normalised = tuple(int(count) for count in counts)
+    if any(count < 1 for count in normalised):
+        raise ValueError("estimator_counts must contain only positive integers")
+    if any(left >= right for left, right in zip(normalised, normalised[1:], strict=False)):
+        raise ValueError("estimator_counts must be strictly increasing")
+    if normalised[-1] != maximum:
+        raise ValueError(
+            f"the final estimator count must equal PreparedInference.n_estimators ({maximum})"
+        )
+    return normalised
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PreparedInference:
     """Reusable, validated tree-inference state.
@@ -594,6 +640,55 @@ class PreparedInference:
                 completed_models=batch.completed_models,
                 executor=executor,
                 on_model_complete=on_model_complete,
+            )
+
+    def iter_group_target_prefix_batches(
+        self,
+        group_weights: Mapping[object, ArrayLike],
+        *,
+        estimator_counts: Sequence[int],
+        target_batch_size: int,
+        group_order: Sequence[object] | None = None,
+        threads: ThreadBudget = "auto",
+        executor: PersistentTaskExecutor | None = None,
+    ) -> Iterator[tuple[InferencePrefixResult, ...]]:
+        """Yield exact fixed-forest prefix networks with shared tree fitting.
+
+        Every yielded tuple corresponds to one bounded group/target batch and is
+        ordered like ``estimator_counts``.  The final count must equal this
+        prepared inference's ``n_estimators``. Each smaller network is the exact
+        deterministic prefix of that maximum forest; no independently fitted
+        trees are discarded or regenerated.
+
+        This numerical core facility is intended for convergence studies. It is
+        deliberately unavailable for adaptive forests, checkpoint resumption,
+        and per-model callbacks because those operations have different stopping
+        or durability semantics. The ordinary inference CLI remains unchanged.
+        ``InferenceResult.duration_seconds`` is the shared wall time for the
+        complete prefix batch, not an independently measured runtime per prefix;
+        cumulative model fit time remains available in each ``ModelStat``.
+        """
+
+        if self.adaptive_trees:
+            raise ValueError("forest prefixes require adaptive_trees=False")
+        counts = _normalise_estimator_prefixes(
+            estimator_counts,
+            maximum=self.n_estimators,
+        )
+        for batch in self._iter_batch_specs(
+            group_weights,
+            target_batch_size=target_batch_size,
+            group_order=group_order,
+            completed_models=(),
+            threads=threads,
+            executor=executor,
+        ):
+            yield self._infer_prepared_group_prefixes(
+                batch.groups,
+                estimator_counts=counts,
+                threads=threads,
+                target_items=batch.targets,
+                executor=executor,
             )
 
     def stream_group_target_batches(
@@ -830,11 +925,57 @@ class PreparedInference:
             prepared_groups=prepared_groups,
             plan=execution.plan,
             tree_method=self.tree_method,
-            started=started,
+            duration_seconds=perf_counter() - started,
             expression_dtype=self.expression_dtype,
             expression_nbytes=self.expression_nbytes,
             predictor_nbytes=self.predictor_nbytes,
         )
+
+    def _infer_prepared_group_prefixes(
+        self,
+        prepared_groups: tuple[_PreparedGroup, ...],
+        *,
+        estimator_counts: tuple[int, ...],
+        threads: ThreadBudget,
+        target_items: Sequence[tuple[int, str]],
+        executor: PersistentTaskExecutor | None,
+    ) -> tuple[InferencePrefixResult, ...]:
+        started = perf_counter()
+        execution = self._prepare_model_execution(
+            prepared_groups,
+            target_items=target_items,
+            completed_models=(),
+            threads=threads,
+            executor=executor,
+        )
+
+        def fit_task(task: _ModelTask) -> tuple[ModelResult, ...]:
+            return _fit_model_prefix_task(task, execution.context, estimator_counts)
+
+        if executor is None:
+            task_prefix_results = execute_tasks(fit_task, execution.tasks, execution.plan)
+        else:
+            task_prefix_results = executor.execute(fit_task, execution.tasks)
+        shared_duration = perf_counter() - started
+        prefix_results: list[InferencePrefixResult] = []
+        for prefix_index, estimator_count in enumerate(estimator_counts):
+            task_results = [results[prefix_index] for results in task_prefix_results]
+            prefix_results.append(
+                InferencePrefixResult(
+                    n_estimators=estimator_count,
+                    inference=_assemble_result(
+                        task_results,
+                        prepared_groups=prepared_groups,
+                        plan=execution.plan,
+                        tree_method=self.tree_method,
+                        duration_seconds=shared_duration,
+                        expression_dtype=self.expression_dtype,
+                        expression_nbytes=self.expression_nbytes,
+                        predictor_nbytes=self.predictor_nbytes,
+                    ),
+                )
+            )
+        return tuple(prefix_results)
 
     def _stream_prepared_groups(
         self,
@@ -951,21 +1092,18 @@ def _extract_feature_importances(
     return importances / np.sum(importances, dtype=np.float64)
 
 
-def _fit_tree_model(
+def _fit_fixed_tree_prefixes(
     x_model: NDArray[np.float32],
     y: NDArray[np.float64],
     weights: NDArray[np.float64],
     *,
     context: _FitContext,
     seed: int,
-) -> _TreeFitOutcome:
-    """Fit a fixed or deterministic adaptive ensemble for one target model."""
+    estimator_counts: tuple[int, ...],
+) -> tuple[_TreeFitOutcome, ...]:
+    """Fit exact deterministic prefixes of one fixed-budget ensemble."""
 
-    first_tree_count = (
-        min(context.adaptive_tree_step, context.n_estimators)
-        if context.adaptive_trees
-        else context.n_estimators
-    )
+    first_tree_count = estimator_counts[0]
     estimator = create_tree_estimator(
         context.tree_method,
         n_estimators=first_tree_count,
@@ -975,17 +1113,71 @@ def _fit_tree_model(
         bootstrap=context.bootstrap,
         random_state=seed,
         n_jobs=context.model_n_jobs,
-        warm_start=context.adaptive_trees,
+        warm_start=True,
+    )
+    fit_seconds = 0.0
+    outcomes: list[_TreeFitOutcome] = []
+    for estimator_count in estimator_counts:
+        if estimator_count != first_tree_count:
+            estimator.set_params(n_estimators=estimator_count)
+        started = perf_counter()
+        try:
+            estimator.fit(x_model, y, sample_weight=weights)
+        except (ValueError, FloatingPointError) as exc:
+            fit_seconds += perf_counter() - started
+            fitted_trees = len(getattr(estimator, "estimators_", ()))
+            raise _TreeFitFailure(
+                exc,
+                fit_seconds=fit_seconds,
+                n_estimators_fitted=fitted_trees,
+                convergence_delta=None,
+                convergence_checks=0,
+            ) from exc
+        fit_seconds += perf_counter() - started
+        outcomes.append(
+            _TreeFitOutcome(
+                importances=_extract_feature_importances(estimator),
+                fit_seconds=fit_seconds,
+                n_estimators_fitted=estimator_count,
+                adaptive_converged=False,
+                convergence_delta=None,
+                convergence_checks=0,
+            )
+        )
+        first_tree_count = estimator_count
+    return tuple(outcomes)
+
+
+def _fit_adaptive_tree_model(
+    x_model: NDArray[np.float32],
+    y: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    *,
+    context: _FitContext,
+    seed: int,
+) -> _TreeFitOutcome:
+    """Fit one deterministic adaptive ensemble for one target model."""
+
+    first_tree_count = min(context.adaptive_tree_step, context.n_estimators)
+    estimator = create_tree_estimator(
+        context.tree_method,
+        n_estimators=first_tree_count,
+        max_features=context.max_features,
+        min_samples_leaf=context.min_samples_leaf,
+        max_depth=context.max_depth,
+        bootstrap=context.bootstrap,
+        random_state=seed,
+        n_jobs=context.model_n_jobs,
+        warm_start=True,
     )
     fitted = 0
     fit_seconds = 0.0
     checks = 0
     history: list[NDArray[np.float64]] = []
     convergence_delta: float | None = None
-    tree_importance_buffer = (
-        np.empty((context.n_estimators, x_model.shape[1]), dtype=np.float64)
-        if context.adaptive_trees
-        else None
+    tree_importance_buffer = np.empty(
+        (context.n_estimators, x_model.shape[1]),
+        dtype=np.float64,
     )
     processed_trees = 0
     informative_trees = 0
@@ -1006,26 +1198,23 @@ def _fit_tree_model(
             ) from exc
         fit_seconds += perf_counter() - started
         fitted = int(getattr(estimator, "n_estimators", first_tree_count))
-        if tree_importance_buffer is None:
-            importances = _extract_feature_importances(estimator)
+        trees = estimator.estimators_
+        for tree in trees[processed_trees:]:
+            if tree.tree_.node_count > 1:
+                tree_importance_buffer[informative_trees, :] = tree.feature_importances_
+                informative_trees += 1
+        processed_trees = len(trees)
+        if informative_trees == 0:
+            importances = np.zeros(x_model.shape[1], dtype=np.float64)
         else:
-            trees = estimator.estimators_
-            for tree in trees[processed_trees:]:
-                if tree.tree_.node_count > 1:
-                    tree_importance_buffer[informative_trees, :] = tree.feature_importances_
-                    informative_trees += 1
-            processed_trees = len(trees)
-            if informative_trees == 0:
-                importances = np.zeros(x_model.shape[1], dtype=np.float64)
-            else:
-                importances = np.mean(
-                    tree_importance_buffer[:informative_trees, :],
-                    axis=0,
-                    dtype=np.float64,
-                )
-                importances /= np.sum(importances, dtype=np.float64)
+            importances = np.mean(
+                tree_importance_buffer[:informative_trees, :],
+                axis=0,
+                dtype=np.float64,
+            )
+            importances /= np.sum(importances, dtype=np.float64)
 
-        if context.adaptive_trees and history and fitted >= context.adaptive_min_estimators:
+        if history and fitted >= context.adaptive_min_estimators:
             comparison_window = history[-context.adaptive_patience :]
             deltas = tuple(
                 float(0.5 * np.sum(np.abs(importances - earlier), dtype=np.float64))
@@ -1066,6 +1255,28 @@ def _fit_tree_model(
         estimator.set_params(
             n_estimators=min(context.n_estimators, fitted + context.adaptive_tree_step)
         )
+
+
+def _fit_tree_model(
+    x_model: NDArray[np.float32],
+    y: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    *,
+    context: _FitContext,
+    seed: int,
+) -> _TreeFitOutcome:
+    """Fit the configured fixed or deterministic adaptive target model."""
+
+    if context.adaptive_trees:
+        return _fit_adaptive_tree_model(x_model, y, weights, context=context, seed=seed)
+    return _fit_fixed_tree_prefixes(
+        x_model,
+        y,
+        weights,
+        context=context,
+        seed=seed,
+        estimator_counts=(context.n_estimators,),
+    )[0]
 
 
 def _validate_hyperparameters(
@@ -1614,171 +1825,18 @@ def _skipped_result(
     return ModelResult(edges=(), skipped=skipped, stat=stat, trained=False)
 
 
-def _fit_model_task(task: _ModelTask, context: _FitContext) -> ModelResult:
-    seed = stable_task_seed(context.global_seed, task.group.name, task.target_name)
-    self_position = context.target_to_tf_position[task.target_index]
-    constant_set = task.group.constant_tf_positions
-    if self_position is None:
-        eligible_predictor_count = len(context.tf_names)
-        constant_predictors = task.group.constant_tf_names
-        selected_positions = task.group.variable_tf_positions
-        selected_names = task.group.variable_tf_names
-        discarded = task.group.constant_tf_names
-    else:
-        eligible_predictor_count = len(context.tf_names) - 1
-        constant_predictors = tuple(
-            context.tf_names[position]
-            for position in sorted(constant_set)
-            if position != self_position
-        )
-        selected_positions = tuple(
-            position for position in task.group.variable_tf_positions if position != self_position
-        )
-        selected_names = tuple(context.tf_names[position] for position in selected_positions)
-        discarded_positions = constant_set.union((self_position,))
-        discarded = tuple(
-            context.tf_names[position]
-            for position in range(len(context.tf_names))
-            if position in discarded_positions
-        )
-
-    y = context.expression[:, task.target_index]
-    eligibility = task.target_eligibility
-    if context.target_eligibility_mode == "automatic" and not eligibility.eligible:
-        return _skipped_result(
-            task,
-            context,
-            reason="target_not_estimable",
-            # Keep checkpoint strings from growing with one numeric message per
-            # model. The exact counts and fractions are already first-class
-            # fields in model_diagnostics.tsv.gz and target_eligibility.tsv.gz.
-            detail=f"automatic target eligibility rejected the target: {eligibility.reason}",
-            seed=seed,
-            n_predictors_used=len(selected_positions),
-            discarded=discarded,
-            constant_predictors=constant_predictors,
-        )
-
-    n_positive = task.group.n_positive_weight_samples
-    if n_positive < 2:
-        return _skipped_result(
-            task,
-            context,
-            reason="insufficient_positive_weight_samples",
-            detail="fewer than two cells have positive sample weight",
-            seed=seed,
-            n_predictors_used=len(selected_positions),
-            discarded=discarded,
-            constant_predictors=constant_predictors,
-        )
-
-    target_weighted_detected_fraction = task.target_weighted_detected_fraction
-    target_weighted_detected_ess = task.target_weighted_detected_ess
-    if context.target_eligibility_mode == "automatic":
-        if target_weighted_detected_fraction is None or target_weighted_detected_ess is None:
-            raise RuntimeError(
-                "eligible target model is missing its precomputed detection statistics"
-            )
-        if (
-            target_weighted_detected_fraction < context.min_target_weighted_detected_fraction
-            or target_weighted_detected_ess < context.min_target_weighted_detected_ess
-        ):
-            return _skipped_result(
-                task,
-                context,
-                reason="target_not_estimable",
-                # The measured fraction/ESS and the configured thresholds are
-                # structured diagnostics. Repeating them in free text would
-                # create an effectively model-sized checkpoint symbol table.
-                detail="automatic target eligibility rejected the group-specific model",
-                seed=seed,
-                n_predictors_used=len(selected_positions),
-                discarded=discarded,
-                constant_predictors=constant_predictors,
-            )
-    positive_minimum = np.min(y, where=task.group.positive_mask, initial=np.inf)
-    positive_maximum = np.max(y, where=task.group.positive_mask, initial=-np.inf)
-    if positive_minimum == positive_maximum:
-        return _skipped_result(
-            task,
-            context,
-            reason="constant_target",
-            detail="target expression is constant among positive-weight cells",
-            seed=seed,
-            n_predictors_used=len(selected_positions),
-            discarded=discarded,
-            constant_predictors=constant_predictors,
-        )
-
-    if eligible_predictor_count == 0:
-        return _skipped_result(
-            task,
-            context,
-            reason="no_predictors_after_self_exclusion",
-            detail="the target is the only candidate transcription factor",
-            seed=seed,
-            n_predictors_used=0,
-            discarded=discarded,
-            constant_predictors=(),
-        )
-
-    if not selected_positions:
-        return _skipped_result(
-            task,
-            context,
-            reason="no_variable_predictors",
-            detail="all eligible predictors are constant among positive-weight cells",
-            seed=seed,
-            n_predictors_used=0,
-            discarded=discarded,
-            constant_predictors=constant_predictors,
-        )
-
-    if self_position is None or self_position in constant_set:
-        x_model = task.group.variable_tf_expression
-    else:
-        # Only variable TF targets need one per-task copy for self-exclusion.
-        # Fill a single C-contiguous allocation directly so no intermediate
-        # advanced-indexing array is created.
-        source = task.group.variable_tf_expression
-        self_variable_position = task.group.variable_tf_local_positions[self_position]
-        if self_variable_position is None:  # pragma: no cover - guarded by constant_set
-            raise RuntimeError("variable TF target is absent from the variable-position map")
-        x_model = np.empty(
-            (source.shape[0], len(selected_positions)),
-            dtype=np.float32,
-            order="C",
-        )
-        x_model[:, :self_variable_position] = source[:, :self_variable_position]
-        x_model[:, self_variable_position:] = source[:, self_variable_position + 1 :]
-
-    try:
-        fit_outcome = _fit_tree_model(
-            x_model,
-            y,
-            task.group.weights,
-            context=context,
-            seed=seed,
-        )
-        fit_seconds = fit_outcome.fit_seconds
-        importances = fit_outcome.importances
-    except _TreeFitFailure as failure:
-        detail = f"{type(failure.error).__name__}: {failure.error}"
-        return _skipped_result(
-            task,
-            context,
-            reason="model_fit_failed",
-            detail=detail,
-            seed=seed,
-            n_predictors_used=len(selected_positions),
-            discarded=discarded,
-            constant_predictors=constant_predictors,
-            fit_seconds=failure.fit_seconds,
-            n_estimators_fitted=failure.n_estimators_fitted,
-            convergence_delta=failure.convergence_delta,
-            convergence_checks=failure.convergence_checks,
-        )
-
+def _result_from_fit_outcome(
+    task: _ModelTask,
+    context: _FitContext,
+    *,
+    outcome: _TreeFitOutcome,
+    seed: int,
+    selected_names: tuple[str, ...],
+    selected_positions: tuple[int, ...],
+    discarded: tuple[str, ...],
+    constant_predictors: tuple[str, ...],
+) -> ModelResult:
+    importances = outcome.importances
     if importances.shape != (len(selected_names),) or not np.isfinite(importances).all():
         detail = (
             "estimator returned invalid feature_importances_: "
@@ -1793,11 +1851,11 @@ def _fit_model_task(task: _ModelTask, context: _FitContext) -> ModelResult:
             n_predictors_used=len(selected_positions),
             discarded=discarded,
             constant_predictors=constant_predictors,
-            fit_seconds=fit_seconds,
-            n_estimators_fitted=fit_outcome.n_estimators_fitted,
-            adaptive_converged=fit_outcome.adaptive_converged,
-            convergence_delta=fit_outcome.convergence_delta,
-            convergence_checks=fit_outcome.convergence_checks,
+            fit_seconds=outcome.fit_seconds,
+            n_estimators_fitted=outcome.n_estimators_fitted,
+            adaptive_converged=outcome.adaptive_converged,
+            convergence_delta=outcome.convergence_delta,
+            convergence_checks=outcome.convergence_checks,
         )
     if np.any(importances < 0.0):
         return _skipped_result(
@@ -1809,11 +1867,11 @@ def _fit_model_task(task: _ModelTask, context: _FitContext) -> ModelResult:
             n_predictors_used=len(selected_positions),
             discarded=discarded,
             constant_predictors=constant_predictors,
-            fit_seconds=fit_seconds,
-            n_estimators_fitted=fit_outcome.n_estimators_fitted,
-            adaptive_converged=fit_outcome.adaptive_converged,
-            convergence_delta=fit_outcome.convergence_delta,
-            convergence_checks=fit_outcome.convergence_checks,
+            fit_seconds=outcome.fit_seconds,
+            n_estimators_fitted=outcome.n_estimators_fitted,
+            adaptive_converged=outcome.adaptive_converged,
+            convergence_delta=outcome.convergence_delta,
+            convergence_checks=outcome.convergence_checks,
         )
 
     evidence = (
@@ -1852,11 +1910,11 @@ def _fit_model_task(task: _ModelTask, context: _FitContext) -> ModelResult:
             constant_predictors=constant_predictors,
             n_edges=0,
             importance_sum=importance_sum,
-            fit_seconds=fit_seconds,
-            n_estimators_fitted=fit_outcome.n_estimators_fitted,
-            adaptive_converged=fit_outcome.adaptive_converged,
-            convergence_delta=fit_outcome.convergence_delta,
-            convergence_checks=fit_outcome.convergence_checks,
+            fit_seconds=outcome.fit_seconds,
+            n_estimators_fitted=outcome.n_estimators_fitted,
+            adaptive_converged=outcome.adaptive_converged,
+            convergence_delta=outcome.convergence_delta,
+            convergence_checks=outcome.convergence_checks,
             message=skipped.detail,
         )
         return ModelResult(edges=(), skipped=skipped, stat=stat, trained=True)
@@ -1871,13 +1929,231 @@ def _fit_model_task(task: _ModelTask, context: _FitContext) -> ModelResult:
         constant_predictors=constant_predictors,
         n_edges=len(edges),
         importance_sum=importance_sum,
-        fit_seconds=fit_seconds,
-        n_estimators_fitted=fit_outcome.n_estimators_fitted,
-        adaptive_converged=fit_outcome.adaptive_converged,
-        convergence_delta=fit_outcome.convergence_delta,
-        convergence_checks=fit_outcome.convergence_checks,
+        fit_seconds=outcome.fit_seconds,
+        n_estimators_fitted=outcome.n_estimators_fitted,
+        adaptive_converged=outcome.adaptive_converged,
+        convergence_delta=outcome.convergence_delta,
+        convergence_checks=outcome.convergence_checks,
     )
     return ModelResult(edges=edges, skipped=None, stat=stat, trained=True)
+
+
+def _fit_model_prefix_task(
+    task: _ModelTask,
+    context: _FitContext,
+    estimator_counts: tuple[int, ...],
+) -> tuple[ModelResult, ...]:
+    def repeat(result: ModelResult) -> tuple[ModelResult, ...]:
+        return (result,) * len(estimator_counts)
+
+    seed = stable_task_seed(context.global_seed, task.group.name, task.target_name)
+    self_position = context.target_to_tf_position[task.target_index]
+    constant_set = task.group.constant_tf_positions
+    if self_position is None:
+        eligible_predictor_count = len(context.tf_names)
+        constant_predictors = task.group.constant_tf_names
+        selected_positions = task.group.variable_tf_positions
+        selected_names = task.group.variable_tf_names
+        discarded = task.group.constant_tf_names
+    else:
+        eligible_predictor_count = len(context.tf_names) - 1
+        constant_predictors = tuple(
+            context.tf_names[position]
+            for position in sorted(constant_set)
+            if position != self_position
+        )
+        selected_positions = tuple(
+            position for position in task.group.variable_tf_positions if position != self_position
+        )
+        selected_names = tuple(context.tf_names[position] for position in selected_positions)
+        discarded_positions = constant_set.union((self_position,))
+        discarded = tuple(
+            context.tf_names[position]
+            for position in range(len(context.tf_names))
+            if position in discarded_positions
+        )
+
+    y = context.expression[:, task.target_index]
+    eligibility = task.target_eligibility
+    if context.target_eligibility_mode == "automatic" and not eligibility.eligible:
+        return repeat(
+            _skipped_result(
+                task,
+                context,
+                reason="target_not_estimable",
+                # Keep checkpoint strings from growing with one numeric message per
+                # model. The exact counts and fractions are already first-class
+                # fields in model_diagnostics.tsv.gz and target_eligibility.tsv.gz.
+                detail=f"automatic target eligibility rejected the target: {eligibility.reason}",
+                seed=seed,
+                n_predictors_used=len(selected_positions),
+                discarded=discarded,
+                constant_predictors=constant_predictors,
+            )
+        )
+
+    n_positive = task.group.n_positive_weight_samples
+    if n_positive < 2:
+        return repeat(
+            _skipped_result(
+                task,
+                context,
+                reason="insufficient_positive_weight_samples",
+                detail="fewer than two cells have positive sample weight",
+                seed=seed,
+                n_predictors_used=len(selected_positions),
+                discarded=discarded,
+                constant_predictors=constant_predictors,
+            )
+        )
+
+    target_weighted_detected_fraction = task.target_weighted_detected_fraction
+    target_weighted_detected_ess = task.target_weighted_detected_ess
+    if context.target_eligibility_mode == "automatic":
+        if target_weighted_detected_fraction is None or target_weighted_detected_ess is None:
+            raise RuntimeError(
+                "eligible target model is missing its precomputed detection statistics"
+            )
+        if (
+            target_weighted_detected_fraction < context.min_target_weighted_detected_fraction
+            or target_weighted_detected_ess < context.min_target_weighted_detected_ess
+        ):
+            return repeat(
+                _skipped_result(
+                    task,
+                    context,
+                    reason="target_not_estimable",
+                    # The measured fraction/ESS and the configured thresholds are
+                    # structured diagnostics. Repeating them in free text would
+                    # create an effectively model-sized checkpoint symbol table.
+                    detail="automatic target eligibility rejected the group-specific model",
+                    seed=seed,
+                    n_predictors_used=len(selected_positions),
+                    discarded=discarded,
+                    constant_predictors=constant_predictors,
+                )
+            )
+    positive_minimum = np.min(y, where=task.group.positive_mask, initial=np.inf)
+    positive_maximum = np.max(y, where=task.group.positive_mask, initial=-np.inf)
+    if positive_minimum == positive_maximum:
+        return repeat(
+            _skipped_result(
+                task,
+                context,
+                reason="constant_target",
+                detail="target expression is constant among positive-weight cells",
+                seed=seed,
+                n_predictors_used=len(selected_positions),
+                discarded=discarded,
+                constant_predictors=constant_predictors,
+            )
+        )
+
+    if eligible_predictor_count == 0:
+        return repeat(
+            _skipped_result(
+                task,
+                context,
+                reason="no_predictors_after_self_exclusion",
+                detail="the target is the only candidate transcription factor",
+                seed=seed,
+                n_predictors_used=0,
+                discarded=discarded,
+                constant_predictors=(),
+            )
+        )
+
+    if not selected_positions:
+        return repeat(
+            _skipped_result(
+                task,
+                context,
+                reason="no_variable_predictors",
+                detail="all eligible predictors are constant among positive-weight cells",
+                seed=seed,
+                n_predictors_used=0,
+                discarded=discarded,
+                constant_predictors=constant_predictors,
+            )
+        )
+
+    if self_position is None or self_position in constant_set:
+        x_model = task.group.variable_tf_expression
+    else:
+        # Only variable TF targets need one per-task copy for self-exclusion.
+        # Fill a single C-contiguous allocation directly so no intermediate
+        # advanced-indexing array is created.
+        source = task.group.variable_tf_expression
+        self_variable_position = task.group.variable_tf_local_positions[self_position]
+        if self_variable_position is None:  # pragma: no cover - guarded by constant_set
+            raise RuntimeError("variable TF target is absent from the variable-position map")
+        x_model = np.empty(
+            (source.shape[0], len(selected_positions)),
+            dtype=np.float32,
+            order="C",
+        )
+        x_model[:, :self_variable_position] = source[:, :self_variable_position]
+        x_model[:, self_variable_position:] = source[:, self_variable_position + 1 :]
+
+    try:
+        fit_outcomes: tuple[_TreeFitOutcome, ...]
+        if len(estimator_counts) == 1:
+            fit_outcomes = (
+                _fit_tree_model(
+                    x_model,
+                    y,
+                    task.group.weights,
+                    context=context,
+                    seed=seed,
+                ),
+            )
+        else:
+            fit_outcomes = _fit_fixed_tree_prefixes(
+                x_model,
+                y,
+                task.group.weights,
+                context=context,
+                seed=seed,
+                estimator_counts=estimator_counts,
+            )
+    except _TreeFitFailure as failure:
+        detail = f"{type(failure.error).__name__}: {failure.error}"
+        return repeat(
+            _skipped_result(
+                task,
+                context,
+                reason="model_fit_failed",
+                detail=detail,
+                seed=seed,
+                n_predictors_used=len(selected_positions),
+                discarded=discarded,
+                constant_predictors=constant_predictors,
+                fit_seconds=failure.fit_seconds,
+                n_estimators_fitted=failure.n_estimators_fitted,
+                convergence_delta=failure.convergence_delta,
+                convergence_checks=failure.convergence_checks,
+            )
+        )
+
+    return tuple(
+        _result_from_fit_outcome(
+            task,
+            context,
+            outcome=fit_outcome,
+            seed=seed,
+            selected_names=selected_names,
+            selected_positions=selected_positions,
+            discarded=discarded,
+            constant_predictors=constant_predictors,
+        )
+        for fit_outcome in fit_outcomes
+    )
+
+
+def _fit_model_task(task: _ModelTask, context: _FitContext) -> ModelResult:
+    """Fit one ordinary model through the same core used for forest prefixes."""
+
+    return _fit_model_prefix_task(task, context, (context.n_estimators,))[0]
 
 
 def _assemble_result(
@@ -1886,7 +2162,7 @@ def _assemble_result(
     prepared_groups: tuple[_PreparedGroup, ...],
     plan: ParallelPlan,
     tree_method: TreeMethod,
-    started: float,
+    duration_seconds: float,
     expression_dtype: str,
     expression_nbytes: int,
     predictor_nbytes: int,
@@ -1900,14 +2176,13 @@ def _assemble_result(
     skipped.sort(key=lambda record: (record.target_group, record.target, record.reason))
     stats.sort(key=lambda record: (record.target_group, record.target))
     trained_models = sum(result.trained for result in task_results)
-    duration = perf_counter() - started
     LOGGER.debug(
         "Completed %d/%d models (%d trained, %d skipped) in %.3f s",
         len(task_results),
         plan.total_tasks,
         trained_models,
         len(skipped),
-        duration,
+        duration_seconds,
     )
 
     return InferenceResult(
@@ -1920,7 +2195,7 @@ def _assemble_result(
         total_models=plan.total_tasks,
         completed_models=len(task_results),
         trained_models=trained_models,
-        duration_seconds=duration,
+        duration_seconds=duration_seconds,
         expression_dtype=expression_dtype,
         expression_nbytes=expression_nbytes,
         predictor_nbytes=predictor_nbytes,
@@ -2027,6 +2302,7 @@ __all__ = [
     "EdgeRecord",
     "FATAL_MODEL_STATUSES",
     "InferenceBatchSummary",
+    "InferencePrefixResult",
     "InferenceResult",
     "MODEL_STATUSES",
     "ModelResult",

@@ -313,6 +313,209 @@ def test_compact_feature_importance_buffer_is_bitwise_sklearn_equivalent() -> No
     np.testing.assert_array_equal(observed, expected)
 
 
+@pytest.mark.parametrize(
+    ("tree_method", "bootstrap"),
+    [("extra-trees", False), ("random-forest", True)],
+)
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_fixed_forest_prefix_importances_are_bitwise_independent_fit_equivalent(
+    tree_method: str,
+    bootstrap: bool,
+    n_jobs: int,
+) -> None:
+    rng = np.random.default_rng(109)
+    predictors = rng.normal(size=(97, 11)).astype(np.float32)
+    response = rng.normal(size=97)
+    weights = rng.uniform(0.05, 2.0, size=97)
+    weights[::13] = 0.0
+    counts = (5, 11, 17)
+    context = inference_module._FitContext(
+        expression=response[:, np.newaxis],
+        tf_names=tuple(f"TF{index}" for index in range(predictors.shape[1])),
+        target_to_tf_position=(None,),
+        tree_method=tree_method,
+        n_estimators=counts[-1],
+        adaptive_trees=False,
+        adaptive_min_estimators=2,
+        adaptive_tree_step=2,
+        adaptive_tolerance=0.01,
+        adaptive_patience=2,
+        target_eligibility_mode="all",
+        min_target_weighted_detected_fraction=0.01,
+        min_target_weighted_detected_ess=2.0,
+        max_features="sqrt",
+        min_samples_leaf=2,
+        max_depth=7,
+        bootstrap=bootstrap,
+        global_seed=23,
+        model_n_jobs=n_jobs,
+    )
+
+    prefixes = inference_module._fit_fixed_tree_prefixes(
+        predictors,
+        response,
+        weights,
+        context=context,
+        seed=31,
+        estimator_counts=counts,
+    )
+
+    assert tuple(outcome.n_estimators_fitted for outcome in prefixes) == counts
+    assert tuple(outcome.fit_seconds for outcome in prefixes) == tuple(
+        sorted(outcome.fit_seconds for outcome in prefixes)
+    )
+    for count, outcome in zip(counts, prefixes, strict=True):
+        independent = inference_module.create_tree_estimator(
+            tree_method,
+            n_estimators=count,
+            max_features="sqrt",
+            min_samples_leaf=2,
+            max_depth=7,
+            bootstrap=bootstrap,
+            random_state=31,
+            n_jobs=n_jobs,
+        )
+        independent.fit(predictors, response, sample_weight=weights)
+        expected = inference_module._extract_feature_importances(independent)
+        np.testing.assert_array_equal(outcome.importances, expected)
+
+
+def _result_without_runtime(result: InferenceResult) -> tuple[object, ...]:
+    stats: list[dict[str, Any]] = []
+    for stat in result.model_stats:
+        values = stat.to_dict()
+        values.pop("fit_seconds")
+        stats.append(values)
+    return (
+        result.edges,
+        result.skipped_targets,
+        tuple(stats),
+        result.group_order,
+        result.parallel_plan,
+        result.tree_method,
+        result.total_models,
+        result.completed_models,
+        result.trained_models,
+        result.expression_dtype,
+        result.expression_nbytes,
+        result.predictor_nbytes,
+    )
+
+
+@pytest.mark.parametrize("tree_method", ["extra-trees", "random-forest"])
+@pytest.mark.parametrize("threads", [1, 2])
+def test_prefix_networks_are_exactly_independent_fit_equivalent(
+    tree_method: str,
+    threads: int,
+) -> None:
+    expression, genes, tfs = inference_data()
+    weights = {
+        "A": np.linspace(0.1, 1.0, expression.shape[0]),
+        "B": np.linspace(1.0, 0.1, expression.shape[0]),
+    }
+    counts = (5, 11, 17)
+    common = {
+        "target_names": ["TF1", "TF2", "G"],
+        "tree_method": tree_method,
+        "max_features": 1.0,
+        "min_samples_leaf": 2,
+        "max_depth": 6,
+        "random_seed": 43,
+    }
+    prepared = prepare_inference(
+        expression,
+        genes,
+        tfs,
+        n_estimators=counts[-1],
+        **common,
+    )
+
+    batches = list(
+        prepared.iter_group_target_prefix_batches(
+            weights,
+            estimator_counts=counts,
+            target_batch_size=prepared.n_targets,
+            group_order=["B", "A"],
+            threads=threads,
+        )
+    )
+
+    assert len(batches) == 1
+    assert tuple(prefix.n_estimators for prefix in batches[0]) == counts
+    for prefix in batches[0]:
+        independent = run_inference(
+            expression,
+            genes,
+            tfs,
+            weights,
+            group_order=["B", "A"],
+            threads=threads,
+            n_estimators=prefix.n_estimators,
+            **common,
+        )
+        assert _result_without_runtime(prefix.inference) == _result_without_runtime(independent)
+        assert {
+            stat.n_estimators_fitted
+            for stat in prefix.inference.model_stats
+            if stat.status in inference_module.TRAINED_MODEL_STATUSES
+        } == {prefix.n_estimators}
+
+
+@pytest.mark.parametrize(
+    ("estimator_counts", "error", "message"),
+    [
+        ((), ValueError, "cannot be empty"),
+        ((0, 17), ValueError, "positive integers"),
+        ((5, 5, 17), ValueError, "strictly increasing"),
+        ((11, 5, 17), ValueError, "strictly increasing"),
+        ((5, 11), ValueError, "final estimator count"),
+        ((5, 11.0, 17), TypeError, "positive integers"),
+        ((True, 17), TypeError, "positive integers"),
+    ],
+)
+def test_prefix_networks_reject_ambiguous_estimator_schedules(
+    estimator_counts: tuple[object, ...],
+    error: type[Exception],
+    message: str,
+) -> None:
+    expression, genes, tfs = inference_data()
+    prepared = prepare_inference(expression, genes, tfs, n_estimators=17)
+
+    with pytest.raises(error, match=message):
+        list(
+            prepared.iter_group_target_prefix_batches(
+                {"A": np.ones(expression.shape[0])},
+                estimator_counts=estimator_counts,  # type: ignore[arg-type]
+                target_batch_size=prepared.n_targets,
+                threads=1,
+            )
+        )
+
+
+def test_prefix_networks_reject_adaptive_tree_semantics() -> None:
+    expression, genes, tfs = inference_data()
+    prepared = prepare_inference(
+        expression,
+        genes,
+        tfs,
+        n_estimators=17,
+        adaptive_trees=True,
+        adaptive_min_estimators=5,
+        adaptive_tree_step=3,
+        adaptive_patience=2,
+    )
+
+    with pytest.raises(ValueError, match="adaptive_trees=False"):
+        list(
+            prepared.iter_group_target_prefix_batches(
+                {"A": np.ones(expression.shape[0])},
+                estimator_counts=(5, 11, 17),
+                target_batch_size=prepared.n_targets,
+                threads=1,
+            )
+        )
+
+
 def test_adaptive_fit_failure_retains_elapsed_time_and_completed_tree_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
