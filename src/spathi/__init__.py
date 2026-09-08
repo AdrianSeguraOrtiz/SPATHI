@@ -14,6 +14,8 @@ from spathi._version import __version__
 if TYPE_CHECKING:
     from spathi.config import PrepareConfig as PrepareConfig
     from spathi.config import SpathiConfig as SpathiConfig
+    from spathi.convergence import PreparedForestPrefixes as PreparedForestPrefixes
+    from spathi.convergence import prepare_forest_prefixes as prepare_forest_prefixes
     from spathi.core import SpathiRunResult as SpathiRunResult
     from spathi.core import infer as infer
     from spathi.preparation import PreparationInputError as PreparationInputError
@@ -30,8 +32,10 @@ __all__ = [
     "SpathiProgressEvent",
     "SpathiRunResult",
     "ProgressCallback",
+    "PreparedForestPrefixes",
     "__version__",
     "infer",
+    "prepare_forest_prefixes",
     "prepare",
 ]
 
@@ -63,6 +67,12 @@ def __getattr__(name: str) -> Any:
         globals()["PreparationInputError"] = PreparationInputError
         globals()["PrepareResult"] = PrepareResult
         globals()["prepare"] = prepare
+        return globals()[name]
+    if name in {"PreparedForestPrefixes", "prepare_forest_prefixes"}:
+        from spathi.convergence import PreparedForestPrefixes, prepare_forest_prefixes
+
+        globals()["PreparedForestPrefixes"] = PreparedForestPrefixes
+        globals()["prepare_forest_prefixes"] = prepare_forest_prefixes
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
