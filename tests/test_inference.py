@@ -150,6 +150,91 @@ def test_estimator_receives_exact_sample_weight(monkeypatch: pytest.MonkeyPatch)
         np.testing.assert_array_equal(supplied, weights)
 
 
+def test_float64_negative_importance_roundoff_is_canonicalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RoundoffEstimator:
+        feature_importances_: np.ndarray
+
+        def fit(
+            self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray
+        ) -> RoundoffEstimator:
+            self.feature_importances_ = np.array(
+                [-np.finfo(np.float64).eps / 2.0, 1.0],
+                dtype=np.float64,
+            )
+            return self
+
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: RoundoffEstimator(),
+    )
+    expression = np.array(
+        [[0.0, 1.0, 1.0], [1.0, 0.0, 2.0], [2.0, 1.0, 4.0]],
+        dtype=np.float64,
+    )
+
+    result = run_inference(
+        expression,
+        ["TF1", "TF2", "G"],
+        ["TF1", "TF2"],
+        {"A": np.ones(3)},
+        target_names=["G"],
+        n_estimators=2,
+        threads=1,
+    )
+
+    assert [(edge.source, edge.score) for edge in result.edges] == [("TF2", 1.0)]
+    assert result.model_stats[0].status == "trained"
+    assert result.model_stats[0].message == (
+        "canonicalized 1 negative feature importance value(s) within float64 "
+        "roundoff tolerance"
+    )
+
+
+def test_materially_negative_importance_remains_a_fatal_model_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidEstimator:
+        feature_importances_: np.ndarray
+
+        def fit(
+            self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray
+        ) -> InvalidEstimator:
+            self.feature_importances_ = np.array(
+                [-2.0 * np.finfo(np.float64).eps, 1.0],
+                dtype=np.float64,
+            )
+            return self
+
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: InvalidEstimator(),
+    )
+    expression = np.array(
+        [[0.0, 1.0, 1.0], [1.0, 0.0, 2.0], [2.0, 1.0, 4.0]],
+        dtype=np.float64,
+    )
+
+    result = run_inference(
+        expression,
+        ["TF1", "TF2", "G"],
+        ["TF1", "TF2"],
+        {"A": np.ones(3)},
+        target_names=["G"],
+        n_estimators=2,
+        threads=1,
+    )
+
+    assert result.edges == ()
+    assert result.model_stats[0].status == "invalid_feature_importances"
+    assert result.model_stats[0].message.startswith(
+        "estimator returned a materially negative feature importance"
+    )
+
+
 def test_tree_fitting_canonicalizes_machine_precision_weight_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

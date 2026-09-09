@@ -61,6 +61,10 @@ from spathi.targeting import (
 from spathi.weighting import canonicalize_sample_weights
 
 INFERENCE_VALIDATION_WORKING_MEMORY_BYTES = 64 * 1024**2
+FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE = float(np.finfo(np.float64).eps)
+FEATURE_IMPORTANCE_CANONICALIZATION_RULE = (
+    "zero-negative-normalized-importance-within-float64-epsilon"
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1857,12 +1861,18 @@ def _result_from_fit_outcome(
             convergence_delta=outcome.convergence_delta,
             convergence_checks=outcome.convergence_checks,
         )
-    if np.any(importances < 0.0):
+    materially_negative = importances < -FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE
+    if np.any(materially_negative):
+        minimum = float(np.min(importances))
         return _skipped_result(
             task,
             context,
             reason="invalid_feature_importances",
-            detail="estimator returned a negative feature importance",
+            detail=(
+                "estimator returned a materially negative feature importance: "
+                f"minimum={minimum!r}, tolerance="
+                f"{FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE!r}"
+            ),
             seed=seed,
             n_predictors_used=len(selected_positions),
             discarded=discarded,
@@ -1873,6 +1883,23 @@ def _result_from_fit_outcome(
             convergence_delta=outcome.convergence_delta,
             convergence_checks=outcome.convergence_checks,
         )
+
+    roundoff_negative = importances < 0.0
+    canonicalized_count = int(np.count_nonzero(roundoff_negative))
+    if canonicalized_count:
+        # Tree impurity subtraction can leave a negative residual far below one
+        # float64 epsilon even though normalized impurity importances are
+        # mathematically non-negative.  Zero only that unresolvable mass.  Keep
+        # every positive score bitwise unchanged and retain the strict failure
+        # above for any negative value with material unit-scale magnitude.
+        importances = np.array(importances, dtype=np.float64, copy=True)
+        importances[roundoff_negative] = 0.0
+    diagnostic_message = (
+        f"canonicalized {canonicalized_count} negative feature importance value(s) "
+        "within float64 roundoff tolerance"
+        if canonicalized_count
+        else ""
+    )
 
     evidence = (
         "weighted_extra_trees_feature_importance"
@@ -1915,7 +1942,11 @@ def _result_from_fit_outcome(
             adaptive_converged=outcome.adaptive_converged,
             convergence_delta=outcome.convergence_delta,
             convergence_checks=outcome.convergence_checks,
-            message=skipped.detail,
+            message=(
+                f"{skipped.detail}; {diagnostic_message}"
+                if diagnostic_message
+                else skipped.detail
+            ),
         )
         return ModelResult(edges=(), skipped=skipped, stat=stat, trained=True)
 
@@ -1934,6 +1965,7 @@ def _result_from_fit_outcome(
         adaptive_converged=outcome.adaptive_converged,
         convergence_delta=outcome.convergence_delta,
         convergence_checks=outcome.convergence_checks,
+        message=diagnostic_message,
     )
     return ModelResult(edges=edges, skipped=None, stat=stat, trained=True)
 

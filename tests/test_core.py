@@ -809,6 +809,13 @@ def test_public_core_writes_self_contained_deterministic_run(
     )
     assert metadata["effective_parameters"]["tree_target_dtype"] == "float64"
     assert metadata["effective_parameters"]["tree_predictor_dtype"] == "float32"
+    assert metadata["effective_parameters"]["feature_importance_canonicalization"] == {
+        "rule": "zero-negative-normalized-importance-within-float64-epsilon",
+        "absolute_tolerance": np.finfo(np.float64).eps,
+        "scale": "normalized-unit-importance",
+        "positive_importances_changed": False,
+        "material_negative_importances": "fatal",
+    }
     assert metadata["effective_parameters"]["bootstrap_requested"] is None
     assert metadata["effective_parameters"]["bootstrap_effective"] is False
     assert metadata["effective_parameters"]["tree_budget"] == {

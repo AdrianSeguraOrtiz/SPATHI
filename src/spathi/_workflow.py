@@ -35,6 +35,8 @@ from spathi.distances import (
 )
 from spathi.inference import (
     FATAL_MODEL_STATUSES,
+    FEATURE_IMPORTANCE_CANONICALIZATION_RULE,
+    FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE,
     INFERENCE_VALIDATION_WORKING_MEMORY_BYTES,
     TRAINED_MODEL_STATUSES,
     ModelResult,
@@ -2307,6 +2309,13 @@ def _run_workflow_impl(
                 ],
                 "retained_weights_renormalized": False,
             },
+            "feature_importance_canonicalization": {
+                "rule": FEATURE_IMPORTANCE_CANONICALIZATION_RULE,
+                "absolute_tolerance": FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE,
+                "scale": "normalized-unit-importance",
+                "positive_importances_changed": False,
+                "material_negative_importances": "fatal",
+            },
             "tree_target_dtype": tree_target_dtype,
             "tree_predictor_dtype": tree_predictor_dtype,
             "inference_preparation_performed": prepared is not None,
@@ -2484,6 +2493,10 @@ def _run_workflow_impl(
             },
             "model_diagnostics.tsv.gz": {
                 "scope": "one record per requested target-group model",
+                "message": (
+                    "records whether negative normalized importance values within one "
+                    "float64 epsilon were canonicalized to exact zero"
+                ),
                 "target_weighted_detected_fraction": (
                     "fraction of the target-group model weight carried by cells in which "
                     "the target is detected"
