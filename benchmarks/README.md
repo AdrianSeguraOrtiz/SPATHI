@@ -158,3 +158,34 @@ case/dataset; implementation order is counterbalanced across the four measured r
 The reported 95% bootstrap bounds describe run-to-run variability in this fixed suite;
 they are not population-level confidence intervals or hypothesis tests. RSS, CPU, and
 transient disk peaks are sampled lower bounds at the interval declared by the profile.
+
+## Parallel-backend engineering experiment
+
+`benchmark_parallel.py` compares sequential execution, the production thread pool,
+public joblib/loky dispatch, and SPATHI's bounded process pool. All four fit the same
+real `PreparedInference` model tasks with fixed seeds and weighted synthetic data;
+exact edge scores and model diagnostics must match, excluding fit timings.
+
+```bash
+python benchmarks/benchmark_parallel.py --case smoke --output benchmarks/results/parallel-smoke
+python benchmarks/benchmark_parallel.py --case small --output benchmarks/results/parallel-small
+python benchmarks/benchmark_parallel.py --case large --output benchmarks/results/parallel-large
+```
+
+Install the development dependencies first. Each backend starts in its own driver
+process. The first measurement includes lazy pool startup; subsequent repetitions
+reuse its workers. `small` uses 600 cells, 100 TFs and 16 targets; `large` uses 3,000
+cells, 500 TFs and four targets. Both have two weighted groups and 250-tree forests.
+The large case uses fewer targets to keep this an engineering probe rather than a
+full inference workload. The default is two repetitions for smoke/small and one
+for large. `--threads`, `--repeats`, `--seed` and `--timeout-seconds`
+control resources, repetitions, reproducibility and the total deadline per case.
+
+Results include exact-equivalence hashes, sampled process-tree CPU/RSS, worker IDs,
+read-only memmap evidence, dependency/source hashes, and a single-model cProfile
+for the smoke/small cases. Summed RSS can double count shared pages. cProfile does
+not measure GIL waiting. SPATHI source, the runner and its measurement helper are
+hashed before and after each worker; editing them during a run aborts comparison.
+These opt-in measurements are not statistical or biological
+performance claims; run them on an otherwise idle machine. Use a fresh output
+directory for each experiment.

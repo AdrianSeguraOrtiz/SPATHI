@@ -968,6 +968,7 @@ def _terminate_process_tree(
     process_group_id: int | None = None,
     tracked_processes: Sequence[psutil.Process] = (),
     timeout_seconds: float = 3.0,
+    natural_exit_grace_seconds: float = 0.0,
 ) -> bool:
     """Stop and verify a run tree, including members created while handling SIGTERM.
 
@@ -975,7 +976,8 @@ def _terminate_process_tree(
     pass includes the dedicated process group as well as previously observed tree
     members. This catches a child forked by a SIGTERM handler after the first group
     signal. Any process which remains active after SIGKILL is a hard supervision
-    error rather than a silently leaked benchmark process.
+    error rather than a silently leaked benchmark process. After the parent has
+    exited normally, an optional bounded grace lets helpers finish without signals.
     """
 
     import psutil
@@ -1029,6 +1031,14 @@ def _terminate_process_tree(
         return {identity: member for identity, member in known.items() if is_active(member)}
 
     active = discover_active()
+    if natural_exit_grace_seconds > 0 and not is_active(process):
+        natural_exit_deadline = time.monotonic() + natural_exit_grace_seconds
+        while active and time.monotonic() < natural_exit_deadline:
+            psutil.wait_procs(
+                list(active.values()),
+                timeout=min(0.02, max(0.0, natural_exit_deadline - time.monotonic())),
+            )
+            active = discover_active()
     needed_termination = bool(active)
     if not active:
         with suppress(psutil.NoSuchProcess, psutil.TimeoutExpired, subprocess.TimeoutExpired):
@@ -1434,6 +1444,7 @@ def measure_command(
                         process,
                         process_group_id=process.pid if os.name == "posix" else None,
                         tracked_processes=usage_sampler.tracked_processes(),
+                        natural_exit_grace_seconds=0.5,
                     )
                 except RuntimeError as exc:
                     cleanup_errors.append(exc)

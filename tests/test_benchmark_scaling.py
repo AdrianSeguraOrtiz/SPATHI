@@ -856,6 +856,87 @@ def test_deadline_is_independent_of_a_cpu_bound_probe(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
+@pytest.mark.parametrize(
+    ("child_exit_delay", "expected_status"),
+    [(0.15, "success"), (60.0, "cleanup_error")],
+)
+def test_normal_parent_exit_allows_brief_natural_cleanup_but_reaps_real_orphans(
+    benchmark: ModuleType,
+    tmp_path: Path,
+    child_exit_delay: float,
+    expected_status: str,
+) -> None:
+    psutil = pytest.importorskip("psutil")
+    ready_path = tmp_path / "child-ready.pid"
+    finished_path = tmp_path / "child-finished.txt"
+    child_program = """
+import os
+from pathlib import Path
+import sys
+import time
+
+parent_pid = os.getppid()
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+while os.getppid() == parent_pid:
+    time.sleep(0.005)
+time.sleep(float(sys.argv[3]))
+Path(sys.argv[2]).write_text("natural exit", encoding="utf-8")
+"""
+    parent_program = f"""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+subprocess.Popen(
+    [sys.executable, "-c", {child_program!r}, *sys.argv[1:]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+while not Path(sys.argv[1]).exists():
+    time.sleep(0.005)
+os._exit(0)
+"""
+    try:
+        measurement = benchmark.measure_command(
+            [
+                sys.executable,
+                "-c",
+                parent_program,
+                str(ready_path),
+                str(finished_path),
+                str(child_exit_delay),
+            ],
+            sample_interval_seconds=0.005,
+            timeout_seconds=5.0,
+            show_output=False,
+            stdout_log_path=tmp_path / "natural-exit.stdout.log",
+            stderr_log_path=tmp_path / "natural-exit.stderr.log",
+        )
+
+        assert measurement.exit_code == 0
+        assert measurement.status == expected_status
+        assert finished_path.exists() == (expected_status == "success")
+        if expected_status == "cleanup_error":
+            assert "active descendants remained" in measurement.error
+        child_pid = int(ready_path.read_text(encoding="utf-8"))
+        try:
+            assert psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            pass
+    finally:
+        if ready_path.exists():
+            try:
+                child = psutil.Process(int(ready_path.read_text(encoding="utf-8")))
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    child.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
 def test_timeout_reaps_orphan_created_by_sigterm_handler(
     benchmark: ModuleType,
     tmp_path: Path,
