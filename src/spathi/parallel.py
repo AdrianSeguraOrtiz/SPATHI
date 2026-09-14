@@ -7,9 +7,10 @@ automatic strategy spends that budget at exactly one level:
   tasks to occupy the budget; or
 * inside one scikit-learn ensemble at a time for a small task collection.
 
-This prevents every outer worker from creating another full set of workers.  A
-threading backend is used for outer parallelism so the read-only expression and
-predictor arrays remain shared instead of being copied to child processes.
+This prevents every outer worker from creating another full set of workers.
+Outer tasks use either threads sharing arrays in memory or isolated processes
+sharing large read-only arrays through temporary memory maps. Model seeds and
+result ordering are independent of that operational choice.
 """
 
 from __future__ import annotations
@@ -17,13 +18,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import islice
+from tempfile import TemporaryDirectory
 from typing import Any, Literal, TypeVar, cast
 
-from joblib import cpu_count
+from joblib import Parallel, cpu_count, delayed, parallel_config
 from threadpoolctl import threadpool_limits
 
 from spathi.config import ThreadBudget
@@ -32,6 +36,8 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 MAX_PENDING_TASKS_PER_WORKER = 2
+PROCESS_MEMMAP_THRESHOLD_BYTES = 64 * 1024
+PROCESS_IDLE_TIMEOUT_SECONDS = 30
 
 ParallelLevel = Literal["none", "tasks", "estimator"]
 
@@ -82,6 +88,7 @@ def resolve_thread_budget(
     *,
     available_threads: int | None = None,
     max_outer_jobs: int | None = None,
+    task_backend: Literal["threading", "loky"] = "threading",
 ) -> ParallelPlan:
     """Resolve ``threads`` into a non-nested automatic parallelism plan.
 
@@ -98,6 +105,9 @@ def resolve_thread_budget(
         Optional upper bound for concurrently active model tasks. The caller
         may derive this from its own memory model; this module deliberately
         performs no system-memory detection.
+    task_backend:
+        Execution mechanism when the budget is spent across model tasks.
+        Estimator-level parallelism always uses scikit-learn's threads.
 
     Notes
     -----
@@ -115,6 +125,8 @@ def resolve_thread_budget(
         raise TypeError("n_tasks must be a non-negative integer")
     if n_tasks < 0:
         raise ValueError("n_tasks must be a non-negative integer")
+    if task_backend not in {"threading", "loky"}:
+        raise ValueError("task_backend must be 'threading' or 'loky'")
 
     capacity = available_cpu_count() if available_threads is None else available_threads
     if isinstance(capacity, bool) or not isinstance(capacity, int):
@@ -170,7 +182,7 @@ def resolve_thread_budget(
             max_outer_jobs=max_outer_jobs,
             outer_jobs=outer_jobs,
             model_n_jobs=1,
-            backend="threading",
+            backend=task_backend,
             parallel_level="tasks",
         )
 
@@ -236,20 +248,34 @@ def execute_tasks(
         return executor.execute(function, task_list)
 
 
+def _execute_indexed(function: Callable[[T], R], index: int, task: T) -> tuple[int, R]:
+    return index, function(task)
+
+
 class PersistentTaskExecutor:
     """Reuse one worker pool across multiple bounded model batches.
 
     ``execute`` returns results in input order. ``consume`` instead forwards
     each result on the caller's orchestration thread as soon as it finishes,
-    without materializing a result collection.
+    without materializing a result collection. Threads replenish one rolling
+    window continuously; processes stream bounded windows through a persistent
+    Joblib pool. Callbacks always execute on the caller, never in a worker.
     """
 
-    def __init__(self, plan: ParallelPlan) -> None:
+    def __init__(self, plan: ParallelPlan, *, process_window_size: int | None = None) -> None:
         if not isinstance(plan, ParallelPlan):
             raise TypeError("plan must be a ParallelPlan")
+        if process_window_size is not None and (
+            type(process_window_size) is not int or process_window_size < 1
+        ):
+            raise ValueError("process_window_size must be a positive integer or None")
         self.plan = plan
+        self.process_window_size = (
+            process_window_size or plan.outer_jobs * MAX_PENDING_TASKS_PER_WORKER
+        )
         self._stack: ExitStack | None = None
         self._pool: ThreadPoolExecutor | None = None
+        self._process_pool: Parallel | None = None
 
     def __enter__(self) -> PersistentTaskExecutor:
         if self._stack is not None:
@@ -257,7 +283,24 @@ class PersistentTaskExecutor:
         stack = ExitStack()
         try:
             stack.enter_context(threadpool_limits(limits=1))
-            if self.plan.outer_jobs > 1:
+            if self.plan.outer_jobs > 1 and self.plan.backend == "loky":
+                temporary_directory = stack.enter_context(
+                    TemporaryDirectory(prefix="spathi-workers-")
+                )
+                stack.enter_context(parallel_config(backend="loky", inner_max_num_threads=1))
+                self._process_pool = stack.enter_context(
+                    Parallel(
+                        n_jobs=self.plan.outer_jobs,
+                        return_as="generator_unordered",
+                        batch_size=1,
+                        pre_dispatch=self.process_window_size,
+                        max_nbytes=PROCESS_MEMMAP_THRESHOLD_BYTES,
+                        mmap_mode="r",
+                        temp_folder=temporary_directory,
+                        idle_worker_timeout=PROCESS_IDLE_TIMEOUT_SECONDS,
+                    )
+                )
+            elif self.plan.outer_jobs > 1:
                 pool = stack.enter_context(
                     ThreadPoolExecutor(
                         max_workers=self.plan.outer_jobs,
@@ -269,6 +312,7 @@ class PersistentTaskExecutor:
             # ``threadpool_limits`` mutates process-wide native pool settings.
             # Restore them even when constructing or entering the worker pool fails.
             self._pool = None
+            self._process_pool = None
             stack.close()
             raise
         self._stack = stack
@@ -278,6 +322,7 @@ class PersistentTaskExecutor:
         stack = self._stack
         self._stack = None
         self._pool = None
+        self._process_pool = None
         if stack is not None:
             stack.__exit__(exc_type, exc, traceback)
 
@@ -289,6 +334,10 @@ class PersistentTaskExecutor:
         on_result: Callable[[int, R], None],
     ) -> None:
         """Run a bounded rolling task window and consume completions on this thread."""
+
+        if self._process_pool is not None:
+            self._consume_processes(function, tasks, on_result=on_result)
+            return
 
         pool = self._pool
         if pool is None:
@@ -335,6 +384,53 @@ class PersistentTaskExecutor:
             for future in pending:
                 future.cancel()
             raise
+
+    def _consume_processes(
+        self,
+        function: Callable[[T], R],
+        tasks: Iterable[T],
+        *,
+        on_result: Callable[[int, R], None],
+    ) -> None:
+        """Stream bounded process windows, sharing large read-only input arrays.
+
+        Joblib's ``pre_dispatch`` limits submission, not completed result retention:
+        its workers can refill the queue while the consumer writes a checkpoint.
+        Explicit windows therefore bound live results even with a slow callback.
+        The same pool and memmap cache serve every window and inference batch.
+        """
+
+        pool = self._process_pool
+        if pool is None:
+            raise RuntimeError("process worker pool is unavailable")
+        indexed_tasks = enumerate(tasks)
+        window_size = self.process_window_size
+        while window := tuple(islice(indexed_tasks, window_size)):
+            results = pool(
+                delayed(_execute_indexed)(function, index, task) for index, task in window
+            )
+            try:
+                for index, result in results:
+                    on_result(index, result)
+                    del result
+            except BaseException:
+                # An interrupted checkpoint/progress callback intentionally stops
+                # consumption. Cancel pending work without Joblib's advice about
+                # an accidentally abandoned generator; preserve the real error.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=(
+                            r"\d+ tasks (have been successfully executed|"
+                            r"which were still being processed)"
+                        ),
+                        category=UserWarning,
+                        module=r"joblib\.parallel",
+                    )
+                    results.close()
+                raise
+            else:
+                results.close()
 
     def execute(
         self,

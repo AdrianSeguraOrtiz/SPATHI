@@ -119,6 +119,7 @@ def _checkpoint_scientific_parameters(config: SpathiConfig) -> dict[str, Any]:
         "centroid_weights",
         "output_dir",
         "threads",
+        "parallel_backend",
         "report",
     ):
         values.pop(operational_or_fingerprinted, None)

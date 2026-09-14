@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from numbers import Integral, Real
 from time import perf_counter
 from typing import Any, Literal, TypeAlias
@@ -28,23 +29,12 @@ from numpy.typing import ArrayLike, NDArray
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 
 from spathi.config import (
-    DEFAULT_ADAPTIVE_MIN_ESTIMATORS,
-    DEFAULT_ADAPTIVE_PATIENCE,
-    DEFAULT_ADAPTIVE_TOLERANCE,
-    DEFAULT_ADAPTIVE_TREE_STEP,
     DEFAULT_MAX_FEATURES,
-    DEFAULT_MIN_TARGET_DETECTED_CELLS,
-    DEFAULT_MIN_TARGET_DETECTED_FRACTION,
-    DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_ESS,
-    DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_FRACTION,
     DEFAULT_N_ESTIMATORS,
-    DEFAULT_TARGET_ELIGIBILITY,
     MAX_RANDOM_SEED,
     MaxFeatures,
-    TargetEligibilityMode,
     ThreadBudget,
     TreeMethod,
-    adaptive_convergence_schedule,
 )
 from spathi.parallel import (
     ParallelPlan,
@@ -52,11 +42,6 @@ from spathi.parallel import (
     execute_tasks,
     resolve_thread_budget,
     stable_task_seed,
-)
-from spathi.targeting import (
-    TargetEligibilityRecord,
-    assess_target_eligibility,
-    weighted_detected_context_statistics,
 )
 from spathi.weighting import canonicalize_sample_weights
 
@@ -76,7 +61,6 @@ UntrainedModelStatus: TypeAlias = Literal[
     "no_variable_predictors",
     "model_fit_failed",
     "invalid_feature_importances",
-    "target_not_estimable",
 ]
 TrainedModelStatus: TypeAlias = Literal["trained", "trained_no_positive_importance"]
 ModelStatus: TypeAlias = UntrainedModelStatus | TrainedModelStatus
@@ -91,7 +75,6 @@ UNTRAINED_MODEL_STATUSES = frozenset(
         "no_variable_predictors",
         "model_fit_failed",
         "invalid_feature_importances",
-        "target_not_estimable",
     }
 )
 FATAL_MODEL_STATUSES = frozenset({"model_fit_failed", "invalid_feature_importances"})
@@ -153,14 +136,7 @@ class ModelStat:
     n_edges: int
     importance_sum: float
     fit_seconds: float
-    target_detected_cells: int | None = None
-    target_detected_fraction: float | None = None
-    target_weighted_detected_fraction: float | None = None
-    target_weighted_detected_ess: float | None = None
     n_estimators_fitted: int = 0
-    adaptive_converged: bool = False
-    convergence_delta: float | None = None
-    convergence_checks: int = 0
     message: str = ""
 
     def __post_init__(self) -> None:
@@ -176,7 +152,6 @@ class ModelStat:
             "n_predictors_used",
             "n_edges",
             "n_estimators_fitted",
-            "convergence_checks",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
@@ -208,60 +183,6 @@ class ModelStat:
                 raise ValueError(f"{field_name} must be non-negative and finite")
         if self.weight_sum <= 0:
             raise ValueError("weight_sum must be positive")
-        if self.target_detected_cells is not None and (
-            isinstance(self.target_detected_cells, bool)
-            or not isinstance(self.target_detected_cells, Integral)
-            or self.target_detected_cells < 0
-            or self.target_detected_cells > self.n_samples
-        ):
-            raise ValueError("target_detected_cells must be a non-negative integer or None")
-        if type(self.adaptive_converged) is not bool:
-            raise TypeError("adaptive_converged must be a boolean")
-        for field_name in (
-            "target_detected_fraction",
-            "target_weighted_detected_fraction",
-            "target_weighted_detected_ess",
-            "convergence_delta",
-        ):
-            value = getattr(self, field_name)
-            if value is not None and (not np.isfinite(value) or value < 0):
-                raise ValueError(f"{field_name} must be non-negative and finite or None")
-        for field_name in (
-            "target_detected_fraction",
-            "target_weighted_detected_fraction",
-        ):
-            value = getattr(self, field_name)
-            if value is not None and value > 1:
-                raise ValueError(f"{field_name} cannot exceed one")
-        if (
-            self.target_detected_cells is not None
-            and self.target_detected_fraction is not None
-            and self.target_detected_fraction != self.target_detected_cells / self.n_samples
-        ):
-            raise ValueError("target detected count and fraction are inconsistent")
-        if (self.target_detected_cells is None) != (self.target_detected_fraction is None):
-            raise ValueError("target detected count and fraction must be recorded together")
-        if (self.target_weighted_detected_fraction is None) != (
-            self.target_weighted_detected_ess is None
-        ):
-            raise ValueError("weighted target detection fraction and ESS must be recorded together")
-        if (
-            self.target_weighted_detected_ess is not None
-            and self.target_detected_cells is not None
-            and self.target_weighted_detected_ess
-            > self.target_detected_cells + 1e-12 * max(1, self.target_detected_cells)
-        ):
-            raise ValueError("weighted detected ESS cannot exceed detected cells")
-        if self.convergence_delta is not None and self.convergence_delta > 1:
-            raise ValueError("convergence_delta cannot exceed one")
-        if (self.convergence_checks == 0) != (self.convergence_delta is None):
-            raise ValueError("convergence checks and delta must be recorded together")
-        if self.adaptive_converged and (
-            self.n_estimators_fitted == 0
-            or self.convergence_checks == 0
-            or self.convergence_delta is None
-        ):
-            raise ValueError("adaptive convergence requires fitted trees and convergence evidence")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -279,14 +200,7 @@ class ModelStat:
             "n_edges": self.n_edges,
             "importance_sum": self.importance_sum,
             "fit_seconds": self.fit_seconds,
-            "target_detected_cells": self.target_detected_cells,
-            "target_detected_fraction": self.target_detected_fraction,
-            "target_weighted_detected_fraction": self.target_weighted_detected_fraction,
-            "target_weighted_detected_ess": self.target_weighted_detected_ess,
             "n_estimators_fitted": self.n_estimators_fitted,
-            "adaptive_converged": self.adaptive_converged,
-            "convergence_delta": self.convergence_delta,
-            "convergence_checks": self.convergence_checks,
             "message": self.message,
         }
 
@@ -348,7 +262,6 @@ class InferenceBatchSummary:
 class _PreparedGroup:
     name: str
     weights: NDArray[np.float64]
-    squared_weights: NDArray[np.float64] | None
     positive_mask: NDArray[np.bool_]
     n_positive_weight_samples: int
     weight_sum: float
@@ -365,9 +278,6 @@ class _ModelTask:
     group: _PreparedGroup
     target_index: int
     target_name: str
-    target_eligibility: TargetEligibilityRecord
-    target_weighted_detected_fraction: float | None
-    target_weighted_detected_ess: float | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -445,14 +355,6 @@ class _FitContext:
     target_to_tf_position: tuple[int | None, ...]
     tree_method: TreeMethod
     n_estimators: int
-    adaptive_trees: bool
-    adaptive_min_estimators: int
-    adaptive_tree_step: int
-    adaptive_tolerance: float
-    adaptive_patience: int
-    target_eligibility_mode: TargetEligibilityMode
-    min_target_weighted_detected_fraction: float
-    min_target_weighted_detected_ess: float
     max_features: MaxFeatures
     min_samples_leaf: int
     max_depth: int | None
@@ -480,9 +382,6 @@ class _TreeFitOutcome:
     importances: NDArray[np.float64]
     fit_seconds: float
     n_estimators_fitted: int
-    adaptive_converged: bool
-    convergence_delta: float | None
-    convergence_checks: int
 
 
 class _TreeFitFailure(RuntimeError):
@@ -494,15 +393,11 @@ class _TreeFitFailure(RuntimeError):
         *,
         fit_seconds: float,
         n_estimators_fitted: int,
-        convergence_delta: float | None,
-        convergence_checks: int,
     ) -> None:
         super().__init__(str(error))
         self.error = error
         self.fit_seconds = fit_seconds
         self.n_estimators_fitted = n_estimators_fitted
-        self.convergence_delta = convergence_delta
-        self.convergence_checks = convergence_checks
 
 
 def _normalise_estimator_prefixes(
@@ -548,18 +443,9 @@ class PreparedInference:
     target_names: tuple[str, ...]
     tf_names: tuple[str, ...]
     _target_to_tf_position: tuple[int | None, ...]
-    target_eligibility: tuple[TargetEligibilityRecord, ...]
     _target_expression_additional_nbytes: int
     tree_method: TreeMethod
     n_estimators: int
-    adaptive_trees: bool
-    adaptive_min_estimators: int
-    adaptive_tree_step: int
-    adaptive_tolerance: float
-    adaptive_patience: int
-    target_eligibility_mode: TargetEligibilityMode
-    min_target_weighted_detected_fraction: float
-    min_target_weighted_detected_ess: float
     max_features: MaxFeatures
     min_samples_leaf: int
     max_depth: int | None
@@ -665,16 +551,14 @@ class PreparedInference:
         trees are discarded or regenerated.
 
         This numerical core facility is intended for convergence studies. It is
-        deliberately unavailable for adaptive forests, checkpoint resumption,
-        and per-model callbacks because those operations have different stopping
-        or durability semantics. The ordinary inference CLI remains unchanged.
+        deliberately unavailable for checkpoint resumption and per-model
+        callbacks because those operations have different durability semantics.
+        The ordinary inference CLI remains unchanged.
         ``InferenceResult.duration_seconds`` is the shared wall time for the
         complete prefix batch, not an independently measured runtime per prefix;
         cumulative model fit time remains available in each ``ModelStat``.
         """
 
-        if self.adaptive_trees:
-            raise ValueError("forest prefixes require adaptive_trees=False")
         counts = _normalise_estimator_prefixes(
             estimator_counts,
             maximum=self.n_estimators,
@@ -755,7 +639,6 @@ class PreparedInference:
             n_cells=self.n_cells,
             tf_expression=self._tf_expression,
             tf_names=self.tf_names,
-            compute_squared_weights=self.target_eligibility_mode == "automatic",
         )
         ordered_targets = tuple(sorted(enumerate(self.target_names), key=lambda item: item[1]))
         completed = frozenset((str(group), str(target)) for group, target in completed_models)
@@ -806,42 +689,11 @@ class PreparedInference:
                 for target_index, target_name in target_items
                 if (group.name, target_name) not in completed_models
             )
-            eligible_indices = tuple(
-                target_index
-                for target_index, _target_name in incomplete
-                if group.n_positive_weight_samples >= 2
-                and self.target_eligibility[target_index].eligible
-                and self.target_eligibility_mode == "automatic"
-            )
-            if eligible_indices:
-                if group.squared_weights is None:  # pragma: no cover - construction invariant
-                    raise RuntimeError("automatic eligibility requires squared group weights")
-                detected_statistics = weighted_detected_context_statistics(
-                    self._expression,
-                    eligible_indices,
-                    group.weights,
-                    group.squared_weights,
-                    weight_sum=group.weight_sum,
-                )
-            else:
-                detected_statistics = ()
-            statistics_by_target = dict(zip(eligible_indices, detected_statistics, strict=True))
             tasks.extend(
                 _ModelTask(
                     group=group,
                     target_index=target_index,
                     target_name=target_name,
-                    target_eligibility=self.target_eligibility[target_index],
-                    target_weighted_detected_fraction=(
-                        None
-                        if target_index not in statistics_by_target
-                        else statistics_by_target[target_index][0]
-                    ),
-                    target_weighted_detected_ess=(
-                        None
-                        if target_index not in statistics_by_target
-                        else statistics_by_target[target_index][1]
-                    ),
                 )
                 for target_index, target_name in incomplete
             )
@@ -858,14 +710,6 @@ class PreparedInference:
             target_to_tf_position=self._target_to_tf_position,
             tree_method=self.tree_method,
             n_estimators=self.n_estimators,
-            adaptive_trees=self.adaptive_trees,
-            adaptive_min_estimators=self.adaptive_min_estimators,
-            adaptive_tree_step=self.adaptive_tree_step,
-            adaptive_tolerance=self.adaptive_tolerance,
-            adaptive_patience=self.adaptive_patience,
-            target_eligibility_mode=self.target_eligibility_mode,
-            min_target_weighted_detected_fraction=(self.min_target_weighted_detected_fraction),
-            min_target_weighted_detected_ess=self.min_target_weighted_detected_ess,
             max_features=self.max_features,
             min_samples_leaf=self.min_samples_leaf,
             max_depth=self.max_depth,
@@ -900,8 +744,7 @@ class PreparedInference:
             executor=executor,
         )
 
-        def fit_task(task: _ModelTask) -> ModelResult:
-            return _fit_model_task(task, execution.context)
+        fit_task = partial(_fit_model_task, context=execution.context)
 
         if on_model_complete is None:
             if executor is None:
@@ -953,8 +796,9 @@ class PreparedInference:
             executor=executor,
         )
 
-        def fit_task(task: _ModelTask) -> tuple[ModelResult, ...]:
-            return _fit_model_prefix_task(task, execution.context, estimator_counts)
+        fit_task = partial(
+            _fit_model_prefix_task, context=execution.context, estimator_counts=estimator_counts
+        )
 
         if executor is None:
             task_prefix_results = execute_tasks(fit_task, execution.tasks, execution.plan)
@@ -1000,8 +844,7 @@ class PreparedInference:
             executor=executor,
         )
 
-        def fit_task(task: _ModelTask) -> ModelResult:
-            return _fit_model_task(task, execution.context)
+        fit_task = partial(_fit_model_task, context=execution.context)
 
         trained_models = 0
         skipped_target_records = 0
@@ -1096,6 +939,30 @@ def _extract_feature_importances(
     return importances / np.sum(importances, dtype=np.float64)
 
 
+@dataclass(slots=True)
+class _TreeImportanceCache:
+    """Retain each new tree vector while preserving exact ordered prefix reductions."""
+
+    values: NDArray[np.float64]
+    processed_trees: int = 0
+    informative_trees: int = 0
+
+    def extract(self, estimator: TreeEstimator) -> NDArray[np.float64]:
+        trees = estimator.estimators_
+        for tree in trees[self.processed_trees :]:
+            if tree.tree_.node_count > 1:
+                self.values[self.informative_trees, :] = tree.feature_importances_
+                self.informative_trees += 1
+        self.processed_trees = len(trees)
+        if self.informative_trees == 0:
+            return np.zeros(self.values.shape[1], dtype=np.float64)
+        # Keep the same complete, ordered float64 mean as sklearn. Incremental
+        # sums would change reduction rounding and the exported importance scores.
+        importances = np.mean(self.values[: self.informative_trees, :], axis=0, dtype=np.float64)
+        importances /= np.sum(importances, dtype=np.float64)
+        return importances
+
+
 def _fit_fixed_tree_prefixes(
     x_model: NDArray[np.float32],
     y: NDArray[np.float64],
@@ -1121,6 +988,11 @@ def _fit_fixed_tree_prefixes(
     )
     fit_seconds = 0.0
     outcomes: list[_TreeFitOutcome] = []
+    importance_cache = (
+        _TreeImportanceCache(np.empty((estimator_counts[-1], x_model.shape[1]), dtype=np.float64))
+        if len(estimator_counts) > 1
+        else None
+    )
     for estimator_count in estimator_counts:
         if estimator_count != first_tree_count:
             estimator.set_params(n_estimators=estimator_count)
@@ -1134,153 +1006,21 @@ def _fit_fixed_tree_prefixes(
                 exc,
                 fit_seconds=fit_seconds,
                 n_estimators_fitted=fitted_trees,
-                convergence_delta=None,
-                convergence_checks=0,
             ) from exc
         fit_seconds += perf_counter() - started
         outcomes.append(
             _TreeFitOutcome(
-                importances=_extract_feature_importances(estimator),
+                importances=(
+                    _extract_feature_importances(estimator)
+                    if importance_cache is None
+                    else importance_cache.extract(estimator)
+                ),
                 fit_seconds=fit_seconds,
                 n_estimators_fitted=estimator_count,
-                adaptive_converged=False,
-                convergence_delta=None,
-                convergence_checks=0,
             )
         )
         first_tree_count = estimator_count
     return tuple(outcomes)
-
-
-def _fit_adaptive_tree_model(
-    x_model: NDArray[np.float32],
-    y: NDArray[np.float64],
-    weights: NDArray[np.float64],
-    *,
-    context: _FitContext,
-    seed: int,
-) -> _TreeFitOutcome:
-    """Fit one deterministic adaptive ensemble for one target model."""
-
-    first_tree_count = min(context.adaptive_tree_step, context.n_estimators)
-    estimator = create_tree_estimator(
-        context.tree_method,
-        n_estimators=first_tree_count,
-        max_features=context.max_features,
-        min_samples_leaf=context.min_samples_leaf,
-        max_depth=context.max_depth,
-        bootstrap=context.bootstrap,
-        random_state=seed,
-        n_jobs=context.model_n_jobs,
-        warm_start=True,
-    )
-    fitted = 0
-    fit_seconds = 0.0
-    checks = 0
-    history: list[NDArray[np.float64]] = []
-    convergence_delta: float | None = None
-    tree_importance_buffer = np.empty(
-        (context.n_estimators, x_model.shape[1]),
-        dtype=np.float64,
-    )
-    processed_trees = 0
-    informative_trees = 0
-
-    while True:
-        started = perf_counter()
-        try:
-            estimator.fit(x_model, y, sample_weight=weights)
-        except (ValueError, FloatingPointError) as exc:
-            fit_seconds += perf_counter() - started
-            fitted_trees = len(getattr(estimator, "estimators_", ()))
-            raise _TreeFitFailure(
-                exc,
-                fit_seconds=fit_seconds,
-                n_estimators_fitted=fitted_trees,
-                convergence_delta=convergence_delta,
-                convergence_checks=checks,
-            ) from exc
-        fit_seconds += perf_counter() - started
-        fitted = int(getattr(estimator, "n_estimators", first_tree_count))
-        trees = estimator.estimators_
-        for tree in trees[processed_trees:]:
-            if tree.tree_.node_count > 1:
-                tree_importance_buffer[informative_trees, :] = tree.feature_importances_
-                informative_trees += 1
-        processed_trees = len(trees)
-        if informative_trees == 0:
-            importances = np.zeros(x_model.shape[1], dtype=np.float64)
-        else:
-            importances = np.mean(
-                tree_importance_buffer[:informative_trees, :],
-                axis=0,
-                dtype=np.float64,
-            )
-            importances /= np.sum(importances, dtype=np.float64)
-
-        if history and fitted >= context.adaptive_min_estimators:
-            comparison_window = history[-context.adaptive_patience :]
-            deltas = tuple(
-                float(0.5 * np.sum(np.abs(importances - earlier), dtype=np.float64))
-                for earlier in comparison_window
-            )
-            convergence_delta = max(deltas)
-            checks += 1
-            current_mass = float(np.sum(importances, dtype=np.float64))
-            if (
-                len(comparison_window) == context.adaptive_patience
-                and current_mass > 0.0
-                and all(
-                    float(np.sum(earlier, dtype=np.float64)) > 0.0 for earlier in comparison_window
-                )
-                and convergence_delta <= context.adaptive_tolerance
-            ):
-                return _TreeFitOutcome(
-                    importances=importances,
-                    fit_seconds=fit_seconds,
-                    n_estimators_fitted=fitted,
-                    adaptive_converged=True,
-                    convergence_delta=convergence_delta,
-                    convergence_checks=checks,
-                )
-
-        if fitted >= context.n_estimators:
-            return _TreeFitOutcome(
-                importances=importances,
-                fit_seconds=fit_seconds,
-                n_estimators_fitted=fitted,
-                adaptive_converged=False,
-                convergence_delta=convergence_delta,
-                convergence_checks=checks,
-            )
-        history.append(importances)
-        if len(history) > context.adaptive_patience:
-            del history[0]
-        estimator.set_params(
-            n_estimators=min(context.n_estimators, fitted + context.adaptive_tree_step)
-        )
-
-
-def _fit_tree_model(
-    x_model: NDArray[np.float32],
-    y: NDArray[np.float64],
-    weights: NDArray[np.float64],
-    *,
-    context: _FitContext,
-    seed: int,
-) -> _TreeFitOutcome:
-    """Fit the configured fixed or deterministic adaptive target model."""
-
-    if context.adaptive_trees:
-        return _fit_adaptive_tree_model(x_model, y, weights, context=context, seed=seed)
-    return _fit_fixed_tree_prefixes(
-        x_model,
-        y,
-        weights,
-        context=context,
-        seed=seed,
-        estimator_counts=(context.n_estimators,),
-    )[0]
 
 
 def _validate_hyperparameters(
@@ -1291,16 +1031,6 @@ def _validate_hyperparameters(
     min_samples_leaf: int,
     max_depth: int | None,
     bootstrap: bool | None,
-    adaptive_trees: bool,
-    adaptive_min_estimators: int,
-    adaptive_tree_step: int,
-    adaptive_tolerance: float,
-    adaptive_patience: int,
-    target_eligibility: TargetEligibilityMode,
-    min_target_detected_cells: int,
-    min_target_detected_fraction: float,
-    min_target_weighted_detected_fraction: float,
-    min_target_weighted_detected_ess: float,
     random_seed: int,
 ) -> None:
     if tree_method not in {"extra-trees", "random-forest"}:
@@ -1334,60 +1064,6 @@ def _validate_hyperparameters(
             raise ValueError("max_depth must be None or a positive integer")
     if bootstrap is not None and not isinstance(bootstrap, bool):
         raise TypeError("bootstrap must be a boolean or None")
-    if not isinstance(adaptive_trees, bool):
-        raise TypeError("adaptive_trees must be a boolean")
-    for field_name, value in (
-        ("adaptive_min_estimators", adaptive_min_estimators),
-        ("adaptive_tree_step", adaptive_tree_step),
-        ("adaptive_patience", adaptive_patience),
-        ("min_target_detected_cells", min_target_detected_cells),
-    ):
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            raise TypeError(f"{field_name} must be a positive integer")
-        if value < 1:
-            raise ValueError(f"{field_name} must be a positive integer")
-    if adaptive_trees and adaptive_min_estimators >= n_estimators:
-        raise ValueError(
-            "adaptive_min_estimators must be smaller than n_estimators when "
-            "adaptive_trees is enabled"
-        )
-    if adaptive_trees:
-        _maximum_checks, first_stop = adaptive_convergence_schedule(
-            n_estimators=int(n_estimators),
-            minimum_estimators=int(adaptive_min_estimators),
-            estimator_step=int(adaptive_tree_step),
-            patience=int(adaptive_patience),
-        )
-        if first_stop is None:
-            raise ValueError(
-                "adaptive tree budget cannot satisfy adaptive_patience at or before "
-                "n_estimators; reduce adaptive_tree_step, adaptive_min_estimators, "
-                "or adaptive_patience"
-            )
-    for field_name, value, upper_bound in (
-        ("adaptive_tolerance", adaptive_tolerance, 1.0),
-        ("min_target_detected_fraction", min_target_detected_fraction, 1.0),
-        (
-            "min_target_weighted_detected_fraction",
-            min_target_weighted_detected_fraction,
-            1.0,
-        ),
-    ):
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError(f"{field_name} must be a number")
-        if not np.isfinite(float(value)) or not 0 < float(value) <= upper_bound:
-            raise ValueError(f"{field_name} must be in the interval (0, 1]")
-    if target_eligibility not in {"all", "automatic"}:
-        raise ValueError("target_eligibility must be 'all' or 'automatic'")
-    if isinstance(min_target_weighted_detected_ess, bool) or not isinstance(
-        min_target_weighted_detected_ess, Real
-    ):
-        raise TypeError("min_target_weighted_detected_ess must be a number")
-    if (
-        not np.isfinite(float(min_target_weighted_detected_ess))
-        or float(min_target_weighted_detected_ess) <= 0
-    ):
-        raise ValueError("min_target_weighted_detected_ess must be positive and finite")
     if isinstance(random_seed, bool) or not isinstance(random_seed, Integral):
         raise TypeError("random_seed must be a non-negative integer")
     if random_seed < 0:
@@ -1608,7 +1284,6 @@ def _prepare_groups(
     n_cells: int,
     tf_expression: NDArray[np.float32],
     tf_names: tuple[str, ...],
-    compute_squared_weights: bool,
 ) -> tuple[_PreparedGroup, ...]:
     if not isinstance(group_weights, Mapping) or not group_weights:
         raise ValueError("group_weights must be a non-empty mapping")
@@ -1617,7 +1292,6 @@ def _prepare_groups(
         str,
         tuple[
             NDArray[np.float64],
-            NDArray[np.float64] | None,
             NDArray[np.bool_],
             int,
             float,
@@ -1653,18 +1327,8 @@ def _prepare_groups(
             raise ValueError(f"weights for group {group!r} are all zero")
         if not np.isfinite(weight_sum):
             raise ValueError(f"weights for group {group!r} have a non-finite total")
-        squared_weights: NDArray[np.float64] | None = None
-        if compute_squared_weights:
-            with np.errstate(over="ignore", under="ignore"):
-                squared_weights = np.square(weights, dtype=np.float64)
-            if not np.isfinite(squared_weights).all() or not np.any(squared_weights > 0.0):
-                raise ValueError(
-                    f"weights for group {group!r} cannot support stable effective-sample-size "
-                    "calculation"
-                )
         weights_by_name[group] = (
             weights,
-            squared_weights,
             positive_mask,
             n_positive_weight_samples,
             weight_sum,
@@ -1687,7 +1351,6 @@ def _prepare_groups(
     for group in ordered_names:
         (
             weights,
-            squared_weights,
             positive_mask,
             n_positive_weight_samples,
             weight_sum,
@@ -1728,7 +1391,6 @@ def _prepare_groups(
             _PreparedGroup(
                 name=group,
                 weights=weights,
-                squared_weights=squared_weights,
                 positive_mask=positive_mask,
                 n_positive_weight_samples=n_positive_weight_samples,
                 weight_sum=weight_sum,
@@ -1756,12 +1418,8 @@ def _make_stat(
     importance_sum: float = 0.0,
     fit_seconds: float = 0.0,
     n_estimators_fitted: int = 0,
-    adaptive_converged: bool = False,
-    convergence_delta: float | None = None,
-    convergence_checks: int = 0,
     message: str = "",
 ) -> ModelStat:
-    eligibility = task.target_eligibility
     return ModelStat(
         target_group=task.group.name,
         target=task.target_name,
@@ -1777,14 +1435,7 @@ def _make_stat(
         n_edges=n_edges,
         importance_sum=importance_sum,
         fit_seconds=fit_seconds,
-        target_detected_cells=eligibility.detected_cells,
-        target_detected_fraction=eligibility.detected_fraction,
-        target_weighted_detected_fraction=task.target_weighted_detected_fraction,
-        target_weighted_detected_ess=task.target_weighted_detected_ess,
         n_estimators_fitted=n_estimators_fitted,
-        adaptive_converged=adaptive_converged,
-        convergence_delta=convergence_delta,
-        convergence_checks=convergence_checks,
         message=message,
     )
 
@@ -1801,9 +1452,6 @@ def _skipped_result(
     constant_predictors: tuple[str, ...],
     fit_seconds: float = 0.0,
     n_estimators_fitted: int = 0,
-    adaptive_converged: bool = False,
-    convergence_delta: float | None = None,
-    convergence_checks: int = 0,
 ) -> ModelResult:
     skipped = SkippedTargetRecord(
         target_group=task.group.name,
@@ -1821,9 +1469,6 @@ def _skipped_result(
         constant_predictors=constant_predictors,
         fit_seconds=fit_seconds,
         n_estimators_fitted=n_estimators_fitted,
-        adaptive_converged=adaptive_converged,
-        convergence_delta=convergence_delta,
-        convergence_checks=convergence_checks,
         message=detail,
     )
     return ModelResult(edges=(), skipped=skipped, stat=stat, trained=False)
@@ -1857,9 +1502,6 @@ def _result_from_fit_outcome(
             constant_predictors=constant_predictors,
             fit_seconds=outcome.fit_seconds,
             n_estimators_fitted=outcome.n_estimators_fitted,
-            adaptive_converged=outcome.adaptive_converged,
-            convergence_delta=outcome.convergence_delta,
-            convergence_checks=outcome.convergence_checks,
         )
     materially_negative = importances < -FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE
     if np.any(materially_negative):
@@ -1879,9 +1521,6 @@ def _result_from_fit_outcome(
             constant_predictors=constant_predictors,
             fit_seconds=outcome.fit_seconds,
             n_estimators_fitted=outcome.n_estimators_fitted,
-            adaptive_converged=outcome.adaptive_converged,
-            convergence_delta=outcome.convergence_delta,
-            convergence_checks=outcome.convergence_checks,
         )
 
     roundoff_negative = importances < 0.0
@@ -1939,13 +1578,8 @@ def _result_from_fit_outcome(
             importance_sum=importance_sum,
             fit_seconds=outcome.fit_seconds,
             n_estimators_fitted=outcome.n_estimators_fitted,
-            adaptive_converged=outcome.adaptive_converged,
-            convergence_delta=outcome.convergence_delta,
-            convergence_checks=outcome.convergence_checks,
             message=(
-                f"{skipped.detail}; {diagnostic_message}"
-                if diagnostic_message
-                else skipped.detail
+                f"{skipped.detail}; {diagnostic_message}" if diagnostic_message else skipped.detail
             ),
         )
         return ModelResult(edges=(), skipped=skipped, stat=stat, trained=True)
@@ -1962,9 +1596,6 @@ def _result_from_fit_outcome(
         importance_sum=importance_sum,
         fit_seconds=outcome.fit_seconds,
         n_estimators_fitted=outcome.n_estimators_fitted,
-        adaptive_converged=outcome.adaptive_converged,
-        convergence_delta=outcome.convergence_delta,
-        convergence_checks=outcome.convergence_checks,
         message=diagnostic_message,
     )
     return ModelResult(edges=edges, skipped=None, stat=stat, trained=True)
@@ -2006,23 +1637,6 @@ def _fit_model_prefix_task(
         )
 
     y = context.expression[:, task.target_index]
-    eligibility = task.target_eligibility
-    if context.target_eligibility_mode == "automatic" and not eligibility.eligible:
-        return repeat(
-            _skipped_result(
-                task,
-                context,
-                reason="target_not_estimable",
-                # Keep checkpoint strings from growing with one numeric message per
-                # model. The exact counts and fractions are already first-class
-                # fields in model_diagnostics.tsv.gz and target_eligibility.tsv.gz.
-                detail=f"automatic target eligibility rejected the target: {eligibility.reason}",
-                seed=seed,
-                n_predictors_used=len(selected_positions),
-                discarded=discarded,
-                constant_predictors=constant_predictors,
-            )
-        )
 
     n_positive = task.group.n_positive_weight_samples
     if n_positive < 2:
@@ -2039,32 +1653,6 @@ def _fit_model_prefix_task(
             )
         )
 
-    target_weighted_detected_fraction = task.target_weighted_detected_fraction
-    target_weighted_detected_ess = task.target_weighted_detected_ess
-    if context.target_eligibility_mode == "automatic":
-        if target_weighted_detected_fraction is None or target_weighted_detected_ess is None:
-            raise RuntimeError(
-                "eligible target model is missing its precomputed detection statistics"
-            )
-        if (
-            target_weighted_detected_fraction < context.min_target_weighted_detected_fraction
-            or target_weighted_detected_ess < context.min_target_weighted_detected_ess
-        ):
-            return repeat(
-                _skipped_result(
-                    task,
-                    context,
-                    reason="target_not_estimable",
-                    # The measured fraction/ESS and the configured thresholds are
-                    # structured diagnostics. Repeating them in free text would
-                    # create an effectively model-sized checkpoint symbol table.
-                    detail="automatic target eligibility rejected the group-specific model",
-                    seed=seed,
-                    n_predictors_used=len(selected_positions),
-                    discarded=discarded,
-                    constant_predictors=constant_predictors,
-                )
-            )
     positive_minimum = np.min(y, where=task.group.positive_mask, initial=np.inf)
     positive_maximum = np.max(y, where=task.group.positive_mask, initial=-np.inf)
     if positive_minimum == positive_maximum:
@@ -2128,26 +1716,14 @@ def _fit_model_prefix_task(
         x_model[:, self_variable_position:] = source[:, self_variable_position + 1 :]
 
     try:
-        fit_outcomes: tuple[_TreeFitOutcome, ...]
-        if len(estimator_counts) == 1:
-            fit_outcomes = (
-                _fit_tree_model(
-                    x_model,
-                    y,
-                    task.group.weights,
-                    context=context,
-                    seed=seed,
-                ),
-            )
-        else:
-            fit_outcomes = _fit_fixed_tree_prefixes(
-                x_model,
-                y,
-                task.group.weights,
-                context=context,
-                seed=seed,
-                estimator_counts=estimator_counts,
-            )
+        fit_outcomes = _fit_fixed_tree_prefixes(
+            x_model,
+            y,
+            task.group.weights,
+            context=context,
+            seed=seed,
+            estimator_counts=estimator_counts,
+        )
     except _TreeFitFailure as failure:
         detail = f"{type(failure.error).__name__}: {failure.error}"
         return repeat(
@@ -2162,8 +1738,6 @@ def _fit_model_prefix_task(
                 constant_predictors=constant_predictors,
                 fit_seconds=failure.fit_seconds,
                 n_estimators_fitted=failure.n_estimators_fitted,
-                convergence_delta=failure.convergence_delta,
-                convergence_checks=failure.convergence_checks,
             )
         )
 
@@ -2246,16 +1820,6 @@ def prepare_inference(
     min_samples_leaf: int = 1,
     max_depth: int | None = None,
     bootstrap: bool | None = None,
-    adaptive_trees: bool = False,
-    adaptive_min_estimators: int = DEFAULT_ADAPTIVE_MIN_ESTIMATORS,
-    adaptive_tree_step: int = DEFAULT_ADAPTIVE_TREE_STEP,
-    adaptive_tolerance: float = DEFAULT_ADAPTIVE_TOLERANCE,
-    adaptive_patience: int = DEFAULT_ADAPTIVE_PATIENCE,
-    target_eligibility: TargetEligibilityMode = DEFAULT_TARGET_ELIGIBILITY,
-    min_target_detected_cells: int = DEFAULT_MIN_TARGET_DETECTED_CELLS,
-    min_target_detected_fraction: float = DEFAULT_MIN_TARGET_DETECTED_FRACTION,
-    min_target_weighted_detected_fraction: float = (DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_FRACTION),
-    min_target_weighted_detected_ess: float = DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_ESS,
     random_seed: int = 123,
 ) -> PreparedInference:
     """Validate and materialize reusable state for one or more group networks.
@@ -2274,16 +1838,6 @@ def prepare_inference(
         min_samples_leaf=min_samples_leaf,
         max_depth=max_depth,
         bootstrap=bootstrap,
-        adaptive_trees=adaptive_trees,
-        adaptive_min_estimators=adaptive_min_estimators,
-        adaptive_tree_step=adaptive_tree_step,
-        adaptive_tolerance=adaptive_tolerance,
-        adaptive_patience=adaptive_patience,
-        target_eligibility=target_eligibility,
-        min_target_detected_cells=min_target_detected_cells,
-        min_target_detected_fraction=min_target_detected_fraction,
-        min_target_weighted_detected_fraction=min_target_weighted_detected_fraction,
-        min_target_weighted_detected_ess=min_target_weighted_detected_ess,
         random_seed=random_seed,
     )
     (
@@ -2295,13 +1849,6 @@ def prepare_inference(
         target_to_tf_position,
         target_expression_additional_nbytes,
     ) = _prepare_expression(expression, gene_names, tf_names, target_names)
-    eligibility_records = assess_target_eligibility(
-        expression64,
-        targets,
-        mode=target_eligibility,
-        min_detected_cells=int(min_target_detected_cells),
-        min_detected_fraction=float(min_target_detected_fraction),
-    )
     effective_bootstrap = tree_method == "random-forest" if bootstrap is None else bootstrap
     return PreparedInference(
         _expression=expression64,
@@ -2310,18 +1857,9 @@ def prepare_inference(
         target_names=targets,
         tf_names=tfs,
         _target_to_tf_position=target_to_tf_position,
-        target_eligibility=eligibility_records,
         _target_expression_additional_nbytes=target_expression_additional_nbytes,
         tree_method=tree_method,
         n_estimators=int(n_estimators),
-        adaptive_trees=adaptive_trees,
-        adaptive_min_estimators=int(adaptive_min_estimators),
-        adaptive_tree_step=int(adaptive_tree_step),
-        adaptive_tolerance=float(adaptive_tolerance),
-        adaptive_patience=int(adaptive_patience),
-        target_eligibility_mode=target_eligibility,
-        min_target_weighted_detected_fraction=float(min_target_weighted_detected_fraction),
-        min_target_weighted_detected_ess=float(min_target_weighted_detected_ess),
         max_features=max_features,
         min_samples_leaf=min_samples_leaf,
         max_depth=None if max_depth is None else int(max_depth),

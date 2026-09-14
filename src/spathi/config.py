@@ -16,8 +16,8 @@ DistanceMetric: TypeAlias = Literal["euclidean", "cosine"]
 KernelName: TypeAlias = Literal["gaussian", "exponential"]
 GroupSizeCorrection: TypeAlias = Literal["none", "cap-to-target"]
 TreeMethod: TypeAlias = Literal["extra-trees", "random-forest"]
-TargetEligibilityMode: TypeAlias = Literal["all", "automatic"]
 ThreadBudget: TypeAlias = Literal["auto"] | int
+ParallelBackend: TypeAlias = Literal["auto", "threads", "processes"]
 Bandwidth: TypeAlias = Literal["auto"] | int | float
 MaxFeatures: TypeAlias = Literal["sqrt", "log2"] | int | float
 GeneIdentifier: TypeAlias = Literal["name", "id"]
@@ -36,22 +36,13 @@ DISTANCE_METRICS: tuple[DistanceMetric, ...] = ("euclidean", "cosine")
 KERNEL_NAMES: tuple[KernelName, ...] = ("gaussian", "exponential")
 GROUP_SIZE_CORRECTIONS: tuple[GroupSizeCorrection, ...] = ("none", "cap-to-target")
 TREE_METHODS: tuple[TreeMethod, ...] = ("extra-trees", "random-forest")
-TARGET_ELIGIBILITY_MODES: tuple[TargetEligibilityMode, ...] = ("all", "automatic")
+PARALLEL_BACKENDS: tuple[ParallelBackend, ...] = ("auto", "threads", "processes")
 MAX_FEATURES_NAMES: tuple[Literal["sqrt", "log2"], ...] = ("sqrt", "log2")
 MAX_RANDOM_SEED = 2**32 - 1
 DEFAULT_DISTANCE_METRIC: DistanceMetric = "cosine"
 DEFAULT_BANDWIDTH_SCALE: float = 1.0
 DEFAULT_N_ESTIMATORS = 250
 DEFAULT_MAX_FEATURES: MaxFeatures = "sqrt"
-DEFAULT_TARGET_ELIGIBILITY: TargetEligibilityMode = "all"
-DEFAULT_MIN_TARGET_DETECTED_CELLS = 20
-DEFAULT_MIN_TARGET_DETECTED_FRACTION = 0.01
-DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_FRACTION = 0.01
-DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_ESS = 10.0
-DEFAULT_ADAPTIVE_MIN_ESTIMATORS = 100
-DEFAULT_ADAPTIVE_TREE_STEP = 50
-DEFAULT_ADAPTIVE_TOLERANCE = 0.01
-DEFAULT_ADAPTIVE_PATIENCE = 2
 DEFAULT_THREADS: ThreadBudget = "auto"
 GENE_IDENTIFIERS: tuple[GeneIdentifier, ...] = ("name", "id")
 DUPLICATE_GENE_POLICIES: tuple[DuplicateGenePolicy, ...] = ("sum", "error")
@@ -59,31 +50,6 @@ PREPARATION_NORMALIZATIONS: tuple[PreparationNormalization, ...] = ("library-siz
 DEFAULT_PREPARE_MIN_CELLS = 300
 DEFAULT_PREPARE_MIN_GENE_CELLS = 1
 DEFAULT_PREPARE_TARGET_SUM = 10_000.0
-
-
-def adaptive_convergence_schedule(
-    *,
-    n_estimators: int,
-    minimum_estimators: int,
-    estimator_step: int,
-    patience: int,
-) -> tuple[int, int | None]:
-    """Return maximum eligible checks and the earliest possible adaptive stop.
-
-    Ensembles start with one ``estimator_step`` block and grow cumulatively to
-    ``n_estimators``. A convergence check requires a previous block and the configured
-    minimum tree count; stopping requires ``patience`` complete prior checkpoints,
-    including checkpoints collected before that minimum.
-    """
-
-    total_fits = (n_estimators + estimator_step - 1) // estimator_step
-    first_check_fit = max(2, (minimum_estimators + estimator_step - 1) // estimator_step)
-    maximum_checks = max(0, total_fits - first_check_fit + 1)
-    first_stop_fit = max(first_check_fit, patience + 1)
-    first_stop_estimators = (
-        None if first_stop_fit > total_fits else min(n_estimators, first_stop_fit * estimator_step)
-    )
-    return maximum_checks, first_stop_estimators
 
 
 def _coerce_path(field_name: str, value: object) -> Path:
@@ -123,21 +89,17 @@ def _validate_integer(
 def _coerce_positive_float(
     field_name: str,
     value: object,
-    *,
-    maximum: float | None = None,
 ) -> float:
-    """Return a finite positive built-in number, optionally bounded above."""
+    """Return a finite positive built-in number."""
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{field_name} must be a number")
-    requirement = (
-        "a positive finite number" if maximum is None else f"in the interval (0, {maximum:g}]"
-    )
+    requirement = "a positive finite number"
     try:
         numeric = float(value)
     except OverflowError as exc:
         raise ValueError(f"{field_name} must be {requirement}") from exc
-    if not isfinite(numeric) or numeric <= 0 or (maximum is not None and numeric > maximum):
+    if not isfinite(numeric) or numeric <= 0:
         raise ValueError(f"{field_name} must be {requirement}")
     return numeric
 
@@ -237,18 +199,9 @@ class SpathiConfig:
     min_samples_leaf: int = 1
     max_depth: int | None = None
     bootstrap: bool | None = None
-    adaptive_trees: bool = False
-    adaptive_min_estimators: int = DEFAULT_ADAPTIVE_MIN_ESTIMATORS
-    adaptive_tree_step: int = DEFAULT_ADAPTIVE_TREE_STEP
-    adaptive_tolerance: float = DEFAULT_ADAPTIVE_TOLERANCE
-    adaptive_patience: int = DEFAULT_ADAPTIVE_PATIENCE
-    target_eligibility: TargetEligibilityMode = DEFAULT_TARGET_ELIGIBILITY
-    min_target_detected_cells: int = DEFAULT_MIN_TARGET_DETECTED_CELLS
-    min_target_detected_fraction: float = DEFAULT_MIN_TARGET_DETECTED_FRACTION
-    min_target_weighted_detected_fraction: float = DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_FRACTION
-    min_target_weighted_detected_ess: float = DEFAULT_MIN_TARGET_WEIGHTED_DETECTED_ESS
     random_seed: int = 123
     threads: ThreadBudget = DEFAULT_THREADS
+    parallel_backend: ParallelBackend = "auto"
     report: bool = True
     target_list: Path | None = None
     centroid_weights: Path | None = None
@@ -335,84 +288,12 @@ class SpathiConfig:
             _validate_integer("max_depth", self.max_depth, minimum=1)
         if self.bootstrap is not None and type(self.bootstrap) is not bool:
             raise TypeError("bootstrap must be a boolean or None")
-        if type(self.adaptive_trees) is not bool:
-            raise TypeError("adaptive_trees must be a boolean")
-        _validate_integer(
-            "adaptive_min_estimators",
-            self.adaptive_min_estimators,
-            minimum=1,
-        )
-        _validate_integer("adaptive_tree_step", self.adaptive_tree_step, minimum=1)
-        _validate_integer("adaptive_patience", self.adaptive_patience, minimum=1)
-        object.__setattr__(
-            self,
-            "adaptive_tolerance",
-            _coerce_positive_float(
-                "adaptive_tolerance",
-                self.adaptive_tolerance,
-                maximum=1.0,
-            ),
-        )
-        if self.adaptive_trees and self.adaptive_min_estimators >= self.n_estimators:
-            raise ValueError(
-                "adaptive_min_estimators must be smaller than n_estimators when "
-                "adaptive_trees is enabled"
-            )
-        if self.adaptive_trees:
-            _maximum_checks, first_stop = adaptive_convergence_schedule(
-                n_estimators=self.n_estimators,
-                minimum_estimators=self.adaptive_min_estimators,
-                estimator_step=self.adaptive_tree_step,
-                patience=self.adaptive_patience,
-            )
-            if first_stop is None:
-                raise ValueError(
-                    "adaptive tree budget cannot satisfy adaptive_patience at or before "
-                    "n_estimators; reduce adaptive_tree_step, adaptive_min_estimators, "
-                    "or adaptive_patience"
-                )
-
-        _validate_choice(
-            "target_eligibility",
-            self.target_eligibility,
-            TARGET_ELIGIBILITY_MODES,
-        )
-        _validate_integer(
-            "min_target_detected_cells",
-            self.min_target_detected_cells,
-            minimum=1,
-        )
-        object.__setattr__(
-            self,
-            "min_target_detected_fraction",
-            _coerce_positive_float(
-                "min_target_detected_fraction",
-                self.min_target_detected_fraction,
-                maximum=1.0,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "min_target_weighted_detected_fraction",
-            _coerce_positive_float(
-                "min_target_weighted_detected_fraction",
-                self.min_target_weighted_detected_fraction,
-                maximum=1.0,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "min_target_weighted_detected_ess",
-            _coerce_positive_float(
-                "min_target_weighted_detected_ess",
-                self.min_target_weighted_detected_ess,
-            ),
-        )
         _validate_integer("random_seed", self.random_seed, minimum=0)
         if self.random_seed > MAX_RANDOM_SEED:
             raise ValueError(f"random_seed must be at most {MAX_RANDOM_SEED}")
         if self.threads != "auto":
             _validate_integer("threads", self.threads, minimum=1)
+        _validate_choice("parallel_backend", self.parallel_backend, PARALLEL_BACKENDS)
         if type(self.report) is not bool:
             raise TypeError("report must be a boolean")
 

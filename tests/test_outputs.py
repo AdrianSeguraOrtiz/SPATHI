@@ -160,9 +160,7 @@ def test_weight_artifacts_identify_each_numerically_canonicalized_cell(tmp_path:
 
     with IncrementalRunWriter(output_dir) as writer:
         writer.write_weights(weights)
-        writer.write_weight_diagnostics(
-            compute_weight_diagnostics(weights, emit_warnings=False)
-        )
+        writer.write_weight_diagnostics(compute_weight_diagnostics(weights, emit_warnings=False))
 
     cells = pd.read_csv(output_dir / "cell_weights.tsv.gz", sep="\t")
     assert cells["final_weight"].tolist() == [1.0, 0.0]

@@ -1,5 +1,4 @@
 import sqlite3
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -131,14 +130,7 @@ def dense_model_result(*, edge_count: int = 600) -> ModelResult:
             n_edges=edge_count,
             importance_sum=1.0,
             fit_seconds=0.8125,
-            target_detected_cells=5_432,
-            target_detected_fraction=5_432 / 9_806,
-            target_weighted_detected_ess=4_001.25,
-            target_weighted_detected_fraction=0.625,
             n_estimators_fitted=768,
-            adaptive_converged=True,
-            convergence_delta=0.00125,
-            convergence_checks=5,
         ),
         trained=True,
     )
@@ -175,41 +167,6 @@ def skipped_model_result() -> ModelResult:
     )
 
 
-def not_estimable_model_result() -> ModelResult:
-    detail = "target does not meet the configured detection thresholds"
-    return ModelResult(
-        edges=(),
-        skipped=SkippedTargetRecord(
-            target_group="A",
-            target="G",
-            reason="target_not_estimable",
-            detail=detail,
-        ),
-        stat=ModelStat(
-            target_group="A",
-            target="G",
-            status="target_not_estimable",
-            random_seed=11,
-            n_samples=10_000,
-            n_positive_weight_samples=9_000,
-            weight_sum=8_100.0,
-            n_predictors_input=600,
-            n_predictors_used=600,
-            discarded_predictors=(),
-            constant_predictors=(),
-            n_edges=0,
-            importance_sum=0.0,
-            fit_seconds=0.0,
-            target_detected_cells=12,
-            target_detected_fraction=0.0012,
-            target_weighted_detected_ess=7.5,
-            target_weighted_detected_fraction=0.0009,
-            message=detail,
-        ),
-        trained=False,
-    )
-
-
 def test_checkpoint_round_trips_one_committed_model(tmp_path: Path) -> None:
     directory = tmp_path / "checkpoint"
     directory.mkdir()
@@ -232,7 +189,7 @@ def test_checkpoint_round_trips_one_committed_model(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "expected",
-    [model_result(), skipped_model_result(), not_estimable_model_result()],
+    [model_result(), skipped_model_result()],
 )
 def test_binary_codec_round_trips_trained_and_skipped_models_exactly(
     tmp_path: Path,
@@ -246,63 +203,6 @@ def test_binary_codec_round_trips_trained_and_skipped_models_exactly(
 
     with ModelCheckpoint(directory, identity=identity(), resume=True) as checkpoint:
         assert tuple(checkpoint.iter_results()) == (expected,)
-
-
-@pytest.mark.parametrize(
-    ("weighted_fraction", "weighted_ess"),
-    [(None, None), (0.0, 0.0), (0.4375, 1.5)],
-)
-def test_binary_codec_preserves_optional_weighted_detected_fraction(
-    tmp_path: Path,
-    weighted_fraction: float | None,
-    weighted_ess: float | None,
-) -> None:
-    base = model_result()
-    expected = replace(
-        base,
-        stat=replace(
-            base.stat,
-            target_weighted_detected_fraction=weighted_fraction,
-            target_weighted_detected_ess=weighted_ess,
-        ),
-    )
-    directory = tmp_path / "checkpoint"
-    directory.mkdir()
-    with ModelCheckpoint(directory, identity=identity(), resume=False) as checkpoint:
-        checkpoint.validate_or_record_weights("A", [1.0, 1.0, 1.0])
-        checkpoint.record_result(expected)
-
-    with ModelCheckpoint(directory, identity=identity(), resume=True) as checkpoint:
-        assert tuple(checkpoint.iter_results()) == (expected,)
-
-
-def test_checkpoint_rejects_noncanonical_absent_weighted_detected_fraction(
-    tmp_path: Path,
-) -> None:
-    directory = tmp_path / "checkpoint"
-    directory.mkdir()
-    with ModelCheckpoint(directory, identity=identity(), resume=False) as checkpoint:
-        checkpoint.validate_or_record_weights("A", [1.0, 1.0, 1.0])
-        checkpoint.record_result(model_result())
-
-    connection = sqlite3.connect(directory / "checkpoint.sqlite3")
-    payload = bytes(connection.execute("SELECT payload FROM model_results").fetchone()[0])
-    header_values = list(checkpoint_module._MODEL_PAYLOAD_HEADER.unpack_from(payload))
-    header_values[18] = 0.5
-    changed = (
-        checkpoint_module._MODEL_PAYLOAD_HEADER.pack(*header_values)
-        + payload[checkpoint_module._MODEL_PAYLOAD_HEADER.size :]
-    )
-    with connection:
-        connection.execute(
-            "UPDATE model_results SET payload = ?, payload_sha256 = ?",
-            (changed, checkpoint_module._model_payload_sha256("A", "G", changed)),
-        )
-    connection.close()
-
-    with ModelCheckpoint(directory, identity=identity(), resume=True) as checkpoint:
-        with pytest.raises(RuntimeError, match="invalid model-result payload"):
-            tuple(checkpoint.iter_results())
 
 
 def test_binary_payload_interns_edge_strings_and_is_compact(tmp_path: Path) -> None:

@@ -33,23 +33,9 @@ _DATABASE_NAME = "checkpoint.sqlite3"
 _LOCK_DATABASE_NAME = "run-lock.sqlite3"
 _SQLITE_SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _MODEL_PAYLOAD_MAGIC = b"SPTHMODL"
-_MODEL_PAYLOAD_HEADER = struct.Struct("<8sBBBIQQIIdIIIddQdddIdIQQQQQ")
+_MODEL_PAYLOAD_HEADER = struct.Struct("<8sBBIQQIIdIIIddIQQQQQ")
 _MAX_SQLITE_ID = (1 << 63) - 1
 _MAX_UINT32 = (1 << 32) - 1
-_MODEL_FLAG_TARGET_DETECTED_CELLS = 1 << 0
-_MODEL_FLAG_TARGET_DETECTED_FRACTION = 1 << 1
-_MODEL_FLAG_TARGET_WEIGHTED_DETECTED_ESS = 1 << 2
-_MODEL_FLAG_CONVERGENCE_DELTA = 1 << 3
-_MODEL_FLAG_ADAPTIVE_CONVERGED = 1 << 4
-_MODEL_FLAG_TARGET_WEIGHTED_DETECTED_FRACTION = 1 << 5
-_MODEL_KNOWN_FLAGS = (
-    _MODEL_FLAG_TARGET_DETECTED_CELLS
-    | _MODEL_FLAG_TARGET_DETECTED_FRACTION
-    | _MODEL_FLAG_TARGET_WEIGHTED_DETECTED_ESS
-    | _MODEL_FLAG_CONVERGENCE_DELTA
-    | _MODEL_FLAG_ADAPTIVE_CONVERGED
-    | _MODEL_FLAG_TARGET_WEIGHTED_DETECTED_FRACTION
-)
 _ID_DTYPES: Mapping[int, np.dtype[Any]] = {
     1: np.dtype("u1"),
     2: np.dtype("<u2"),
@@ -65,7 +51,6 @@ _STATUS_TO_CODE: Mapping[ModelStatus, int] = {
     "no_variable_predictors": 5,
     "model_fit_failed": 6,
     "invalid_feature_importances": 7,
-    "target_not_estimable": 8,
 }
 _CODE_TO_STATUS = {code: status for status, code in _STATUS_TO_CODE.items()}
 CHECKPOINT_OWNED_FILENAMES = frozenset(
@@ -86,7 +71,6 @@ _SCIENTIFIC_IMPLEMENTATION_FILES = (
     "parallel.py",
     "representation.py",
     "resources.py",
-    "targeting.py",
     "weighting.py",
 )
 
@@ -316,54 +300,6 @@ def _result_payload(
         _MAX_UINT32,
         label="n_estimators_fitted",
     )
-    convergence_checks = _validated_uint(
-        stat.convergence_checks,
-        _MAX_UINT32,
-        label="convergence_checks",
-    )
-    flags = 0
-    if stat.target_detected_cells is None:
-        target_detected_cells = 0
-    else:
-        flags |= _MODEL_FLAG_TARGET_DETECTED_CELLS
-        target_detected_cells = _validated_uint(
-            stat.target_detected_cells,
-            _MAX_SQLITE_ID,
-            label="target_detected_cells",
-        )
-    optional_floats = (
-        (
-            stat.target_detected_fraction,
-            _MODEL_FLAG_TARGET_DETECTED_FRACTION,
-            "target_detected_fraction",
-        ),
-        (
-            stat.target_weighted_detected_ess,
-            _MODEL_FLAG_TARGET_WEIGHTED_DETECTED_ESS,
-            "target_weighted_detected_ess",
-        ),
-        (
-            stat.target_weighted_detected_fraction,
-            _MODEL_FLAG_TARGET_WEIGHTED_DETECTED_FRACTION,
-            "target_weighted_detected_fraction",
-        ),
-        (stat.convergence_delta, _MODEL_FLAG_CONVERGENCE_DELTA, "convergence_delta"),
-    )
-    encoded_optional_floats: list[float] = []
-    for numeric_value, flag, label in optional_floats:
-        if numeric_value is None:
-            encoded_optional_floats.append(0.0)
-        else:
-            flags |= flag
-            encoded_optional_floats.append(_finite_float(numeric_value, label=label))
-    (
-        target_detected_fraction,
-        target_weighted_detected_ess,
-        target_weighted_detected_fraction,
-        convergence_delta,
-    ) = encoded_optional_floats
-    if stat.adaptive_converged:
-        flags |= _MODEL_FLAG_ADAPTIVE_CONVERGED
     discarded_ids = tuple(symbol_ids[value] for value in stat.discarded_predictors)
     constant_ids = tuple(symbol_ids[value] for value in stat.constant_predictors)
     source_ids = tuple(symbol_ids[edge.source] for edge in ordered_edges)
@@ -379,7 +315,6 @@ def _result_payload(
         _MODEL_PAYLOAD_MAGIC,
         status_code,
         width,
-        flags,
         random_seed,
         n_samples,
         n_positive,
@@ -391,13 +326,7 @@ def _result_payload(
         len(ordered_edges),
         _finite_float(stat.importance_sum, label="importance_sum"),
         _finite_float(stat.fit_seconds, label="fit_seconds"),
-        target_detected_cells,
-        target_detected_fraction,
-        target_weighted_detected_ess,
-        target_weighted_detected_fraction,
         n_estimators_fitted,
-        convergence_delta,
-        convergence_checks,
         symbol_ids[stat.message],
         skipped_detail_id,
         edge_context_id,
@@ -436,7 +365,6 @@ def _result_from_payload(
             magic,
             status_code,
             width,
-            flags,
             random_seed,
             n_samples,
             n_positive_weight_samples,
@@ -448,13 +376,7 @@ def _result_from_payload(
             n_edges,
             importance_sum,
             fit_seconds,
-            encoded_target_detected_cells,
-            encoded_target_detected_fraction,
-            encoded_target_weighted_detected_ess,
-            encoded_target_weighted_detected_fraction,
             n_estimators_fitted,
-            encoded_convergence_delta,
-            convergence_checks,
             message_id,
             skipped_detail_id,
             edge_context_id,
@@ -463,8 +385,6 @@ def _result_from_payload(
         ) = _MODEL_PAYLOAD_HEADER.unpack_from(payload)
         if magic != _MODEL_PAYLOAD_MAGIC:
             raise ValueError("model payload magic is invalid")
-        if flags & ~_MODEL_KNOWN_FLAGS:
-            raise ValueError("model payload contains unknown flags")
         try:
             id_dtype = _ID_DTYPES[width]
         except KeyError as exc:
@@ -477,57 +397,11 @@ def _result_from_payload(
             ("weight_sum", weight_sum),
             ("importance_sum", importance_sum),
             ("fit_seconds", fit_seconds),
-            ("target_detected_fraction", encoded_target_detected_fraction),
-            ("target_weighted_detected_ess", encoded_target_weighted_detected_ess),
-            (
-                "target_weighted_detected_fraction",
-                encoded_target_weighted_detected_fraction,
-            ),
-            ("convergence_delta", encoded_convergence_delta),
         ):
             if not np.isfinite(value):
                 raise ValueError(f"{label} must be finite")
         if n_samples > _MAX_SQLITE_ID or n_positive_weight_samples > _MAX_SQLITE_ID:
             raise ValueError("model sample count exceeds the codec range")
-        if encoded_target_detected_cells > _MAX_SQLITE_ID:
-            raise ValueError("target_detected_cells exceeds the codec range")
-
-        def optional_float(encoded: float, flag: int, *, label: str) -> float | None:
-            if flags & flag:
-                return encoded
-            if encoded != 0.0:
-                raise ValueError(f"absent {label} must use the canonical zero placeholder")
-            return None
-
-        if flags & _MODEL_FLAG_TARGET_DETECTED_CELLS:
-            target_detected_cells: int | None = encoded_target_detected_cells
-        else:
-            if encoded_target_detected_cells != 0:
-                raise ValueError(
-                    "absent target_detected_cells must use the canonical zero placeholder"
-                )
-            target_detected_cells = None
-        target_detected_fraction = optional_float(
-            encoded_target_detected_fraction,
-            _MODEL_FLAG_TARGET_DETECTED_FRACTION,
-            label="target_detected_fraction",
-        )
-        target_weighted_detected_ess = optional_float(
-            encoded_target_weighted_detected_ess,
-            _MODEL_FLAG_TARGET_WEIGHTED_DETECTED_ESS,
-            label="target_weighted_detected_ess",
-        )
-        target_weighted_detected_fraction = optional_float(
-            encoded_target_weighted_detected_fraction,
-            _MODEL_FLAG_TARGET_WEIGHTED_DETECTED_FRACTION,
-            label="target_weighted_detected_fraction",
-        )
-        convergence_delta = optional_float(
-            encoded_convergence_delta,
-            _MODEL_FLAG_CONVERGENCE_DELTA,
-            label="convergence_delta",
-        )
-        adaptive_converged = bool(flags & _MODEL_FLAG_ADAPTIVE_CONVERGED)
 
         trained = status in {"trained", "trained_no_positive_importance"}
         if status == "trained":
@@ -641,14 +515,7 @@ def _result_from_payload(
             n_edges=n_edges,
             importance_sum=importance_sum,
             fit_seconds=fit_seconds,
-            target_detected_cells=target_detected_cells,
-            target_detected_fraction=target_detected_fraction,
-            target_weighted_detected_ess=target_weighted_detected_ess,
-            target_weighted_detected_fraction=target_weighted_detected_fraction,
             n_estimators_fitted=n_estimators_fitted,
-            adaptive_converged=adaptive_converged,
-            convergence_delta=convergence_delta,
-            convergence_checks=convergence_checks,
             message=message,
         )
         result = ModelResult(edges=edges, skipped=skipped, stat=stat, trained=trained)

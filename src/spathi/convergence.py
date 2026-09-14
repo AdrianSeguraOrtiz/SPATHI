@@ -7,16 +7,18 @@ Every logical estimator count is a prefix of one fitted maximum forest.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
 from threadpoolctl import threadpool_limits
 
-from spathi._workflow import validate_group_configuration
+from spathi._workflow import _plan_inference_execution, validate_group_configuration
 from spathi.centroids import compute_centroids
 from spathi.config import SpathiConfig, ThreadBudget
 from spathi.distances import (
@@ -30,8 +32,12 @@ from spathi.inference import (
 )
 from spathi.io import load_inputs
 from spathi.kernels import BandwidthSelection, resolve_bandwidth_for_mode
+from spathi.parallel import PersistentTaskExecutor, available_cpu_count
 from spathi.representation import RepresentationResult, compute_distance_representation
+from spathi.resources import estimate_model_memory_bytes
 from spathi.weighting import WeightResult, compute_weights, prepare_weighting_context
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -44,7 +50,7 @@ class PreparedForestPrefixes:
     estimator_counts: tuple[int, ...]
     bandwidth: BandwidthSelection
     representation: RepresentationResult
-    threads: ThreadBudget
+    config: SpathiConfig
 
     def __post_init__(self) -> None:
         if not self.group_order or len(set(self.group_order)) != len(self.group_order):
@@ -80,15 +86,61 @@ class PreparedForestPrefixes:
         target_batch_size: int,
         threads: ThreadBudget | None = None,
     ) -> Iterator[tuple[InferencePrefixResult, ...]]:
-        """Yield all estimator prefixes in bounded canonical target batches."""
+        """Yield canonical prefix batches; the requested size is a memory-bounded maximum."""
 
-        yield from self.prepared_inference.iter_group_target_prefix_batches(
-            self.group_weights,
-            estimator_counts=self.estimator_counts,
-            target_batch_size=target_batch_size,
-            group_order=self.group_order,
-            threads=self.threads if threads is None else threads,
+        if type(target_batch_size) is not int or target_batch_size < 1:
+            raise ValueError("target_batch_size must be a positive integer")
+        config = self.config if threads is None else replace(self.config, threads=threads)
+        prepared = self.prepared_inference
+        model_bytes = estimate_model_memory_bytes(
+            n_cells=prepared.n_cells,
+            n_transcription_factors=len(prepared.tf_names),
+            n_estimators=prepared.n_estimators,
+            min_samples_leaf=prepared.min_samples_leaf,
+            max_depth=prepared.max_depth,
         )
+        model_bytes += prepared.n_estimators * len(prepared.tf_names) * 8
+        plan = _plan_inference_execution(
+            config=config,
+            n_cells=prepared.n_cells,
+            n_groups=len(self.group_order),
+            n_targets=prepared.n_targets,
+            n_transcription_factors=len(prepared.tf_names),
+            predictor_bytes=prepared.predictor_nbytes,
+            response_bytes=prepared.expression_nbytes,
+            remaining_models=len(self.group_order) * prepared.n_targets,
+            available_threads=available_cpu_count(),
+            estimated_model_bytes=model_bytes,
+            checkpoint_enabled=False,
+            result_multiplier=len(self.estimator_counts),
+        )
+        batch_size = min(target_batch_size, plan.batch.target_batch_size)
+        group_batch_size = plan.batch.group_batch_size if batch_size == prepared.n_targets else 1
+        LOGGER.info(
+            "Prefix inference backend %s; up to %d targets and %d groups per batch: %s",
+            plan.parallel.backend,
+            batch_size,
+            group_batch_size,
+            plan.backend_reason,
+        )
+        with PersistentTaskExecutor(
+            plan.parallel,
+            process_window_size=(
+                batch_size * group_batch_size if plan.parallel.backend == "loky" else None
+            ),
+        ) as executor:
+            group_weights = self.group_weights
+            for start in range(0, len(self.group_order), group_batch_size):
+                groups = self.group_order[start : start + group_batch_size]
+                weights: dict[object, ArrayLike] = {group: group_weights[group] for group in groups}
+                yield from prepared.iter_group_target_prefix_batches(
+                    weights,
+                    estimator_counts=self.estimator_counts,
+                    target_batch_size=batch_size,
+                    group_order=groups,
+                    threads=config.threads,
+                    executor=executor,
+                )
 
 
 def prepare_forest_prefixes(
@@ -107,8 +159,6 @@ def prepare_forest_prefixes(
 
     if not isinstance(config, SpathiConfig):
         raise TypeError("config must be a SpathiConfig instance")
-    if config.adaptive_trees:
-        raise ValueError("forest prefix studies require adaptive_trees=False")
     counts = tuple(estimator_counts)
     if not counts:
         raise ValueError("estimator_counts cannot be empty")
@@ -206,16 +256,6 @@ def prepare_forest_prefixes(
         min_samples_leaf=config.min_samples_leaf,
         max_depth=config.max_depth,
         bootstrap=config.bootstrap,
-        adaptive_trees=False,
-        adaptive_min_estimators=config.adaptive_min_estimators,
-        adaptive_tree_step=config.adaptive_tree_step,
-        adaptive_tolerance=config.adaptive_tolerance,
-        adaptive_patience=config.adaptive_patience,
-        target_eligibility=config.target_eligibility,
-        min_target_detected_cells=config.min_target_detected_cells,
-        min_target_detected_fraction=config.min_target_detected_fraction,
-        min_target_weighted_detected_fraction=config.min_target_weighted_detected_fraction,
-        min_target_weighted_detected_ess=config.min_target_weighted_detected_ess,
         random_seed=config.random_seed,
     )
     return PreparedForestPrefixes(
@@ -225,7 +265,7 @@ def prepare_forest_prefixes(
         estimator_counts=counts,
         bandwidth=bandwidth,
         representation=representation,
-        threads=config.threads,
+        config=config,
     )
 
 

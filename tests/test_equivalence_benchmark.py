@@ -13,8 +13,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from spathi import _workflow as workflow
-from spathi.outputs import MODEL_DIAGNOSTIC_COLUMNS
+from spathi.outputs import CELL_WEIGHT_COLUMNS, MODEL_DIAGNOSTIC_COLUMNS, WEIGHT_DIAGNOSTIC_COLUMNS
 
 
 def _load_benchmark_module() -> ModuleType:
@@ -86,16 +85,14 @@ def test_available_cpu_count_is_never_below_one(
     assert benchmark.available_cpu_count() == 1
 
 
-def test_benchmark_schema_tracks_current_optimization_diagnostics(
+def test_benchmark_schema_matches_published_diagnostic_tables(
     benchmark: ModuleType,
 ) -> None:
-    """Fail immediately if SPATHI evolves either optimization audit table."""
+    """Compare complete current headers, including scientific weight canonicalization."""
 
     assert benchmark._TABLE_COLUMNS["model_diagnostics.tsv.gz"] == MODEL_DIAGNOSTIC_COLUMNS
-    assert (
-        benchmark._TABLE_COLUMNS["target_eligibility.tsv.gz"]
-        == workflow._TARGET_ELIGIBILITY_COLUMNS
-    )
+    assert benchmark._TABLE_COLUMNS["weight_diagnostics.tsv"] == WEIGHT_DIAGNOSTIC_COLUMNS
+    assert benchmark._TABLE_COLUMNS["cell_weights.tsv.gz"] == CELL_WEIGHT_COLUMNS
 
 
 def _hash(path: Path) -> str:
@@ -303,16 +300,6 @@ def _profile_document(*, targets: list[int] | None = None) -> dict[str, object]:
             "min_samples_leaf": 1,
             "max_depth": None,
             "bootstrap": False,
-            "adaptive_trees": False,
-            "adaptive_min_estimators": 100,
-            "adaptive_tree_step": 50,
-            "adaptive_tolerance": 0.01,
-            "adaptive_patience": 2,
-            "target_eligibility": "all",
-            "min_target_detected_cells": 20,
-            "min_target_detected_fraction": 0.01,
-            "min_target_weighted_detected_fraction": 0.01,
-            "min_target_weighted_detected_ess": 10.0,
         },
         "defaults": {
             "target_counts": [4] if targets is None else targets,
@@ -519,8 +506,6 @@ def test_full_target_profile_requires_a_dataset_and_omits_target_list(
     assert command[command.index("--max-features") + 1] == "sqrt"
     assert command[command.index("--bandwidth-scale") + 1] == "1.0"
     assert "--no-bootstrap" in command
-    assert "--no-adaptive-trees" in command
-    assert command[command.index("--target-eligibility") + 1] == "all"
     resumed_command = benchmark.build_infer_command(
         SimpleNamespace(snapshot_parent=tmp_path / "snapshot"),
         dataset,
@@ -777,8 +762,6 @@ def test_canonical_table_comparison_tolerates_only_declared_numeric_delta_and_fi
             "importance_sum": "1.0",
             "fit_seconds": "0.2",
             "n_estimators_fitted": "5",
-            "adaptive_converged": "False",
-            "convergence_checks": "0",
         }
     )
     candidate_row = {**reference_row, "weight_sum": "10.00000000001", "fit_seconds": "9.8"}
@@ -800,7 +783,7 @@ def test_canonical_table_comparison_tolerates_only_declared_numeric_delta_and_fi
         relative_tolerance=0.0,
     )
     assert equivalent.equivalent
-    assert equivalent.numeric_values_compared == 10
+    assert equivalent.numeric_values_compared == 9
 
     candidate.write_bytes(reference.read_bytes())
     byte_identical = benchmark.compare_table(
@@ -825,6 +808,32 @@ def test_canonical_table_comparison_tolerates_only_declared_numeric_delta_and_fi
     )
     assert not different.equivalent
     assert "status" in different.first_mismatches[0]
+
+
+def test_parameter_comparison_separates_execution_backend_from_scientific_settings(
+    benchmark: ModuleType,
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.json"
+    candidate = tmp_path / "candidate.json"
+    scientific = {"n_estimators": 250, "max_features": 0.5, "random_seed": 123}
+    reference.write_text(
+        json.dumps({**scientific, "output_dir": "first", "parallel_backend": "threads"}),
+        encoding="utf-8",
+    )
+    candidate.write_text(
+        json.dumps({**scientific, "output_dir": "second", "parallel_backend": "processes"}),
+        encoding="utf-8",
+    )
+
+    assert benchmark._normalized_parameters(reference) == benchmark._normalized_parameters(
+        candidate
+    )
+
+    candidate.write_text(json.dumps({**scientific, "max_features": 1.0}), encoding="utf-8")
+    assert benchmark._normalized_parameters(reference) != benchmark._normalized_parameters(
+        candidate
+    )
 
 
 def test_run_metadata_audit_pins_inputs_and_scientific_controls(
@@ -878,16 +887,6 @@ def test_run_metadata_audit_pins_inputs_and_scientific_controls(
             "min_samples_leaf": 1,
             "max_depth": None,
             "bootstrap": False,
-            "adaptive_trees": False,
-            "adaptive_min_estimators": 100,
-            "adaptive_tree_step": 50,
-            "adaptive_tolerance": 0.01,
-            "adaptive_patience": 2,
-            "target_eligibility": "all",
-            "min_target_detected_cells": 20,
-            "min_target_detected_fraction": 0.01,
-            "min_target_weighted_detected_fraction": 0.01,
-            "min_target_weighted_detected_ess": 10.0,
             "report": False,
         },
         "checkpoint": {"enabled": False, "resumed": False},

@@ -322,55 +322,14 @@ that source/target pair. The authoritative model-level values are
 `cell_weights.tsv.gz:final_weight`; their exact effective source-group mass is reported
 in `weight_diagnostics.tsv`.
 
-## Target estimability policy
+## Requested targets and model validity
 
-Target selection and target estimability are distinct. `target_list` defines the
-requested response universe. The default `target_eligibility=all` attempts that entire
-universe and deliberately performs no extra expression scan. The optional
-`target_eligibility=automatic` applies an auditable compute-saving policy without
-changing the distance genes or the TF predictor universe.
-
-For target \(t\), define detected cells as
-
-\[
-D_t = \{i : x_{it} > 0\}.
-\]
-
-All input values have already passed finite-value validation. Automatic mode further
-requires non-negative, zero-preserving target expression; centered or otherwise signed
-inputs must use the `all` policy because zero no longer denotes non-detection in those
-spaces. Globally, an automatic target is eligible only when its detected-cell count is
-at least both the configured
-absolute minimum and the smallest integer satisfying the configured detected fraction,
-and when its exact finite minimum and maximum differ. The min/max comparison avoids the
-underflow and overflow failure modes of explicitly computing variance. The chosen
-integer threshold is corrected at floating-point boundaries so, for example, seven of
-100 cells satisfies a configured fraction of 0.07.
-
-For each group-specific weight vector \(w^{(c)}\), SPATHI then computes
-
-\[
-r_{t,c} =
-\frac{\sum_{i\in D_t} w_i^{(c)}}{\sum_i w_i^{(c)}},
-\qquad
-\operatorname{ESS}_{t,c} =
-\frac{\left(\sum_{i\in D_t}w_i^{(c)}\right)^2}
-{\sum_{i\in D_t}\left(w_i^{(c)}\right)^2}.
-\]
-
-Both the weighted detected fraction and detected-cell ESS must reach their configured
-minimum. This prevents either a tiny amount of total model weight or many negligible
-weights from making a response appear adequately supported. A rejected target still
-exists in the requested output accounting and is recorded for every affected group as
-`target_not_estimable`; if it is a supplied TF, it remains a candidate predictor for
-other targets. The existing exact positive-weight constant-response check remains a
-separate model-level safeguard.
-
-The global table `target_eligibility.tsv.gz` records counts, fractions, extrema,
-thresholds, and reasons. `model_diagnostics.tsv.gz` records \(r_{t,c}\),
-\(\operatorname{ESS}_{t,c}\), and model status. Automatic eligibility is disabled by
-default because it intentionally changes the response universe; adoption requires
-separate accuracy and coverage validation.
+Every expression gene is requested as a response unless `target_list` explicitly
+selects a subset. This choice changes neither the distance representation nor the
+supplied TF predictor universe. Each requested `(group, target)` model is attempted;
+constant responses, insufficient positive-weight cells, or empty variable predictor
+sets are reported as non-trainable models, with their exact reasons. These checks
+prevent invalid fits and do not apply expression-detection thresholds.
 
 ## Interactive report
 
@@ -480,38 +439,17 @@ of both `--bootstrap` and `--no-bootstrap` in the CLI, selects that automatic po
 an explicit boolean overrides it. `parameters.json` preserves the requested nullable
 value and `run_metadata.json` records the effective boolean used by every estimator.
 
-### Optional adaptive tree budget
+### Fixed tree budgets and model accounting
 
-The default fixed policy fits exactly `n_estimators` trees for every trainable model.
-With `adaptive_trees=True`, that same deterministically seeded ensemble is grown with
-`warm_start` in cumulative `adaptive_tree_step` blocks; `n_estimators` remains a hard
-ceiling. At each eligible checkpoint, SPATHI calculates the normalized TF-importance
-vector \(p_k\) and the total-variation distance
+Each trainable model fits exactly `n_estimators` trees. The fixed-prefix convergence
+API can compare several increasing budgets by extending the same seeded forest.
+Each tree's importance vector is extracted once; complete, ordered `float64` means
+and normalization preserve the scores of independently fitted fixed-size forests.
+The fitted tree count and cumulative fitting time are recorded per model.
 
-\[
-\operatorname{TV}(p_k,p_j) = \frac{1}{2}\sum_f |p_{k,f}-p_{j,f}|.
-\]
-
-Stopping requires at least `adaptive_min_estimators` fitted trees, non-zero importance
-mass, a complete history of `adaptive_patience` previous checkpoints, and a maximum
-distance from the current vector to every vector in that history no larger than
-`adaptive_tolerance`. The configuration is rejected before inference if its ceiling,
-step, minimum, and patience cannot make such a stop possible. Trees are accumulated in
-their stable seeded order, and feature importances are updated only from newly fitted
-trees; the retained importance buffer is included in memory planning.
-
-`model_diagnostics.tsv.gz` records actual trees, checks, final change, and convergence
-per model; `run_metadata.json` records the theoretical schedule and aggregate savings.
-Convergence of impurity importance is not mathematical equivalence to the ceiling-sized
-ensemble: an early stop can change edge scores and rankings relative to the full forest.
-Adaptive fitting is therefore disabled by default until a predeclared non-inferiority
-study supports its use for the intended data regime.
-
-Every selected target is accounted for in every group. Under the reference
-`target_eligibility=all` policy each one is attempted; the optional automatic policy
-may instead classify a response as not estimable before fitting. Constant responses,
-empty or entirely constant predictor sets, eligibility exclusions, and other
-non-trainable models are recorded in `skipped_targets.tsv`.
+Every selected target is accounted for in every group. Constant responses,
+insufficient positive-weight samples, empty or entirely constant predictor sets, and
+other non-trainable models are recorded in `skipped_targets.tsv`.
 `model_diagnostics.tsv.gz` distinguishes the self-excluded predictor, constant
 predictors, the complete discarded set, and the number actually used, preserving the
 mapping from fitted importance columns back to TF names. No self-edges are produced,
@@ -535,14 +473,22 @@ N_{\mathrm{groups}}\,N_{\mathrm{targets}}\,
 \]
 
 `threads` is the only public CPU budget. `auto` resolves to all available logical CPUs,
-`1` is sequential, and any positive value is a cap. An internal automatic plan
-uses a bounded rolling thread queue across independent `(target group, target gene)`
-tasks, or Joblib inside a single ensemble, never both at full width. When outer task parallelism is active, each
-ensemble receives `n_jobs=1`; threadpoolctl constrains BLAS/OpenMP libraries to prevent
-nested oversubscription. The threading backend shares the read-only expression array
-instead of copying it into worker processes. One persistent worker pool is reused
-across all bounded target batches in an attempt; result callbacks execute only on the
-orchestration thread, and completed tasks are reordered before canonical serialization.
+`1` is sequential, and any positive value is a cap. `parallel_backend` is an operational
+choice (`auto`, `threads`, `processes`), independent of scientific parameters. In `auto`,
+processes require at least `2 * CPU_budget` remaining models and
+`remaining_models * n_estimators >= 1000 * CPU_budget`, as well as sufficient RAM and
+temporary disk. Smaller workloads use threads. Explicit processes skip the workload
+threshold but retain resource checks. If the available independent tasks or memory
+cannot sustain process workers across the CPU budget, the actual backend is threading;
+too few independent tasks use parallel trees within one ensemble. One level receives
+the CPU budget, never both. Outer workers use `n_jobs=1`, and BLAS/OpenMP libraries are
+limited to one native thread.
+
+Threading shares arrays directly with a bounded rolling task queue. Processes use
+read-only memory maps and bounded batches whose complete result window is reserved.
+One persistent pool spans target batches; callbacks execute on the orchestration thread
+and outputs are reordered canonically. Temporary mappings are cleaned on pool exit;
+Joblib can retain idle Python workers for up to 30 seconds in a long-lived application.
 
 The core also estimates a conservative peak allocation for one fitted ensemble and
 detects the tightest available host or cgroup memory headroom when possible. Linux host
@@ -552,17 +498,24 @@ planner reserves headroom for shared arrays and caps concurrent outer models
 accordingly. This heuristic cannot predict every allocator or fitted-tree shape, so it
 complements rather than replaces external memory monitoring. The estimate, detected
 availability, usable fraction, and selected model-concurrency cap are persisted in
-`run_metadata.json`.
+`run_metadata.json`. Process planning additionally reserves 256 MiB per interpreter,
+the active shared response/predictor/weight backing, and all result records in a bounded
+process batch. Temporary disk planning covers response storage plus all groups'
+predictors and weights, since backing files may survive until pool exit, with a margin
+of 10% or 16 MiB (whichever is larger). Auto falls back to threads when resource checks
+fail; explicit processes report an actionable error when even one worker or its backing
+cannot fit. Requested and actual backends, selection reasons, resource estimates and
+process window size are recorded. These remain estimates, not OS-enforced limits.
 
 A task seed is derived stably from the global seed, group identifier, and target
 identifier. It does not depend on scheduler order. Output is sorted by `context`,
-`target`, and `source`, so changing `threads` should produce equal or numerically
-equivalent results.
+`target`, and `source`, so changing `threads` or `parallel_backend` preserves model
+results. Both settings are excluded from the checkpoint's scientific identity.
 
 The core chooses bounded target-group batches large enough to expose independent
 `(group, target)` tasks to its persistent executor while keeping output progressive.
-Joblib is used only by scikit-learn inside an ensemble when model-level parallelism is
-selected. When all selected targets fit in one batch, multiple groups are scheduled
+Joblib supplies the process backend and scikit-learn's within-ensemble workers when
+model-level threading is selected. When all selected targets fit in one batch, multiple groups are scheduled
 together; larger target sets retain group-major sub-batches so output remains globally
 sorted without retaining one result object for every selected target at once. PCA,
 centroids, distances, bandwidth selection, and auxiliary report PCA run with one

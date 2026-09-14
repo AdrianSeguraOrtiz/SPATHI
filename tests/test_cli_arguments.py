@@ -32,6 +32,8 @@ def test_cli_builds_typed_configuration() -> None:
             "sqrt",
             "--threads",
             "2",
+            "--parallel-backend",
+            "processes",
             "--bootstrap",
         ]
     )
@@ -40,6 +42,7 @@ def test_cli_builds_typed_configuration() -> None:
     assert config.bandwidth == 2.5
     assert config.max_features == "sqrt"
     assert config.threads == 2
+    assert config.parallel_backend == "processes"
     assert config.bootstrap is True
 
 
@@ -135,6 +138,7 @@ def test_cli_distinguishes_integer_and_fractional_max_features() -> None:
     "arguments",
     [
         [*BASE_ARGUMENTS, "--threads", "0"],
+        [*BASE_ARGUMENTS, "--parallel-backend", "loky"],
         [*BASE_ARGUMENTS, "--bandwidth", "0"],
         [*BASE_ARGUMENTS, "--bandwidth", "nan"],
         [*BASE_ARGUMENTS, "--bandwidth", "inf"],

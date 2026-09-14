@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile as real_named_temporary_file
 from threading import get_ident
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,7 @@ import spathi.checkpoint as checkpoint_module
 import spathi.core as core_module
 import spathi.inference as inference_module
 import spathi.io as io_module
+import spathi.resources as resources_module
 from spathi import SpathiConfig, infer
 from spathi.progress import SpathiProgressEvent
 
@@ -38,7 +40,6 @@ EXPECTED_ARTIFACTS = {
     "pca_explained_variance.tsv",
     "run_metadata.json",
     "skipped_targets.tsv",
-    "target_eligibility.tsv.gz",
     "weight_diagnostics.tsv",
     "report.html",
 }
@@ -317,6 +318,132 @@ def test_infer_cannot_replace_output_created_during_publication_race(
     assert list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("threads", "remaining_models", "n_estimators", "expected"),
+    [
+        (4, 8, 499, "threading"),
+        (4, 8, 500, "loky"),
+        (4, 7, 1000, "threading"),
+        (12, 24, 500, "loky"),
+        (1, 200, 500, "sequential"),
+    ],
+)
+def test_automatic_backend_scales_thresholds_to_the_cpu_budget(
+    input_files: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    threads: int,
+    remaining_models: int,
+    n_estimators: int,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 100 * 1024**3)
+    monkeypatch.setattr(
+        workflow_module, "disk_usage", lambda _: SimpleNamespace(free=100 * 1024**3)
+    )
+    config = replace(config_for(input_files, tmp_path, threads=threads), n_estimators=n_estimators)
+    result = workflow_module._plan_inference_execution(
+        config=config,
+        n_cells=1000,
+        n_groups=2,
+        n_targets=100,
+        n_transcription_factors=20,
+        predictor_bytes=80_000,
+        response_bytes=800_000,
+        remaining_models=remaining_models,
+        available_threads=threads,
+        estimated_model_bytes=1_000_000,
+        checkpoint_enabled=True,
+    )
+    assert result.parallel.backend == expected
+    if expected == "loky":
+        assert result.batch.model_plan.estimated_bytes_per_model == 1_000_000 + 256 * 1024**2
+        assert result.batch.shared_memmap_bytes >= 800_000 + 80_000
+        assert result.temporary_disk_required_bytes > 800_000 + 2 * 80_000
+    else:
+        assert result.batch.shared_memmap_bytes == 0
+        assert result.process_worker_base_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("backend", "memory", "disk", "error", "reason"),
+    [
+        ("auto", 1024**3, 10 * 1024**3, None, "RAM"),
+        ("processes", 1024**3, 10 * 1024**3, None, "RAM"),
+        ("auto", None, 10 * 1024**3, None, "RAM"),
+        ("processes", None, 10 * 1024**3, MemoryError, "Cannot determine"),
+        ("processes", 100_000, 10 * 1024**3, MemoryError, "Insufficient available memory"),
+        ("auto", 10 * 1024**3, 0, None, "temporary disk"),
+        ("processes", 10 * 1024**3, 0, OSError, "TMPDIR"),
+    ],
+)
+def test_process_selection_honors_ram_and_temporary_disk(
+    input_files: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    memory: int | None,
+    disk: int,
+    error: type[Exception] | None,
+    reason: str,
+) -> None:
+    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: memory)
+    monkeypatch.setattr(resources_module, "available_memory_bytes", lambda: memory)
+    monkeypatch.setattr(workflow_module, "disk_usage", lambda _: SimpleNamespace(free=disk))
+    config = replace(
+        config_for(input_files, tmp_path, threads=4), parallel_backend=backend, n_estimators=500
+    )
+
+    def plan():
+        return workflow_module._plan_inference_execution(
+            config=config,
+            n_cells=1000,
+            n_groups=2,
+            n_targets=100,
+            n_transcription_factors=20,
+            predictor_bytes=80_000,
+            response_bytes=800_000,
+            remaining_models=200,
+            available_threads=4,
+            estimated_model_bytes=1_000_000,
+            checkpoint_enabled=True,
+        )
+
+    if error is not None:
+        with pytest.raises(error, match=reason):
+            plan()
+    else:
+        result = plan()
+        assert result.parallel.backend == "threading"
+        assert reason in result.backend_reason
+        assert result.batch.model_plan.estimated_bytes_per_model == 1_000_000
+
+
+def test_process_batch_planning_reserves_all_results_and_shared_arrays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 100 * 1024**3)
+    plan = workflow_module._plan_inference_batches(
+        n_cells=1000,
+        n_groups=2,
+        n_targets=100,
+        n_transcription_factors=20,
+        predictor_bytes=80_000,
+        numeric_thread_limit=4,
+        estimated_model_bytes=100_000,
+        report_retained_bytes=0,
+        report_auxiliary_bytes=0,
+        report_render_bytes=0,
+        checkpoint_enabled=True,
+        process_worker_base_bytes=256 * 1024**2,
+        process_shared_response_bytes=800_000,
+        result_multiplier=3,
+    )
+    group_bytes = 1000 * (8 + 1) + 80_000
+    result_bytes = plan.models_per_inference_batch * (20 * 256 + 768) * 3
+    assert plan.reserved_bytes == 800_000 + 2 * group_bytes + 4 * 1000 * 8 + result_bytes
+
+
 def test_batch_memory_plan_preserves_parallelism_then_reduces_group_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -407,39 +534,6 @@ def test_checkpoint_memory_plan_reserves_the_complete_rolling_result_window(
     assert plan.reserved_bytes == result_bytes + retained_group_bytes + weight_working_bytes
 
 
-def test_batch_memory_plan_reserves_automatic_target_eligibility_buffers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 10_000_000_000)
-    parameters = {
-        "n_cells": 1_000,
-        "n_groups": 3,
-        "n_targets": 300,
-        "n_transcription_factors": 20,
-        "predictor_bytes": 80_000,
-        "numeric_thread_limit": 8,
-        "estimated_model_bytes": 100_000,
-        "report_retained_bytes": 0,
-        "report_auxiliary_bytes": 0,
-        "report_render_bytes": 0,
-        "checkpoint_enabled": True,
-    }
-
-    reference = workflow_module._plan_inference_batches(
-        **parameters,
-        automatic_target_eligibility=False,
-    )
-    automatic = workflow_module._plan_inference_batches(
-        **parameters,
-        automatic_target_eligibility=True,
-    )
-
-    expected_extra = 1_000 * np.dtype(np.float64).itemsize
-    expected_extra += 1_000 * automatic.target_batch_size * np.dtype(np.bool_).itemsize
-    assert automatic.group_batch_size == 1
-    assert automatic.reserved_bytes == reference.reserved_bytes + expected_extra
-
-
 def test_batch_memory_plan_fails_before_an_infeasible_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,30 +552,6 @@ def test_batch_memory_plan_fails_before_an_infeasible_model(
             report_auxiliary_bytes=0,
             report_render_bytes=0,
             checkpoint_enabled=True,
-        )
-
-
-def test_resume_target_eligibility_block_obeys_live_headroom(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 10_000)
-    plan = workflow_module._plan_target_eligibility_memory(
-        n_cells=100,
-        n_targets=20,
-    )
-    assert plan.available_bytes == 10_000
-    assert plan.usable_bytes == 7_000
-    bytes_per_target = 100 * (np.dtype(np.float64).itemsize + np.dtype(np.bool_).itemsize) + (
-        np.dtype(np.intp).itemsize + 2 * np.dtype(np.float64).itemsize + np.dtype(np.bool_).itemsize
-    )
-    assert plan.block_size == 7_000 // bytes_per_target
-    assert plan.working_bytes == plan.block_size * bytes_per_target
-
-    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 1_000)
-    with pytest.raises(MemoryError, match="one target eligibility column"):
-        workflow_module._plan_target_eligibility_memory(
-            n_cells=100,
-            n_targets=20,
         )
 
 
@@ -523,7 +593,6 @@ def test_inference_preparation_memory_plan_accounts_for_persistent_arrays(
         n_transcription_factors=10,
         n_targets=20,
         target_subset=True,
-        automatic_target_eligibility=True,
     )
 
     assert plan.predictor_bytes == 4_000
@@ -540,7 +609,6 @@ def test_inference_preparation_memory_plan_accounts_for_persistent_arrays(
             n_transcription_factors=10,
             n_targets=20,
             target_subset=True,
-            automatic_target_eligibility=True,
         )
 
 
@@ -818,28 +886,7 @@ def test_public_core_writes_self_contained_deterministic_run(
     }
     assert metadata["effective_parameters"]["bootstrap_requested"] is None
     assert metadata["effective_parameters"]["bootstrap_effective"] is False
-    assert metadata["effective_parameters"]["tree_budget"] == {
-        "mode": "fixed",
-        "schedule_active": False,
-        "maximum_estimators": 12,
-        "minimum_estimators": None,
-        "estimator_step": None,
-        "convergence_tolerance": None,
-        "convergence_patience": None,
-        "maximum_convergence_checks": None,
-        "earliest_possible_stop_estimators": None,
-    }
-    assert metadata["effective_parameters"]["target_eligibility"] == {
-        "mode": "all",
-        "thresholds_active": False,
-        "min_detected_cells": None,
-        "min_detected_fraction": None,
-        "min_weighted_detected_fraction": None,
-        "min_weighted_detected_ess": None,
-        "globally_eligible_targets": 4,
-        "globally_ineligible_targets": 0,
-        "predictor_space_changed": False,
-    }
+    assert metadata["effective_parameters"]["n_estimators"] == 12
     assert metadata["effective_parameters"]["targets_per_batch"] == 4
     assert metadata["effective_parameters"]["target_selection"] == "all-expression-genes"
     assert metadata["effective_parameters"]["target_ids"] is None
@@ -1079,86 +1126,6 @@ def test_target_subset_releases_complete_expression_before_model_fitting(
 
 
 @pytest.mark.integration
-def test_automatic_eligibility_and_adaptive_budget_are_fully_auditable(
-    tmp_path: Path,
-    input_files: dict[str, Path],
-) -> None:
-    target_list = tmp_path / "targets.txt"
-    target_list.write_text("G3\n", encoding="utf-8")
-    output_dir = tmp_path / "auditable-optimizations"
-    base = config_for(input_files, output_dir)
-    config = SpathiConfig(
-        **{
-            **base.to_dict(),
-            "target_list": target_list,
-            "n_estimators": 20,
-            "adaptive_trees": True,
-            "adaptive_min_estimators": 5,
-            "adaptive_tree_step": 5,
-            "adaptive_tolerance": 1.0,
-            "adaptive_patience": 2,
-            "target_eligibility": "automatic",
-            "min_target_detected_cells": 2,
-            "min_target_detected_fraction": 0.25,
-            "min_target_weighted_detected_fraction": 0.01,
-            "min_target_weighted_detected_ess": 1.0,
-        }
-    )
-
-    infer(config)
-
-    eligibility = pd.read_csv(output_dir / "target_eligibility.tsv.gz", sep="\t")
-    assert eligibility.to_dict(orient="records") == [
-        {
-            "target": "G3",
-            "mode": "automatic",
-            "eligible": True,
-            "detected_cells": 4,
-            "detected_fraction": 1.0,
-            "expression_min": 1.0,
-            "expression_max": 6.0,
-            "required_detected_cells": 2,
-            "reason": "eligible",
-        }
-    ]
-    diagnostics = pd.read_csv(output_dir / "model_diagnostics.tsv.gz", sep="\t")
-    assert diagnostics["n_estimators_fitted"].tolist() == [15, 15]
-    assert diagnostics["adaptive_converged"].tolist() == [True, True]
-    assert diagnostics["target_weighted_detected_fraction"].between(0.0, 1.0).all()
-    assert (diagnostics["target_weighted_detected_ess"] >= 1.0).all()
-
-    metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
-    assert metadata["effective_parameters"]["target_eligibility"] == {
-        "mode": "automatic",
-        "thresholds_active": True,
-        "min_detected_cells": 2,
-        "min_detected_fraction": 0.25,
-        "min_weighted_detected_fraction": 0.01,
-        "min_weighted_detected_ess": 1.0,
-        "globally_eligible_targets": 1,
-        "globally_ineligible_targets": 0,
-        "predictor_space_changed": False,
-    }
-    assert metadata["effective_parameters"]["tree_budget"] == {
-        "mode": "adaptive",
-        "schedule_active": True,
-        "maximum_estimators": 20,
-        "minimum_estimators": 5,
-        "estimator_step": 5,
-        "convergence_tolerance": 1.0,
-        "convergence_patience": 2,
-        "maximum_convergence_checks": 3,
-        "earliest_possible_stop_estimators": 15,
-    }
-    assert metadata["models"]["adaptive_converged"] == 2
-    assert metadata["models"]["adaptive_early_stopped"] == 2
-    assert metadata["models"]["fitted_estimators_total"] == 30
-    assert metadata["memory_estimate_bytes"]["tree_importance_buffer_float64"] == 320
-    assert metadata["memory_estimate_bytes"]["adaptive_convergence_history_float64"] == 48
-    assert metadata["checkpoint"]["model_storage"] == ("sqlite-binary-columnar-zlib-per-model")
-
-
-@pytest.mark.integration
 def test_expression_distance_representation_is_released_before_model_fitting(
     tmp_path: Path,
     input_files: dict[str, Path],
@@ -1241,6 +1208,86 @@ def test_randomized_pca_scientific_artifacts_are_exact_across_thread_budgets(
         "group_distances.tsv",
     ):
         assert (first_dir / name).read_bytes() == (second_dir / name).read_bytes()
+
+
+@pytest.mark.integration
+def test_process_backend_matches_threads_and_reports_main_thread_progress(
+    input_files: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_module, "available_cpu_count", lambda: 2)
+    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 10 * 1024**3)
+    monkeypatch.setattr(workflow_module, "disk_usage", lambda _: SimpleNamespace(free=10 * 1024**3))
+    reference = replace(
+        config_for(input_files, tmp_path / "threads", threads=2),
+        parallel_backend="threads",
+    )
+    process = replace(reference, output_dir=tmp_path / "processes", parallel_backend="processes")
+    infer(reference, checkpoint=False)
+    events: list[SpathiProgressEvent] = []
+    callback_threads: list[int] = []
+
+    def progress(event: SpathiProgressEvent) -> None:
+        events.append(event)
+        callback_threads.append(get_ident())
+
+    infer(process, progress_callback=progress)
+    assert callback_threads == [get_ident()] * len(events)
+    assert [event.completed_models for event in events if event.phase == "model_inference"] == list(
+        range(1, 9)
+    )
+    for name in (
+        "network.csv",
+        "cell_weights.tsv.gz",
+        "skipped_targets.tsv",
+    ):
+        assert (reference.output_dir / name).read_bytes() == (
+            process.output_dir / name
+        ).read_bytes()
+    reference_diagnostics = pd.read_csv(
+        reference.output_dir / "model_diagnostics.tsv.gz", sep="\t"
+    ).drop(columns="fit_seconds")
+    process_diagnostics = pd.read_csv(
+        process.output_dir / "model_diagnostics.tsv.gz", sep="\t"
+    ).drop(columns="fit_seconds")
+    pd.testing.assert_frame_equal(reference_diagnostics, process_diagnostics)
+    metadata = json.loads((process.output_dir / "run_metadata.json").read_text())
+    assert metadata["parallelism"]["backend_requested"] == "processes"
+    assert metadata["parallelism"]["backend"] == "loky"
+    assert metadata["parallelism"]["maximum_concurrent_model_fits"] == 2
+    assert metadata["parallelism"]["process_native_thread_limit"] == 1
+    assert metadata["parallelism"]["process_task_window"] >= 2
+    assert metadata["parallelism"]["memory_estimates_are_hard_limits"] is False
+
+
+@pytest.mark.integration
+def test_checkpoint_resume_can_switch_from_processes_to_threads(
+    input_files: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_module, "available_cpu_count", lambda: 2)
+    monkeypatch.setattr(workflow_module, "available_memory_bytes", lambda: 10 * 1024**3)
+    monkeypatch.setattr(workflow_module, "disk_usage", lambda _: SimpleNamespace(free=10 * 1024**3))
+    config = replace(
+        config_for(input_files, tmp_path / "resume", threads=2), parallel_backend="processes"
+    )
+
+    def interrupt(event: SpathiProgressEvent) -> None:
+        if event.phase == "model_inference" and event.completed_models == 3:
+            raise RuntimeError("stop after checkpoint")
+
+    with pytest.raises(RuntimeError, match="stop after checkpoint"):
+        infer(config, progress_callback=interrupt)
+    resumed = infer(replace(config, parallel_backend="threads"), resume=True)
+    assert resumed.resumed_models == 3
+    clean = replace(config, output_dir=tmp_path / "clean", parallel_backend="threads")
+    infer(clean, checkpoint=False)
+    assert (config.output_dir / "network.csv").read_bytes() == (
+        clean.output_dir / "network.csv"
+    ).read_bytes()
+    assert not (tmp_path / ".resume.checkpoint").exists()
 
 
 @pytest.mark.integration
@@ -1345,19 +1392,7 @@ def test_checkpoint_resume_reuses_only_committed_models_and_matches_clean_run(
 ) -> None:
     output_dir = tmp_path / "resumed"
     base = config_for(input_files, output_dir, threads=1)
-    optimization_parameters = {
-        "adaptive_trees": True,
-        "adaptive_min_estimators": 4,
-        "adaptive_tree_step": 4,
-        "adaptive_tolerance": 1.0,
-        "adaptive_patience": 1,
-        "target_eligibility": "automatic",
-        "min_target_detected_cells": 1,
-        "min_target_detected_fraction": 0.01,
-        "min_target_weighted_detected_fraction": 0.01,
-        "min_target_weighted_detected_ess": 1.0,
-    }
-    config = SpathiConfig(**{**base.to_dict(), **optimization_parameters})
+    config = base
     original_fit = inference_module._fit_model_task
     fitted_keys: list[tuple[str, str]] = []
 
@@ -1397,14 +1432,13 @@ def test_checkpoint_resume_reuses_only_committed_models_and_matches_clean_run(
     clean_dir = tmp_path / "clean"
     clean_base = config_for(input_files, clean_dir, threads=2)
     infer(
-        SpathiConfig(**{**clean_base.to_dict(), **optimization_parameters}),
+        clean_base,
         checkpoint=False,
     )
     for artifact in (
         "network.csv",
         "cell_weights.tsv.gz",
         "skipped_targets.tsv",
-        "target_eligibility.tsv.gz",
     ):
         assert (output_dir / artifact).read_bytes() == (clean_dir / artifact).read_bytes()
     resumed_diagnostics = pd.read_csv(output_dir / "model_diagnostics.tsv.gz", sep="\t")
@@ -1413,13 +1447,6 @@ def test_checkpoint_resume_reuses_only_committed_models_and_matches_clean_run(
         resumed_diagnostics.drop(columns="fit_seconds"),
         clean_diagnostics.drop(columns="fit_seconds"),
     )
-    assert set(resumed_diagnostics["target_detected_cells"]) == {3, 4}
-    assert resumed_diagnostics["target_weighted_detected_fraction"].notna().sum() == 6
-    assert set(
-        resumed_diagnostics.loc[
-            resumed_diagnostics["target_weighted_detected_fraction"].isna(), "status"
-        ]
-    ) == {"target_not_estimable"}
     assert resumed_diagnostics["n_estimators_fitted"].max() <= config.n_estimators
     metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
     assert metadata["checkpoint"]["models_reused"] == 3

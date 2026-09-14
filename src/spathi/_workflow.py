@@ -13,9 +13,10 @@ from decimal import Decimal, localcontext
 from importlib.metadata import PackageNotFoundError, version
 from math import ceil, fsum
 from pathlib import Path
-from tempfile import TemporaryFile
+from shutil import disk_usage
+from tempfile import TemporaryFile, gettempdir
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import finalize
 
 import numpy as np
@@ -26,7 +27,7 @@ from threadpoolctl import threadpool_limits
 from spathi._version import __version__
 from spathi.centroids import compute_centroids
 from spathi.checkpoint import ModelCheckpoint
-from spathi.config import SpathiConfig, adaptive_convergence_schedule
+from spathi.config import SpathiConfig
 from spathi.diagnostics import compute_weight_diagnostics
 from spathi.distances import (
     DEFAULT_WORKING_MEMORY_MIB,
@@ -74,13 +75,6 @@ from spathi.resources import (
     estimate_model_memory_bytes,
     plan_model_memory,
 )
-from spathi.targeting import (
-    TARGET_ELIGIBILITY_CHUNK_SIZE,
-    TargetEligibilityRecord,
-    assess_target_eligibility,
-    target_eligibility_chunk_size,
-    unfiltered_target_eligibility,
-)
 from spathi.weighting import (
     SAMPLE_WEIGHT_CANONICALIZATION_RULE,
     SAMPLE_WEIGHT_RELATIVE_PRECISION,
@@ -97,6 +91,7 @@ LOGGER = logging.getLogger(__name__)
 _DISTANCE_MEMMAP_THRESHOLD_BYTES = 512 * 1024**2
 _TARGET_BATCH_MIN_MODELS = 32
 _TARGET_BATCH_MAX_MODELS = 256
+_PROCESS_WORKER_BASE_BYTES = 256 * 1024**2
 _CENTROID_COLUMNS = ("group", "dimension", "centroid")
 _GROUP_DISTANCE_COLUMNS = ("target_group", "source_group", "centroid_distance")
 _GROUP_AFFINITY_COLUMNS = (
@@ -120,17 +115,6 @@ _CENTROID_WEIGHT_DIAGNOSTIC_COLUMNS = (
     "median_weight",
     "max_weight",
     "effective_sample_size",
-)
-_TARGET_ELIGIBILITY_COLUMNS = (
-    "target",
-    "mode",
-    "eligible",
-    "detected_cells",
-    "detected_fraction",
-    "expression_min",
-    "expression_max",
-    "required_detected_cells",
-    "reason",
 )
 
 
@@ -278,6 +262,17 @@ class _BatchMemoryPlan:
     concurrent_fits: int
     reserved_bytes: int
     model_plan: MemoryPlan
+    shared_memmap_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _InferenceExecutionPlan:
+    batch: _BatchMemoryPlan
+    parallel: ParallelPlan
+    backend_reason: str
+    process_worker_base_bytes: int
+    temporary_disk_required_bytes: int
+    temporary_disk_available_bytes: int | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -300,16 +295,6 @@ class _CentroidDistanceMemoryPlan:
     estimated_persistent_bytes: int
     working_memory_mib: float
     working_memory_bytes: int
-    available_bytes: int | None
-    usable_bytes: int | None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _TargetEligibilityMemoryPlan:
-    """Bound all arrays used by one resume eligibility reconstruction block."""
-
-    block_size: int
-    working_bytes: int
     available_bytes: int | None
     usable_bytes: int | None
 
@@ -451,8 +436,6 @@ class _ModelRunStatistics:
     trained_models: int = 0
     skipped_target_records: int = 0
     model_status_counts: Counter[str] = field(default_factory=Counter)
-    adaptive_converged_models: int = 0
-    adaptive_early_stopped_models: int = 0
     fitted_estimators_total: int = 0
     fitted_estimators_min: int | None = None
     fitted_estimators_max: int = 0
@@ -460,18 +443,9 @@ class _ModelRunStatistics:
     def account_model_stats(
         self,
         model_stats: Sequence[ModelStat],
-        *,
-        adaptive_trees: bool,
-        maximum_estimators: int,
     ) -> None:
         for stat in model_stats:
             self.model_status_counts[stat.status] += 1
-            self.adaptive_converged_models += int(stat.adaptive_converged)
-            self.adaptive_early_stopped_models += int(
-                adaptive_trees
-                and stat.adaptive_converged
-                and stat.n_estimators_fitted < maximum_estimators
-            )
             if stat.n_estimators_fitted > 0:
                 self.fitted_estimators_total += stat.n_estimators_fitted
                 self.fitted_estimators_min = (
@@ -726,46 +700,6 @@ def _plan_centroid_distance_memory(
     )
 
 
-def _plan_target_eligibility_memory(
-    *,
-    n_cells: int,
-    n_targets: int,
-) -> _TargetEligibilityMemoryPlan:
-    """Size the advanced-index block used by a complete automatic resume."""
-
-    if n_cells < 1 or n_targets < 1:
-        raise ValueError("target eligibility memory planning requires positive dimensions")
-    matrix_bytes_per_target = n_cells * (
-        np.dtype(np.float64).itemsize + np.dtype(np.bool_).itemsize
-    )
-    summary_bytes_per_target = (
-        np.dtype(np.intp).itemsize + 2 * np.dtype(np.float64).itemsize + np.dtype(np.bool_).itemsize
-    )
-    bytes_per_target = matrix_bytes_per_target + summary_bytes_per_target
-    available_bytes = available_memory_bytes()
-    usable_bytes = None if available_bytes is None else int(available_bytes * 0.7)
-    if usable_bytes is not None and usable_bytes < bytes_per_target:
-        raise MemoryError(
-            "Insufficient available memory to reconstruct one target eligibility column: "
-            f"usable={usable_bytes}, required={bytes_per_target} bytes"
-        )
-    default_working_bytes = int(DEFAULT_WORKING_MEMORY_MIB * 1024**2)
-    working_budget = (
-        default_working_bytes if usable_bytes is None else min(default_working_bytes, usable_bytes)
-    )
-    block_size = min(
-        n_targets,
-        TARGET_ELIGIBILITY_CHUNK_SIZE,
-        max(1, working_budget // bytes_per_target),
-    )
-    return _TargetEligibilityMemoryPlan(
-        block_size=block_size,
-        working_bytes=block_size * bytes_per_target,
-        available_bytes=available_bytes,
-        usable_bytes=usable_bytes,
-    )
-
-
 def _plan_inference_preparation_memory(
     *,
     n_cells: int,
@@ -773,7 +707,6 @@ def _plan_inference_preparation_memory(
     n_transcription_factors: int,
     n_targets: int,
     target_subset: bool,
-    automatic_target_eligibility: bool,
 ) -> _InferencePreparationMemoryPlan:
     """Reject an infeasible predictor/target preparation before its first copy."""
 
@@ -797,20 +730,14 @@ def _plan_inference_preparation_memory(
         n_cells * n_transcription_factors * np.dtype(np.bool_).itemsize,
         INFERENCE_VALIDATION_WORKING_MEMORY_BYTES,
     )
-    eligibility_working_bytes = (
-        n_cells * target_eligibility_chunk_size(n_cells, n_targets) * np.dtype(np.bool_).itemsize
-        if automatic_target_eligibility
-        else 0
-    )
     maximum_validation_working_bytes = max(
         expression_validation_bytes,
         predictor_validation_bytes,
-        eligibility_working_bytes,
     )
     estimated_peak_additional_bytes = max(
         expression_validation_bytes,
         predictor_bytes + predictor_validation_bytes,
-        predictor_bytes + additional_target_bytes + eligibility_working_bytes,
+        predictor_bytes + additional_target_bytes,
     )
     available_bytes = available_memory_bytes()
     usable_bytes = None if available_bytes is None else int(available_bytes * 0.7)
@@ -943,7 +870,9 @@ def _plan_inference_batches(
     report_auxiliary_bytes: int,
     report_render_bytes: int,
     checkpoint_enabled: bool,
-    automatic_target_eligibility: bool = False,
+    process_worker_base_bytes: int = 0,
+    process_shared_response_bytes: int = 0,
+    result_multiplier: int = 1,
 ) -> _BatchMemoryPlan:
     """Maximise safe model exposure while reserving all batch allocations."""
 
@@ -961,7 +890,6 @@ def _plan_inference_batches(
     detected_memory = available_memory_bytes()
     weight_working_bytes = 4 * n_cells * np.dtype(np.float64).itemsize
     per_group_weight_bytes = n_cells * np.dtype(np.float64).itemsize
-    per_group_squared_weight_bytes = per_group_weight_bytes if automatic_target_eligibility else 0
     per_group_mask_bytes = n_cells * np.dtype(np.bool_).itemsize
 
     candidates: list[_BatchMemoryPlan] = []
@@ -979,29 +907,20 @@ def _plan_inference_batches(
                     models_per_batch,
                     numeric_thread_limit * MAX_PENDING_TASKS_PER_WORKER,
                 )
-                if checkpoint_enabled
+                if checkpoint_enabled and not process_worker_base_bytes
                 else models_per_batch
             )
-            result_record_bytes = retained_model_results * (n_transcription_factors * 256 + 768)
-            retained_group_bytes = group_batch_size * (
-                per_group_weight_bytes
-                + per_group_squared_weight_bytes
-                + per_group_mask_bytes
-                + predictor_bytes
+            result_record_bytes = (
+                retained_model_results * (n_transcription_factors * 256 + 768) * result_multiplier
             )
-            target_eligibility_working_bytes = (
-                n_cells
-                * target_eligibility_chunk_size(n_cells, target_batch_size)
-                * np.dtype(np.bool_).itemsize
-                if automatic_target_eligibility
-                else 0
+            retained_group_bytes = group_batch_size * (
+                per_group_weight_bytes + per_group_mask_bytes + predictor_bytes
             )
             inference_reservation = (
                 retained_group_bytes
                 + weight_working_bytes
                 + result_record_bytes
                 + report_retained_bytes
-                + target_eligibility_working_bytes
             )
             report_render_reservation = (
                 group_batch_size * per_group_weight_bytes
@@ -1015,13 +934,22 @@ def _plan_inference_batches(
                 report_render_reservation,
                 report_preparation_reservation,
             )
+            # The parent retains its arrays. Read-only process mappings can also
+            # occupy shared page cache; reserve that backing once, not per worker.
+            shared_memmap_bytes = (
+                process_shared_response_bytes + retained_group_bytes
+                if process_worker_base_bytes
+                else 0
+            )
+            reserved_bytes += shared_memmap_bytes
+            estimated_worker_bytes = estimated_model_bytes + process_worker_base_bytes
             model_plan = plan_model_memory(
-                estimated_bytes_per_model=estimated_model_bytes,
+                estimated_bytes_per_model=estimated_worker_bytes,
                 available_bytes=detected_memory,
                 reserved_bytes=reserved_bytes,
             )
             usable_bytes = model_plan.usable_bytes
-            required_bytes = reserved_bytes + estimated_model_bytes
+            required_bytes = reserved_bytes + estimated_worker_bytes
             minimum_required_bytes = (
                 required_bytes
                 if minimum_required_bytes is None
@@ -1042,6 +970,7 @@ def _plan_inference_batches(
                     concurrent_fits=concurrent_fits,
                     reserved_bytes=reserved_bytes,
                     model_plan=model_plan,
+                    shared_memmap_bytes=shared_memmap_bytes,
                 )
             )
 
@@ -1062,6 +991,135 @@ def _plan_inference_batches(
     )
 
 
+def _plan_inference_execution(
+    *,
+    config: SpathiConfig,
+    n_cells: int,
+    n_groups: int,
+    n_targets: int,
+    n_transcription_factors: int,
+    predictor_bytes: int,
+    response_bytes: int,
+    remaining_models: int,
+    available_threads: int,
+    estimated_model_bytes: int,
+    report_retained_bytes: int = 0,
+    report_auxiliary_bytes: int = 0,
+    report_render_bytes: int = 0,
+    checkpoint_enabled: bool,
+    result_multiplier: int = 1,
+) -> _InferenceExecutionPlan:
+    """Choose workers and bounded batches together, including process overhead.
+
+    These are conservative estimates against current headroom, not OS-enforced
+    limits. Process inputs are mapped read-only; backing files can outlive a group
+    batch, so disk planning covers every group while RAM covers active groups.
+    """
+
+    budget = (
+        available_threads if config.threads == "auto" else min(config.threads, available_threads)
+    )
+    eligible = budget > 1 and remaining_models >= budget
+    substantial = (
+        remaining_models >= 2 * budget and remaining_models * config.n_estimators >= 1000 * budget
+    )
+    use_processes = eligible and (
+        config.parallel_backend == "processes"
+        or (config.parallel_backend == "auto" and substantial)
+    )
+    reason = (
+        "threads explicitly requested"
+        if config.parallel_backend == "threads"
+        else "too few independent models for task-level processes"
+        if not eligible
+        else "workload below automatic process threshold"
+    )
+    disk_required = 0
+    disk_available: int | None = None
+    if use_processes:
+        group_state_bytes = n_cells * (8 + 1)
+        backing_bytes = response_bytes + n_groups * (predictor_bytes + group_state_bytes)
+        disk_required = backing_bytes + max(16 * 1024**2, ceil(backing_bytes * 0.1))
+        try:
+            disk_available = int(disk_usage(gettempdir()).free)
+        except OSError:
+            disk_available = None
+        if disk_available is None or disk_available < disk_required:
+            reason = "insufficient or unknown temporary disk space for process mappings"
+            if config.parallel_backend == "processes":
+                raise OSError(
+                    f"{reason}: required={disk_required}, available={disk_available} bytes; "
+                    "set TMPDIR to a directory with enough free space or use --parallel-backend threads"
+                )
+            use_processes = False
+
+    def batches(processes: bool) -> _BatchMemoryPlan:
+        return _plan_inference_batches(
+            n_cells=n_cells,
+            n_groups=n_groups,
+            n_targets=n_targets,
+            n_transcription_factors=n_transcription_factors,
+            predictor_bytes=predictor_bytes,
+            numeric_thread_limit=budget,
+            estimated_model_bytes=estimated_model_bytes,
+            report_retained_bytes=report_retained_bytes,
+            report_auxiliary_bytes=report_auxiliary_bytes,
+            report_render_bytes=report_render_bytes,
+            checkpoint_enabled=checkpoint_enabled,
+            process_worker_base_bytes=_PROCESS_WORKER_BASE_BYTES if processes else 0,
+            process_shared_response_bytes=response_bytes if processes else 0,
+            result_multiplier=result_multiplier,
+        )
+
+    batch: _BatchMemoryPlan | None = None
+    if use_processes:
+        try:
+            batch = batches(True)
+        except MemoryError:
+            if config.parallel_backend == "processes":
+                raise MemoryError(
+                    "Insufficient available memory for process workers and shared inputs; "
+                    "use --parallel-backend threads or reduce --threads"
+                ) from None
+            reason = "insufficient RAM for process workers and shared inputs"
+            use_processes = False
+        if batch is not None and (
+            batch.model_plan.available_bytes is None or batch.concurrent_fits < budget
+        ):
+            if batch.model_plan.available_bytes is None and config.parallel_backend == "processes":
+                raise MemoryError(
+                    "Cannot determine available RAM for process workers; "
+                    "use --parallel-backend threads"
+                )
+            reason = "RAM or batch capacity cannot sustain the full CPU budget with processes"
+            use_processes = False
+        if use_processes:
+            reason = (
+                "processes explicitly requested with sufficient RAM and temporary disk"
+                if config.parallel_backend == "processes"
+                else "substantial model workload with sufficient RAM and temporary disk"
+            )
+    if not use_processes:
+        batch = batches(False)
+    assert batch is not None
+    task_backend: Literal["threading", "loky"] = "loky" if use_processes else "threading"
+    plan = resolve_thread_budget(
+        config.threads,
+        remaining_models,
+        available_threads=available_threads,
+        max_outer_jobs=batch.concurrent_fits,
+        task_backend=task_backend,
+    )
+    return _InferenceExecutionPlan(
+        batch=batch,
+        parallel=plan,
+        backend_reason=reason,
+        process_worker_base_bytes=_PROCESS_WORKER_BASE_BYTES if use_processes else 0,
+        temporary_disk_required_bytes=disk_required,
+        temporary_disk_available_bytes=disk_available,
+    )
+
+
 def _execute_model_phase(
     *,
     config: SpathiConfig,
@@ -1069,6 +1127,7 @@ def _execute_model_phase(
     group_ids: Sequence[str],
     group_batch_size: int,
     target_batch_size: int,
+    models_per_inference_batch: int,
     remaining_models: int,
     weighting_context: WeightingContext,
     bandwidth: BandwidthSelection,
@@ -1097,7 +1156,12 @@ def _execute_model_phase(
     # every model: weights, diagnostics, and the optional report are still rebuilt.
     with (
         IncrementalRunWriter(output_dir) as writer,
-        PersistentTaskExecutor(parallel_plan) as executor,
+        PersistentTaskExecutor(
+            parallel_plan,
+            process_window_size=(
+                models_per_inference_batch if parallel_plan.backend == "loky" else None
+            ),
+        ) as executor,
     ):
         for batch_start in range(0, len(group_ids), group_batch_size):
             batch_groups = group_ids[batch_start : batch_start + group_batch_size]
@@ -1182,8 +1246,6 @@ def _execute_model_phase(
                     statistics.skipped_target_records += len(inference_result.skipped_targets)
                     statistics.account_model_stats(
                         inference_result.model_stats,
-                        adaptive_trees=config.adaptive_trees,
-                        maximum_estimators=config.n_estimators,
                     )
 
                     phase_started = perf_counter()
@@ -1213,8 +1275,6 @@ def _execute_model_phase(
                 statistics.trained_models += int(model_result.trained)
                 statistics.account_model_stats(
                     (model_result.stat,),
-                    adaptive_trees=config.adaptive_trees,
-                    maximum_estimators=config.n_estimators,
                 )
                 statistics.n_edges += writer.write_edges(model_result.edges)
                 if model_result.skipped is not None:
@@ -1354,8 +1414,6 @@ def _run_workflow_impl(
     )
     resumed_models = progress.resumed_models
     remaining_models = requested_model_count - resumed_models
-    resume_target_eligibility_working_bytes = 0
-    resume_target_eligibility_memory_plan: _TargetEligibilityMemoryPlan | None = None
 
     progress.emit(
         "building_representation",
@@ -1522,7 +1580,6 @@ def _run_workflow_impl(
             n_transcription_factors=len(tf_names),
             n_targets=len(target_names),
             target_subset=target_names != gene_names,
-            automatic_target_eligibility=config.target_eligibility == "automatic",
         )
         phase_started = perf_counter()
         prepared = prepare_inference(
@@ -1536,16 +1593,6 @@ def _run_workflow_impl(
             min_samples_leaf=config.min_samples_leaf,
             max_depth=config.max_depth,
             bootstrap=config.bootstrap,
-            adaptive_trees=config.adaptive_trees,
-            adaptive_min_estimators=config.adaptive_min_estimators,
-            adaptive_tree_step=config.adaptive_tree_step,
-            adaptive_tolerance=config.adaptive_tolerance,
-            adaptive_patience=config.adaptive_patience,
-            target_eligibility=config.target_eligibility,
-            min_target_detected_cells=config.min_target_detected_cells,
-            min_target_detected_fraction=config.min_target_detected_fraction,
-            min_target_weighted_detected_fraction=(config.min_target_weighted_detected_fraction),
-            min_target_weighted_detected_ess=config.min_target_weighted_detected_ess,
             random_seed=config.random_seed,
         )
         if (
@@ -1563,7 +1610,6 @@ def _run_workflow_impl(
         tree_target_dtype = prepared.expression_dtype
         tree_predictor_dtype = prepared.predictor_dtype
         effective_bootstrap = prepared.bootstrap
-        target_eligibility_records = prepared.target_eligibility
     else:
         # A complete checkpoint already contains every fitted model. Rebuilding
         # weights and output diagnostics must not allocate the target/TF matrices
@@ -1580,37 +1626,6 @@ def _run_workflow_impl(
         effective_bootstrap = (
             config.tree_method == "random-forest" if config.bootstrap is None else config.bootstrap
         )
-        if config.target_eligibility == "all":
-            target_eligibility_records = unfiltered_target_eligibility(target_names)
-        else:
-            gene_position = {gene: index for index, gene in enumerate(gene_names)}
-            target_positions = tuple(gene_position[target] for target in target_names)
-            eligibility_records: list[TargetEligibilityRecord] = []
-            resume_target_eligibility_memory_plan = _plan_target_eligibility_memory(
-                n_cells=len(cell_names),
-                n_targets=len(target_names),
-            )
-            eligibility_block_size = resume_target_eligibility_memory_plan.block_size
-            resume_target_eligibility_working_bytes = (
-                resume_target_eligibility_memory_plan.working_bytes
-            )
-            for start in range(0, len(target_names), eligibility_block_size):
-                stop = min(len(target_names), start + eligibility_block_size)
-                # Advanced indexing is bounded to one block: a completed resume
-                # never duplicates the complete cells-by-targets matrix merely to
-                # rebuild its eligibility artifact.
-                target_values = expression_values[target_positions[start:stop], :].T
-                eligibility_records.extend(
-                    assess_target_eligibility(
-                        target_values,
-                        target_names[start:stop],
-                        mode="automatic",
-                        min_detected_cells=config.min_target_detected_cells,
-                        min_detected_fraction=config.min_target_detected_fraction,
-                    )
-                )
-                del target_values
-            target_eligibility_records = tuple(eligibility_records)
 
     memory_estimate = _estimated_memory_bytes(
         expression_bytes=int(expression_values.nbytes),
@@ -1625,9 +1640,6 @@ def _run_workflow_impl(
         normalized_centroid_weight_bytes=int(centroid_weight_data.normalized.nbytes),
         cell_distance_storage=cell_distance_storage,
     )
-    memory_estimate["resume_target_eligibility_working_total"] = (
-        resume_target_eligibility_working_bytes
-    )
     memory_estimate["inference_preparation_peak_additional"] = (
         0
         if inference_preparation_memory_plan is None
@@ -1637,16 +1649,6 @@ def _run_workflow_impl(
         0
         if inference_preparation_memory_plan is None
         else inference_preparation_memory_plan.maximum_validation_working_bytes
-    )
-    resume_target_eligibility_available_bytes_at_planning = (
-        None
-        if resume_target_eligibility_memory_plan is None
-        else resume_target_eligibility_memory_plan.available_bytes
-    )
-    resume_target_eligibility_usable_bytes_at_planning = (
-        None
-        if resume_target_eligibility_memory_plan is None
-        else resume_target_eligibility_memory_plan.usable_bytes
     )
     memory_estimate["centroid_distance_planned_persistent_upper_bound"] = (
         centroid_distance_memory_plan.estimated_persistent_bytes
@@ -1743,26 +1745,21 @@ def _run_workflow_impl(
     tree_importance_buffer_bytes = (
         config.n_estimators * len(tf_names) * np.dtype(np.float64).itemsize
     )
-    adaptive_fit_count = ceil(config.n_estimators / config.adaptive_tree_step)
-    adaptive_history_vectors = (
-        min(config.adaptive_patience, max(0, adaptive_fit_count - 1)) + 1
-        if config.adaptive_trees
-        else 0
-    )
-    adaptive_convergence_history_bytes = (
-        adaptive_history_vectors * len(tf_names) * np.dtype(np.float64).itemsize
-    )
-    estimated_model_bytes += tree_importance_buffer_bytes + adaptive_convergence_history_bytes
+    estimated_model_bytes += tree_importance_buffer_bytes
     batch_memory_plan: _BatchMemoryPlan | None = None
     model_memory_plan: MemoryPlan | None = None
+    execution_plan: _InferenceExecutionPlan | None = None
     if remaining_models:
-        batch_memory_plan = _plan_inference_batches(
+        execution_plan = _plan_inference_execution(
+            config=config,
             n_cells=len(cell_names),
             n_groups=len(group_ids),
             n_targets=len(target_names),
             n_transcription_factors=len(tf_names),
             predictor_bytes=predictor_bytes,
-            numeric_thread_limit=numeric_thread_limit,
+            response_bytes=tree_target_bytes,
+            remaining_models=remaining_models,
+            available_threads=available_threads,
             estimated_model_bytes=estimated_model_bytes,
             report_retained_bytes=memory_estimate["report_retained_rough_bytes"],
             report_auxiliary_bytes=memory_estimate["report_auxiliary_pca_working_rough_bytes"],
@@ -1771,8 +1768,8 @@ def _run_workflow_impl(
                 memory_estimate["report_aggregation_working_rough_bytes"],
             ),
             checkpoint_enabled=checkpoint is not None,
-            automatic_target_eligibility=config.target_eligibility == "automatic",
         )
+        batch_memory_plan = execution_plan.batch
         group_batch_size = batch_memory_plan.group_batch_size
         target_batch_size = batch_memory_plan.target_batch_size
         active_groups_per_inference_batch = batch_memory_plan.active_groups_per_inference_batch
@@ -1798,7 +1795,7 @@ def _run_workflow_impl(
                 models_per_inference_batch,
                 concurrent_fits * MAX_PENDING_TASKS_PER_WORKER,
             )
-            if checkpoint is not None
+            if checkpoint is not None and execution_plan.parallel.backend != "loky"
             else models_per_inference_batch
         )
     else:
@@ -1829,30 +1826,11 @@ def _run_workflow_impl(
         retained_model_results * (len(tf_names) * 256 + 768)
     )
     memory_estimate["tree_importance_buffer_float64"] = int(tree_importance_buffer_bytes)
-    memory_estimate["adaptive_convergence_history_float64"] = int(
-        adaptive_convergence_history_bytes
-    )
     memory_estimate["weight_result_working_float64"] = int(
         4 * len(cell_names) * np.dtype(np.float64).itemsize
     )
     memory_estimate["group_positive_masks_bool"] = int(
         len(cell_names) * group_batch_size * np.dtype(np.bool_).itemsize
-    )
-    memory_estimate["group_squared_weights_float64"] = int(
-        len(cell_names)
-        * group_batch_size
-        * np.dtype(np.float64).itemsize
-        * int(config.target_eligibility == "automatic")
-    )
-    memory_estimate["target_eligibility_working_bool"] = int(
-        len(cell_names)
-        * (
-            target_eligibility_chunk_size(len(cell_names), target_batch_size)
-            if target_batch_size > 0
-            else 0
-        )
-        * np.dtype(np.bool_).itemsize
-        * int(config.target_eligibility == "automatic")
     )
     # If a group contains any constant TF among its positive-weight cells,
     # inference caches one filtered predictor matrix for that group. This is a
@@ -1874,6 +1852,15 @@ def _run_workflow_impl(
     memory_estimate["estimated_model_fit_bytes"] = estimated_model_bytes
     memory_estimate["tree_importance_buffer_per_model_float64"] = tree_importance_buffer_bytes
     memory_estimate["rough_concurrent_model_upper_bound"] = concurrent_fits * estimated_model_bytes
+    memory_estimate["process_worker_base_bytes_per_worker"] = (
+        0 if execution_plan is None else execution_plan.process_worker_base_bytes
+    )
+    memory_estimate["process_workers_base_upper_bound"] = (
+        concurrent_fits * memory_estimate["process_worker_base_bytes_per_worker"]
+    )
+    memory_estimate["process_shared_memmap_backing_upper_bound"] = (
+        0 if batch_memory_plan is None else batch_memory_plan.shared_memmap_bytes
+    )
     memory_estimate["batch_planning_reserved_bytes"] = (
         0 if batch_memory_plan is None else batch_memory_plan.reserved_bytes
     )
@@ -1883,8 +1870,6 @@ def _run_workflow_impl(
             "weight_batch_retained_float64",
             "weight_result_working_float64",
             "group_positive_masks_bool",
-            "group_squared_weights_float64",
-            "target_eligibility_working_bool",
             "group_constant_filter_predictors_float32_upper_bound",
             "retained_model_result_records_rough_bytes",
         )
@@ -1907,7 +1892,6 @@ def _run_workflow_impl(
         + max(
             memory_estimate["centroid_distance_chunk_working_memory_upper_bound"],
             memory_estimate["distance_chunk_working_memory_upper_bound"],
-            memory_estimate["resume_target_eligibility_working_total"],
             inference_temporary + report_retained,
             report_preparation_temporary,
             report_render_temporary,
@@ -1916,6 +1900,11 @@ def _run_workflow_impl(
     memory_estimate["estimated_peak_heap_with_rough_trees"] = int(
         memory_estimate["estimated_peak_heap_before_tree_storage"]
         + memory_estimate["rough_concurrent_model_upper_bound"]
+    )
+    memory_estimate["estimated_peak_with_processes_and_shared_backing"] = int(
+        memory_estimate["estimated_peak_heap_with_rough_trees"]
+        + memory_estimate["process_workers_base_upper_bound"]
+        + memory_estimate["process_shared_memmap_backing_upper_bound"]
     )
     if memory_estimate["estimated_peak_heap_before_tree_storage"] > 2 * 1024**3:
         message = "Estimated non-tree heap peak exceeds 2 GiB; monitor memory during fitting"
@@ -1991,11 +1980,6 @@ def _run_workflow_impl(
         _iter_centroid_weight_diagnostic_records(centroid_weight_summaries, group_ids),
         output_dir / "centroid_weight_diagnostics.tsv",
         _CENTROID_WEIGHT_DIAGNOSTIC_COLUMNS,
-    )
-    write_tsv_gzip_records(
-        (record.to_dict() for record in target_eligibility_records),
-        output_dir / "target_eligibility.tsv.gz",
-        _TARGET_ELIGIBILITY_COLUMNS,
     )
     if representation.distance_space == "pca":
         embedding_component_count = min(3, representation.values.shape[1])
@@ -2093,11 +2077,22 @@ def _run_workflow_impl(
     del representation
     del centroid_weight_data
 
-    run_parallel_plan = resolve_thread_budget(
-        config.threads,
-        remaining_models,
-        available_threads=available_threads,
-        max_outer_jobs=concurrent_fits or None,
+    run_parallel_plan = (
+        execution_plan.parallel
+        if execution_plan is not None
+        else resolve_thread_budget(config.threads, 0, available_threads=available_threads)
+    )
+    backend_reason = (
+        "all models restored from checkpoint"
+        if execution_plan is None
+        else execution_plan.backend_reason
+    )
+    LOGGER.info(
+        "Inference backend %s, %d model worker(s), %d estimator thread(s): %s",
+        run_parallel_plan.backend,
+        run_parallel_plan.outer_jobs,
+        run_parallel_plan.model_n_jobs,
+        backend_reason,
     )
     if (
         remaining_models
@@ -2127,6 +2122,7 @@ def _run_workflow_impl(
         group_ids=group_ids,
         group_batch_size=group_batch_size,
         target_batch_size=target_batch_size,
+        models_per_inference_batch=models_per_inference_batch,
         remaining_models=remaining_models,
         weighting_context=weighting_context,
         bandwidth=bandwidth,
@@ -2145,8 +2141,6 @@ def _run_workflow_impl(
     trained_models = model_statistics.trained_models
     skipped_target_records = model_statistics.skipped_target_records
     model_status_counts = model_statistics.model_status_counts
-    adaptive_converged_models = model_statistics.adaptive_converged_models
-    adaptive_early_stopped_models = model_statistics.adaptive_early_stopped_models
     fitted_estimators_total = model_statistics.fitted_estimators_total
     fitted_estimators_min = model_statistics.fitted_estimators_min
     fitted_estimators_max = model_statistics.fitted_estimators_max
@@ -2199,9 +2193,6 @@ def _run_workflow_impl(
                     "skipped": skipped_target_records,
                     "failed": fatal_model_failures,
                     "positive_edges": n_edges,
-                    "globally_eligible_targets": sum(
-                        record.eligible for record in target_eligibility_records
-                    ),
                 },
                 "weighting": {
                     "mode": config.weight_mode,
@@ -2220,25 +2211,6 @@ def _run_workflow_impl(
     run_finished_at = datetime.now(UTC)
     total_seconds = perf_counter() - run_started
     phase_times["total"] = total_seconds
-    if config.adaptive_trees:
-        maximum_convergence_checks, earliest_adaptive_stop = adaptive_convergence_schedule(
-            n_estimators=config.n_estimators,
-            minimum_estimators=config.adaptive_min_estimators,
-            estimator_step=config.adaptive_tree_step,
-            patience=config.adaptive_patience,
-        )
-    else:
-        maximum_convergence_checks = None
-        earliest_adaptive_stop = None
-    memory_estimate_metadata: dict[str, int | None] = {
-        **memory_estimate,
-        "resume_target_eligibility_available_bytes_at_planning": (
-            resume_target_eligibility_available_bytes_at_planning
-        ),
-        "resume_target_eligibility_usable_bytes_at_planning": (
-            resume_target_eligibility_usable_bytes_at_planning
-        ),
-    }
     metadata: dict[str, Any] = {
         "status": "failed" if fatal_model_failures else "complete",
         "started_at": run_started_at.isoformat(),
@@ -2303,7 +2275,6 @@ def _run_workflow_impl(
                 "applied_before": [
                     "positive_weight_mask",
                     "constant_predictor_screening",
-                    "target_weighted_detection",
                     "effective_sample_size",
                     "tree_fitting",
                 ],
@@ -2316,6 +2287,7 @@ def _run_workflow_impl(
                 "positive_importances_changed": False,
                 "material_negative_importances": "fatal",
             },
+            "n_estimators": config.n_estimators,
             "tree_target_dtype": tree_target_dtype,
             "tree_predictor_dtype": tree_predictor_dtype,
             "inference_preparation_performed": prepared is not None,
@@ -2347,54 +2319,6 @@ def _run_workflow_impl(
                 "all-expression-genes" if config.target_list is None else "explicit-list"
             ),
             "target_ids": None if config.target_list is None else target_names,
-            "target_eligibility": {
-                "mode": config.target_eligibility,
-                "thresholds_active": config.target_eligibility == "automatic",
-                "min_detected_cells": (
-                    config.min_target_detected_cells
-                    if config.target_eligibility == "automatic"
-                    else None
-                ),
-                "min_detected_fraction": (
-                    config.min_target_detected_fraction
-                    if config.target_eligibility == "automatic"
-                    else None
-                ),
-                "min_weighted_detected_fraction": (
-                    config.min_target_weighted_detected_fraction
-                    if config.target_eligibility == "automatic"
-                    else None
-                ),
-                "min_weighted_detected_ess": (
-                    config.min_target_weighted_detected_ess
-                    if config.target_eligibility == "automatic"
-                    else None
-                ),
-                "globally_eligible_targets": sum(
-                    record.eligible for record in target_eligibility_records
-                ),
-                "globally_ineligible_targets": sum(
-                    not record.eligible for record in target_eligibility_records
-                ),
-                "predictor_space_changed": False,
-            },
-            "tree_budget": {
-                "mode": "adaptive" if config.adaptive_trees else "fixed",
-                "schedule_active": config.adaptive_trees,
-                "maximum_estimators": config.n_estimators,
-                "minimum_estimators": (
-                    config.adaptive_min_estimators if config.adaptive_trees else None
-                ),
-                "estimator_step": config.adaptive_tree_step if config.adaptive_trees else None,
-                "convergence_tolerance": (
-                    config.adaptive_tolerance if config.adaptive_trees else None
-                ),
-                "convergence_patience": (
-                    config.adaptive_patience if config.adaptive_trees else None
-                ),
-                "maximum_convergence_checks": maximum_convergence_checks,
-                "earliest_possible_stop_estimators": earliest_adaptive_stop,
-            },
         },
         "random_seed": config.random_seed,
         "parallelism": {
@@ -2403,7 +2327,23 @@ def _run_workflow_impl(
             "threads_available": available_threads,
             "preprocessing_thread_limit": 1,
             "inference_thread_budget": numeric_thread_limit,
+            "backend_requested": config.parallel_backend,
             "backend": run_parallel_plan.backend,
+            "backend_selection_reason": backend_reason,
+            "process_native_thread_limit": 1 if run_parallel_plan.backend == "loky" else None,
+            "process_input_sharing": (
+                "read-only-memory-map" if run_parallel_plan.backend == "loky" else None
+            ),
+            "process_task_window": (
+                models_per_inference_batch if run_parallel_plan.backend == "loky" else None
+            ),
+            "process_temporary_disk_required_bytes": (
+                0 if execution_plan is None else execution_plan.temporary_disk_required_bytes
+            ),
+            "process_temporary_disk_available_bytes": (
+                None if execution_plan is None else execution_plan.temporary_disk_available_bytes
+            ),
+            "memory_estimates_are_hard_limits": False,
             "parallel_level": run_parallel_plan.parallel_level,
             "nested_parallelism": False,
             "persistent_worker_pool": run_parallel_plan.outer_jobs > 1,
@@ -2439,9 +2379,6 @@ def _run_workflow_impl(
                 for status, count in model_status_counts.items()
                 if status not in TRAINED_MODEL_STATUSES | FATAL_MODEL_STATUSES
             ),
-            "target_not_estimable": model_status_counts["target_not_estimable"],
-            "adaptive_converged": adaptive_converged_models,
-            "adaptive_early_stopped": adaptive_early_stopped_models,
             "fitted_estimators_total": fitted_estimators_total,
             "fitted_estimators_min": fitted_estimators_min,
             "fitted_estimators_max": fitted_estimators_max or None,
@@ -2461,7 +2398,7 @@ def _run_workflow_impl(
             "weight_identity": (None if checkpoint is None else "sha256-float64-per-group"),
             "included_in_output": False,
         },
-        "memory_estimate_bytes": memory_estimate_metadata,
+        "memory_estimate_bytes": memory_estimate,
         "artifact_semantics": {
             "cell_weights.tsv.gz": {
                 "scope": "one effective model weight per target-group and cell",
@@ -2475,20 +2412,7 @@ def _run_workflow_impl(
                 "scope": "effective weight-mass diagnostics per target and source group",
                 "canonicalization": (
                     "exact rule, threshold, affected-cell count and removed mass applied "
-                    "before masks, weighted detection, ESS and fitting"
-                ),
-            },
-            "target_eligibility.tsv.gz": {
-                "scope": "one global eligibility decision per requested target",
-                "mode": config.target_eligibility,
-                "detection": (
-                    "expression value greater than zero in a required non-negative, "
-                    "zero-preserving target matrix"
-                ),
-                "predictor_space_changed": False,
-                "context_specific_decisions": (
-                    "model_diagnostics.tsv.gz:target_weighted_detected_fraction and "
-                    "target_weighted_detected_ess"
+                    "before masks, ESS and fitting"
                 ),
             },
             "model_diagnostics.tsv.gz": {
@@ -2497,18 +2421,7 @@ def _run_workflow_impl(
                     "records whether negative normalized importance values within one "
                     "float64 epsilon were canonicalized to exact zero"
                 ),
-                "target_weighted_detected_fraction": (
-                    "fraction of the target-group model weight carried by cells in which "
-                    "the target is detected"
-                ),
-                "target_weighted_detected_ess": (
-                    "Kish effective sample size of target-detected weighted cells"
-                ),
                 "n_estimators_fitted": "actual fitted trees, bounded by n_estimators",
-                "adaptive_converged": (
-                    "whether the optional importance-stability criterion was met at or before "
-                    "the maximum tree count; aggregate adaptive_early_stopped records savings"
-                ),
             },
             "centroid_weights.tsv.gz": {
                 "scope": "centroid construction only",

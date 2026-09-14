@@ -40,16 +40,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scores.
 - A provisional baseline shared by core and CLI: cosine distance, 250 trees, and
   `max_features=sqrt`, pending selection by the full calibration study.
-- One process-wide thread budget, non-nested parallelism, a reusable worker pool,
-  a continuously replenished deterministic rolling queue with exact model-result
-  backpressure, deterministic single-thread preprocessing, and memory-aware
-  group/target batching.
-- Optional, default-off automatic target eligibility with global detected-cell and
-  exact-variability checks, contextual weighted detected-mass and Kish-ESS gates,
-  unchanged TF/distance spaces, and complete global/per-model audit artifacts.
-- Optional, default-off adaptive tree budgets that grow the same seeded ensemble in
-  blocks up to a strict ceiling, stop on predeclared feature-importance stability, and
-  record the actual tree count, convergence schedule, and savings per model.
+- One CPU budget with operational `--parallel-backend auto|threads|processes`,
+  non-nested parallelism, persistent workers, a rolling thread queue or bounded
+  process batches, read-only shared memory maps, and workload/RAM/temporary-disk
+  preflight. Backend choice preserves model seeds, scientific output and checkpoint
+  identity; effective decisions and resource estimates are recorded.
+- Fixed-size forests with auditable fitted tree counts. Exact multi-prefix studies
+  reuse trees and individual tree importances without changing their ordered
+  float64 aggregation.
 - Compact checksummed binary checkpoint payloads with interned strings, columnar
   numeric edge storage, and group-bounded resume indexes.
 - `MemAvailable`- and cgroup-aware memory planning, live-headroom-sized distance
@@ -79,5 +77,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   child-process cancellation. A separate prepared-data equivalence harness compares
   scientific artifacts across two implementations while measuring time, memory, disk,
   batching, and effective execution decisions on hashed prepared-data slices.
+- An opt-in synthetic thread/process comparison with exact model-result hashes,
+  pool startup/reuse timings, process-tree CPU/RSS, profiling, deadlines and source
+  identity checks. The supervisor permits bounded natural child shutdown after a
+  successful parent exit while still rejecting and cleaning up orphan processes.
 
 No SPATHI version has been published yet.

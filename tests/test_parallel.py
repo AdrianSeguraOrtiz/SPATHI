@@ -1,5 +1,6 @@
 from threading import Event, get_ident
 
+import numpy as np
 import pytest
 
 import spathi.parallel as parallel_module
@@ -55,8 +56,9 @@ def test_task_seed_depends_on_identity_not_schedule_order() -> None:
     assert first != stable_task_seed(123, "group A", "target 2")
 
 
-def test_persistent_executor_reuses_pool_and_restores_input_order() -> None:
-    plan = resolve_thread_budget(2, 6, available_threads=2)
+@pytest.mark.parametrize("backend", ["threading", "loky"])
+def test_persistent_executor_reuses_pool_and_restores_input_order(backend) -> None:
+    plan = resolve_thread_budget(2, 6, available_threads=2, task_backend=backend)
 
     with PersistentTaskExecutor(plan) as executor:
         first = executor.execute(lambda value: value * 2, [3, 1, 2])
@@ -66,8 +68,9 @@ def test_persistent_executor_reuses_pool_and_restores_input_order() -> None:
     assert second == [12, 10, 11]
 
 
-def test_persistent_executor_can_consume_without_collecting_results() -> None:
-    plan = resolve_thread_budget(2, 6, available_threads=2)
+@pytest.mark.parametrize("backend", ["threading", "loky"])
+def test_persistent_executor_can_consume_without_collecting_results(backend) -> None:
+    plan = resolve_thread_budget(2, 6, available_threads=2, task_backend=backend)
     callback_threads: list[int] = []
     observed: list[int] = []
     caller_thread = get_ident()
@@ -88,8 +91,9 @@ def test_persistent_executor_can_consume_without_collecting_results() -> None:
     assert callback_threads == [caller_thread] * 3
 
 
-def test_persistent_executor_uses_a_bounded_rolling_window() -> None:
-    plan = resolve_thread_budget(3, 8, available_threads=3)
+@pytest.mark.parametrize("backend", ["threading", "loky"])
+def test_persistent_executor_bounds_unconsumed_work(backend) -> None:
+    plan = resolve_thread_budget(3, 8, available_threads=3, task_backend=backend)
     observed: list[int] = []
     yielded = 0
     consumed = 0
@@ -169,3 +173,89 @@ def test_persistent_executor_restores_thread_limits_when_pool_opening_fails(
         PersistentTaskExecutor(plan).__enter__()
 
     assert active_limits == []
+
+
+def test_process_workers_share_read_only_arrays_and_limit_native_threads() -> None:
+    import os
+    from pathlib import Path
+
+    from threadpoolctl import threadpool_info
+
+    def describe(values):
+        return (
+            os.getpid(),
+            isinstance(values, np.memmap),
+            values.flags.writeable,
+            float(values.sum()),
+            [pool["num_threads"] for pool in threadpool_info()],
+            str(values.filename) if isinstance(values, np.memmap) else None,
+        )
+
+    values = np.ones((256, 128), dtype=np.float64)
+    plan = resolve_thread_budget(2, 2, available_threads=2, task_backend="loky")
+    with PersistentTaskExecutor(plan) as executor:
+        results = executor.execute(describe, [values, values])
+    for pid, mapped, writable, total, limits, filename in results:
+        assert pid != os.getpid()
+        assert mapped
+        assert not writable
+        assert total == values.size
+        assert limits and set(limits) == {1}
+        assert not Path(filename).exists()
+    assert values.flags.writeable
+
+
+def test_process_executor_respects_the_callers_result_memory_window() -> None:
+    yielded = consumed = 0
+    maximum_ahead = 0
+
+    def tasks():
+        nonlocal yielded, maximum_ahead
+        for value in range(23):
+            yielded += 1
+            maximum_ahead = max(maximum_ahead, yielded - consumed)
+            yield value
+
+    def record(result):
+        nonlocal consumed
+        consumed += 1
+
+    plan = resolve_thread_budget(3, 23, available_threads=3, task_backend="loky")
+    with PersistentTaskExecutor(plan, process_window_size=7) as executor:
+        executor.consume(lambda value: value * 2, tasks(), on_result=record)
+    assert consumed == 23
+    assert maximum_ahead == 7
+
+
+@pytest.mark.parametrize("window", [0, -1, True, 1.5])
+def test_process_executor_rejects_an_invalid_memory_window(window) -> None:
+    plan = resolve_thread_budget(2, 4, available_threads=2, task_backend="loky")
+    with pytest.raises(ValueError, match="process_window_size"):
+        PersistentTaskExecutor(plan, process_window_size=window)
+
+
+@pytest.mark.parametrize("backend", ["threading", "loky"])
+def test_executor_propagates_worker_failure(backend) -> None:
+    def fail(value):
+        raise ValueError(f"invalid task {value}")
+
+    plan = resolve_thread_budget(2, 2, available_threads=2, task_backend=backend)
+    with pytest.raises(ValueError, match="invalid task"):
+        with PersistentTaskExecutor(plan) as executor:
+            executor.execute(fail, [1, 2])
+
+
+def test_process_cancellation_preserves_the_callback_error_and_unrelated_warnings(recwarn) -> None:
+    import warnings
+
+    def interrupt(result):
+        warnings.warn("consumer diagnostic", RuntimeWarning, stacklevel=1)
+        raise RuntimeError("checkpoint interrupted")
+
+    plan = resolve_thread_budget(2, 8, available_threads=2, task_backend="loky")
+    with pytest.raises(RuntimeError, match="checkpoint interrupted"):
+        with PersistentTaskExecutor(plan) as executor:
+            executor.consume(lambda value: value * 2, range(8), on_result=interrupt)
+    assert [(item.category, str(item.message)) for item in recwarn] == [
+        (RuntimeWarning, "consumer diagnostic")
+    ]

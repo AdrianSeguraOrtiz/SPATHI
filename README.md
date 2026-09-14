@@ -201,34 +201,6 @@ produced. PCA or expression-space distances still use the complete expression ma
 and candidate predictors still come from the complete `--tf-list`. The exact target
 file is fingerprinted in `run_metadata.json`.
 
-### Optional automatic target eligibility
-
-The primary, exact-scope policy is `--target-eligibility all`, which attempts every
-requested target and is the default. For very large all-gene analyses,
-`--target-eligibility automatic` can avoid fitting responses that have too little
-observable support. A target must then:
-
-- be non-zero in at least `--min-target-detected-cells` cells and the fraction set by
-  `--min-target-detected-fraction` over the complete input;
-- vary over the complete input; and
-- for each target-group model, carry at least
-  `--min-target-weighted-detected-fraction` of that model's total weight and reach
-  `--min-target-weighted-detected-ess` Kish effective detected-cell sample size.
-
-The delivered thresholds are 20 cells, 0.01 unweighted fraction, 0.01 weighted
-fraction, and ESS 10. Detection means a value greater than zero, and automatic mode
-therefore requires non-negative, zero-preserving target expression such as the output
-of `spathi prepare`; centered or otherwise signed inputs must use `all`. Global
-decisions are written to `target_eligibility.tsv.gz`; contextual values
-and every skipped model are written to `model_diagnostics.tsv.gz` and
-`skipped_targets.tsv`.
-
-This policy changes only whether a gene is fitted as a response. It never removes an
-eligible TF from another target's predictor set and never changes the genes used for
-PCA or expression-space distances. Because it intentionally changes the inferred
-target universe, it remains opt-in until its accuracy and coverage gates have been
-validated on an independent benchmark.
-
 ### Groups
 
 `--groups` is a TSV with a header. Its first column contains cell identifiers and it
@@ -534,9 +506,8 @@ Additional artifacts are:
 | `group_affinities.tsv` | group-level centroid affinities and per-cell size-correction factors |
 | `centroids.tsv` | long-form `(group, dimension, centroid)` values for each reusable arithmetic or explicitly weighted centroid |
 | `weight_diagnostics.tsv` | authoritative raw/effective weight mass, numerical canonicalization, sample size, ESS, and source-group contributions |
-| `target_eligibility.tsv.gz` | global per-target automatic-eligibility decisions and their measured support |
-| `skipped_targets.tsv` | constant, automatically ineligible, or otherwise non-trainable target models and reasons |
-| `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, target support, actual tree count, convergence, fit status, and timing |
+| `skipped_targets.tsv` | constant or otherwise non-trainable target models and reasons |
+| `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, fitted tree count, fit status, and timing |
 | `cell_embedding.tsv.gz` | cells, groups, and report coordinates: retained PCs for PCA-distance runs, or auxiliary PCs for expression-distance runs when reporting is enabled |
 | `pca_explained_variance.tsv` | per-PC and cumulative ratios for the fitted or auxiliary PCA; absent only for expression-distance runs with `--no-report` |
 | `report.html` | single self-contained interactive report with the Plotly runtime and run data embedded; omitted with `--no-report` |
@@ -646,32 +617,46 @@ enabled for Random Forest. An explicit CLI flag overrides that choice.
 `parameters.json` retains the requested value (`null` means automatic), while
 `run_metadata.json` records the effective boolean used for training.
 
-`--adaptive-trees` is an opt-in compute policy. It grows the same seeded ensemble in
-deterministic blocks, up to the strict `--n-estimators` ceiling, and stops a model only
-after its normalized TF-importance vector remains within the configured total-variation
-`--adaptive-tolerance` over `--adaptive-patience` prior checkpoints. The first possible
-stop is constrained by `--adaptive-min-estimators`; `--adaptive-tree-step` controls the
-block size. Delivered controls are 100, 50, 0.01, and 2 respectively. The actual tree
-count and convergence diagnostics are persisted per model and summarized in metadata.
-Importance stability is a computational stopping rule, not proof that the result equals
-the maximum-tree ensemble, so this option is disabled by default pending formal
-non-inferiority validation.
+Every trainable model fits the fixed number of trees requested by `--n-estimators`.
+The fitted count is recorded in `model_diagnostics.tsv.gz`. The convergence API can
+reuse exact prefixes of one maximum forest to compare fixed tree budgets without
+retraining their shared trees or changing their importance aggregation.
 
-`--threads` is the only public parallelism budget: `auto` uses all logical CPUs, `1` is
-sequential, and a positive integer caps available workers. Independent
-`(target group, target gene)` tasks use one persistent, bounded rolling thread queue.
-At most two tasks per worker are pending, completed work is replenished immediately,
-and results return to canonical order before serialization. Ensembles run with one
-worker when outer parallelism is active, while threadpoolctl limits numerical-library
-thread pools to avoid nested oversubscription. Per-task seeds depend on the global seed,
-group ID, and target ID—not scheduler completion order.
+`--threads` is the single CPU budget: `auto` uses all process-visible logical CPUs,
+`1` is sequential, and a positive integer caps available workers. The operational
+`--parallel-backend auto|threads|processes` chooses how independent `(target group,
+target gene)` models share that budget; it does not change the method or random seeds.
+The default `auto` selects processes only when at least twice the CPU budget of models
+remain, their maximum tree counts total at least 1,000 times that budget, and sufficient
+RAM and temporary disk space are available. Otherwise it uses threads. Explicit
+`processes` bypasses the workload threshold, not the resource checks. Too few models or
+a memory cap below the CPU budget can use threading instead; metadata records the actual
+backend and the reason. With fewer models than CPUs, one ensemble uses the thread budget.
+This automatic threshold is a conservative heuristic, not a guarantee that processes
+are faster for every dataset; use explicit backends for controlled timing experiments.
+
+Thread workers share arrays directly through a rolling queue with at most two pending
+tasks per worker. Process workers use read-only memory maps and run bounded model
+batches, each with one estimator and one native-library thread. The persistent pool is
+reused across batches; results are serialized in canonical order and progress callbacks
+stay on the main thread. Per-task seeds depend on the global seed, group ID, and target
+ID—not the backend or completion order. `--parallel-backend` and `--threads` can be
+changed when resuming the same checkpoint.
+The Python `prepare_forest_prefixes` API applies the same worker and memory policies;
+`iter_batches(target_batch_size=...)` treats the requested size as an upper bound.
 
 Before fitting, SPATHI estimates the conservative memory cost of one ensemble and
 detects available host or cgroup memory when the platform exposes it. On Linux it uses
 `MemAvailable`, then applies the tightest visible cgroup headroom. The outer model
 concurrency is capped to retain space for shared arrays; the estimate, detected
-headroom, and selected cap are recorded in `run_metadata.json`. This is a planning
-heuristic rather than a replacement for monitoring exceptionally large runs.
+headroom, and selected cap are recorded in `run_metadata.json`. Process planning adds
+a conservative 256 MiB per-worker import allowance and shared mapping backing on top
+of the fitted-model and batch estimates. It also checks temporary disk capacity for
+responses, group-specific predictors and weights across the run, plus a safety margin.
+Set `TMPDIR` before launching Python if the default temporary filesystem is too small.
+Temporary mappings are removed on pool exit; reusable idle worker processes can remain
+for up to 30 seconds in a long-lived Python session. These are estimates against current
+headroom, not hard resource limits or a replacement for monitoring large runs.
 
 PCA, centroid distances, and the optional report-only auxiliary PCA use one numerical
 thread deliberately. Different BLAS reduction orders can otherwise perturb distances

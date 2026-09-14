@@ -150,16 +150,6 @@ _SCIENTIFIC_PARAMETER_FIELDS = {
     "min_samples_leaf",
     "max_depth",
     "bootstrap",
-    "adaptive_trees",
-    "adaptive_min_estimators",
-    "adaptive_tree_step",
-    "adaptive_tolerance",
-    "adaptive_patience",
-    "target_eligibility",
-    "min_target_detected_cells",
-    "min_target_detected_fraction",
-    "min_target_weighted_detected_fraction",
-    "min_target_weighted_detected_ess",
 }
 _DATASET_MANIFEST_FIELDS = {"schema_version", "description", "datasets"}
 _DATASET_FIELDS = {
@@ -296,16 +286,6 @@ class ScientificParameters:
     min_samples_leaf: int
     max_depth: int | None
     bootstrap: bool
-    adaptive_trees: bool
-    adaptive_min_estimators: int
-    adaptive_tree_step: int
-    adaptive_tolerance: float
-    adaptive_patience: int
-    target_eligibility: str
-    min_target_detected_cells: int
-    min_target_detected_fraction: float
-    min_target_weighted_detected_fraction: float
-    min_target_weighted_detected_ess: float
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -451,7 +431,13 @@ _TABLE_RULES = (
                 "max_weight",
                 "mean_weight",
                 "median_weight",
+                "raw_weight_sum",
+                "raw_positive_cell_count",
                 "positive_cell_count",
+                "canonicalized_cell_count",
+                "canonicalized_weight_mass",
+                "canonicalization_threshold",
+                "canonicalization_relative_precision",
                 "effective_sample_size",
                 "source_weight",
                 "source_mass_percent",
@@ -508,29 +494,10 @@ _TABLE_RULES = (
                 "n_predictors_used",
                 "n_edges",
                 "importance_sum",
-                "target_detected_cells",
-                "target_detected_fraction",
-                "target_weighted_detected_fraction",
-                "target_weighted_detected_ess",
                 "n_estimators_fitted",
-                "convergence_delta",
-                "convergence_checks",
             }
         ),
         ignored_columns=frozenset({"fit_seconds"}),
-    ),
-    TableRule(
-        filename="target_eligibility.tsv.gz",
-        delimiter="\t",
-        numeric_columns=frozenset(
-            {
-                "detected_cells",
-                "detected_fraction",
-                "expression_min",
-                "expression_max",
-                "required_detected_cells",
-            }
-        ),
     ),
 )
 
@@ -558,7 +525,14 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "max_weight",
         "mean_weight",
         "median_weight",
+        "raw_weight_sum",
+        "raw_positive_cell_count",
         "positive_cell_count",
+        "canonicalized_cell_count",
+        "canonicalized_weight_mass",
+        "canonicalization_threshold",
+        "canonicalization_rule",
+        "canonicalization_relative_precision",
         "effective_sample_size",
         "warnings_json",
         "source_group",
@@ -575,6 +549,7 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "base_weight",
         "group_size_factor",
         "final_weight",
+        "canonicalized_for_fitting",
     ),
     "cell_embedding.tsv.gz": ("cell", "group", "PC1", "PC2", "PC3"),
     "centroid_weights.tsv.gz": (
@@ -612,26 +587,8 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "n_edges",
         "importance_sum",
         "fit_seconds",
-        "target_detected_cells",
-        "target_detected_fraction",
-        "target_weighted_detected_fraction",
-        "target_weighted_detected_ess",
         "n_estimators_fitted",
-        "adaptive_converged",
-        "convergence_delta",
-        "convergence_checks",
         "message",
-    ),
-    "target_eligibility.tsv.gz": (
-        "target",
-        "mode",
-        "eligible",
-        "detected_cells",
-        "detected_fraction",
-        "expression_min",
-        "expression_max",
-        "required_detected_cells",
-        "reason",
     ),
 }
 
@@ -992,13 +949,6 @@ def _max_features(value: Any, *, location: str) -> str | int | float:
     return result
 
 
-def _unit_fraction(value: Any, *, location: str) -> float:
-    result = _finite_number(value, location=location, strict=True)
-    if result > 1:
-        raise ContractError(f"{location} must not exceed 1")
-    return result
-
-
 def _parse_scientific_parameters(raw: Any) -> ScientificParameters:
     location = "scientific_parameters"
     value = _json_object(raw, location=location)
@@ -1097,49 +1047,6 @@ def _parse_scientific_parameters(raw: Any) -> ScientificParameters:
         ),
         max_depth=max_depth,
         bootstrap=_boolean(value["bootstrap"], location=f"{location}.bootstrap"),
-        adaptive_trees=_boolean(value["adaptive_trees"], location=f"{location}.adaptive_trees"),
-        adaptive_min_estimators=_integer(
-            value["adaptive_min_estimators"],
-            location=f"{location}.adaptive_min_estimators",
-            minimum=1,
-        ),
-        adaptive_tree_step=_integer(
-            value["adaptive_tree_step"],
-            location=f"{location}.adaptive_tree_step",
-            minimum=1,
-        ),
-        adaptive_tolerance=_unit_fraction(
-            value["adaptive_tolerance"],
-            location=f"{location}.adaptive_tolerance",
-        ),
-        adaptive_patience=_integer(
-            value["adaptive_patience"],
-            location=f"{location}.adaptive_patience",
-            minimum=1,
-        ),
-        target_eligibility=_choice(
-            value["target_eligibility"],
-            location=f"{location}.target_eligibility",
-            choices={"all", "automatic"},
-        ),
-        min_target_detected_cells=_integer(
-            value["min_target_detected_cells"],
-            location=f"{location}.min_target_detected_cells",
-            minimum=1,
-        ),
-        min_target_detected_fraction=_unit_fraction(
-            value["min_target_detected_fraction"],
-            location=f"{location}.min_target_detected_fraction",
-        ),
-        min_target_weighted_detected_fraction=_unit_fraction(
-            value["min_target_weighted_detected_fraction"],
-            location=f"{location}.min_target_weighted_detected_fraction",
-        ),
-        min_target_weighted_detected_ess=_finite_number(
-            value["min_target_weighted_detected_ess"],
-            location=f"{location}.min_target_weighted_detected_ess",
-            strict=True,
-        ),
     )
 
 
@@ -1449,20 +1356,6 @@ def load_profile(value: str | Path) -> EquivalenceProfile:
     ids = tuple(case.id for case in cases)
     if len(ids) != len(set(ids)):
         raise ContractError("case ids must be unique")
-    if scientific_parameters.adaptive_trees:
-        invalid_estimators = sorted(
-            {
-                n_estimators
-                for case in cases
-                for n_estimators in case.n_estimators
-                if n_estimators <= scientific_parameters.adaptive_min_estimators
-            }
-        )
-        if invalid_estimators:
-            raise ContractError(
-                "adaptive_min_estimators must be smaller than every n_estimators budget; "
-                f"invalid values: {invalid_estimators}"
-            )
     signatures: dict[tuple[object, ...], str] = {}
     for case in cases:
         values = asdict(case)
@@ -2229,25 +2122,6 @@ def build_infer_command(
         "--min-samples-leaf",
         str(scientific_parameters.min_samples_leaf),
         "--bootstrap" if scientific_parameters.bootstrap else "--no-bootstrap",
-        "--adaptive-trees" if scientific_parameters.adaptive_trees else "--no-adaptive-trees",
-        "--adaptive-min-estimators",
-        str(scientific_parameters.adaptive_min_estimators),
-        "--adaptive-tree-step",
-        str(scientific_parameters.adaptive_tree_step),
-        "--adaptive-tolerance",
-        str(scientific_parameters.adaptive_tolerance),
-        "--adaptive-patience",
-        str(scientific_parameters.adaptive_patience),
-        "--target-eligibility",
-        scientific_parameters.target_eligibility,
-        "--min-target-detected-cells",
-        str(scientific_parameters.min_target_detected_cells),
-        "--min-target-detected-fraction",
-        str(scientific_parameters.min_target_detected_fraction),
-        "--min-target-weighted-detected-fraction",
-        str(scientific_parameters.min_target_weighted_detected_fraction),
-        "--min-target-weighted-detected-ess",
-        str(scientific_parameters.min_target_weighted_detected_ess),
         "--random-seed",
         str(seed),
         "--threads",
@@ -2485,6 +2359,7 @@ def _normalized_parameters(path: Path) -> dict[str, Any]:
         raise ContractError("parameters.json must contain a JSON object")
     normalized = dict(document)
     normalized.pop("output_dir", None)
+    normalized.pop("parallel_backend", None)
     return normalized
 
 
@@ -2633,20 +2508,6 @@ def _audit_run_metadata(
             "min_samples_leaf": scientific_parameters.min_samples_leaf,
             "max_depth": scientific_parameters.max_depth,
             "bootstrap": scientific_parameters.bootstrap,
-            "adaptive_trees": scientific_parameters.adaptive_trees,
-            "adaptive_min_estimators": scientific_parameters.adaptive_min_estimators,
-            "adaptive_tree_step": scientific_parameters.adaptive_tree_step,
-            "adaptive_tolerance": scientific_parameters.adaptive_tolerance,
-            "adaptive_patience": scientific_parameters.adaptive_patience,
-            "target_eligibility": scientific_parameters.target_eligibility,
-            "min_target_detected_cells": scientific_parameters.min_target_detected_cells,
-            "min_target_detected_fraction": (scientific_parameters.min_target_detected_fraction),
-            "min_target_weighted_detected_fraction": (
-                scientific_parameters.min_target_weighted_detected_fraction
-            ),
-            "min_target_weighted_detected_ess": (
-                scientific_parameters.min_target_weighted_detected_ess
-            ),
             "report": report,
         }
         requested_mismatches = {

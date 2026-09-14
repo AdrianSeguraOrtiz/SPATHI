@@ -26,9 +26,9 @@ from spathi.config import (
     KERNEL_NAMES,
     MAX_FEATURES_NAMES,
     MAX_RANDOM_SEED,
+    PARALLEL_BACKENDS,
     PCA_SVD_SOLVERS,
     PREPARATION_NORMALIZATIONS,
-    TARGET_ELIGIBILITY_MODES,
     TREE_METHODS,
     WEIGHT_MODES,
     MaxFeatures,
@@ -114,16 +114,6 @@ def _positive_float(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a positive number") from exc
     if not isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive finite number")
-    return parsed
-
-
-def _unit_fraction(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
-    if not isfinite(parsed) or not 0 < parsed <= 1:
-        raise argparse.ArgumentTypeError("must be a finite number in (0, 1]")
     return parsed
 
 
@@ -389,10 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-estimators",
         type=_positive_int,
         default=DEFAULT_N_ESTIMATORS,
-        help=(
-            "trees in every fixed ensemble, or the strict per-model maximum when "
-            "adaptive trees are enabled"
-        ),
+        help="number of trees in every ensemble",
     )
     model.add_argument(
         "--max-features",
@@ -434,86 +421,17 @@ def build_parser() -> argparse.ArgumentParser:
             "deterministic model seeds"
         ),
     )
-    model.add_argument(
-        "--adaptive-trees",
-        action=argparse.BooleanOptionalAction,
-        default=_config_default("adaptive_trees"),
-        help=(
-            "grow deterministic tree blocks and stop a target model after stable "
-            "importance estimates; n-estimators remains the strict maximum"
-        ),
-    )
-    model.add_argument(
-        "--adaptive-min-estimators",
-        type=_positive_int,
-        default=_config_default("adaptive_min_estimators"),
-        help="minimum trees required before adaptive convergence can stop a model",
-    )
-    model.add_argument(
-        "--adaptive-tree-step",
-        type=_positive_int,
-        default=_config_default("adaptive_tree_step"),
-        help="trees added between adaptive convergence checks",
-    )
-    model.add_argument(
-        "--adaptive-tolerance",
-        type=_unit_fraction,
-        default=_config_default("adaptive_tolerance"),
-        help="maximum total-variation change accepted between importance estimates",
-    )
-    model.add_argument(
-        "--adaptive-patience",
-        type=_positive_int,
-        default=_config_default("adaptive_patience"),
-        help=(
-            "number of preceding importance checkpoints that must all lie within "
-            "the convergence tolerance before stopping a model"
-        ),
-    )
-    model.add_argument(
-        "--target-eligibility",
-        choices=TARGET_ELIGIBILITY_MODES,
-        default=_config_default("target_eligibility"),
-        help=(
-            "use every requested target or automatically skip targets lacking enough "
-            "detectable expression; TF predictor eligibility is never changed"
-        ),
-    )
-    model.add_argument(
-        "--min-target-detected-cells",
-        type=_positive_int,
-        default=_config_default("min_target_detected_cells"),
-        help="absolute detected-cell requirement used by automatic target eligibility",
-    )
-    model.add_argument(
-        "--min-target-detected-fraction",
-        type=_unit_fraction,
-        default=_config_default("min_target_detected_fraction"),
-        help="relative detected-cell requirement used by automatic target eligibility",
-    )
-    model.add_argument(
-        "--min-target-weighted-detected-fraction",
-        type=_unit_fraction,
-        default=_config_default("min_target_weighted_detected_fraction"),
-        help=(
-            "minimum fraction of each target group's total model-weight mass carried "
-            "by cells in which the target is detected"
-        ),
-    )
-    model.add_argument(
-        "--min-target-weighted-detected-ess",
-        type=_positive_float,
-        default=_config_default("min_target_weighted_detected_ess"),
-        help=(
-            "minimum effective sample size among detected cells under each target-group "
-            "weight vector"
-        ),
-    )
     execution.add_argument(
         "--threads",
         type=_threads,
         default=_config_default("threads"),
         help="single parallelism budget; 'auto' uses all process-visible CPUs",
+    )
+    execution.add_argument(
+        "--parallel-backend",
+        choices=PARALLEL_BACKENDS,
+        default=_config_default("parallel_backend"),
+        help="model worker backend; auto uses processes for substantial workloads with enough RAM",
     )
     execution.add_argument(
         "--report",
@@ -565,18 +483,9 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         min_samples_leaf=args.min_samples_leaf,
         max_depth=args.max_depth,
         bootstrap=args.bootstrap,
-        adaptive_trees=args.adaptive_trees,
-        adaptive_min_estimators=args.adaptive_min_estimators,
-        adaptive_tree_step=args.adaptive_tree_step,
-        adaptive_tolerance=args.adaptive_tolerance,
-        adaptive_patience=args.adaptive_patience,
-        target_eligibility=args.target_eligibility,
-        min_target_detected_cells=args.min_target_detected_cells,
-        min_target_detected_fraction=args.min_target_detected_fraction,
-        min_target_weighted_detected_fraction=args.min_target_weighted_detected_fraction,
-        min_target_weighted_detected_ess=args.min_target_weighted_detected_ess,
         random_seed=args.random_seed,
         threads=args.threads,
+        parallel_backend=args.parallel_backend,
         report=args.report,
     )
 
