@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import ceil
+
 import pytest
 
 from spathi import resources
@@ -168,8 +170,67 @@ def test_model_memory_estimate_respects_leaf_and_depth_bounds() -> None:
         min_samples_leaf=1,
         max_depth=2,
     )
+    weight_limited = estimate_model_memory_bytes(
+        n_cells=100,
+        n_transcription_factors=20,
+        n_estimators=50,
+        min_samples_leaf=1,
+        max_depth=None,
+        min_weight_fraction_leaf=0.1,
+    )
     assert leaf_limited < unconstrained
     assert depth_limited < unconstrained
+    assert weight_limited < unconstrained
+    assert (
+        estimate_model_memory_bytes(
+            n_cells=100,
+            n_transcription_factors=20,
+            n_estimators=50,
+            min_samples_leaf=1,
+            max_depth=None,
+            min_weight_fraction_leaf=0.0,
+        )
+        == unconstrained
+    )
+
+
+def test_model_memory_weight_fraction_uses_a_conservative_leaf_bound() -> None:
+    n_cells = 100
+    n_tfs = 20
+    n_estimators = 5
+    fraction = 0.3
+    maximum_leaves = ceil(1.0 / fraction)
+    expected = (
+        n_estimators * (2 * maximum_leaves - 1) * resources._BYTES_PER_TREE_NODE_ESTIMATE
+        + n_cells * (n_tfs - 1) * 4
+    )
+
+    assert (
+        estimate_model_memory_bytes(
+            n_cells=n_cells,
+            n_transcription_factors=n_tfs,
+            n_estimators=n_estimators,
+            min_samples_leaf=1,
+            max_depth=None,
+            min_weight_fraction_leaf=fraction,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("value", [-0.01, 0.500_001, float("nan"), float("inf"), True])
+def test_model_memory_estimate_rejects_invalid_minimum_leaf_weight_fraction(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="min_weight_fraction_leaf"):
+        estimate_model_memory_bytes(
+            n_cells=100,
+            n_transcription_factors=20,
+            n_estimators=5,
+            min_samples_leaf=1,
+            max_depth=None,
+            min_weight_fraction_leaf=value,  # type: ignore[arg-type]
+        )
 
 
 def test_memory_plan_caps_concurrency_and_reports_infeasible_budget() -> None:

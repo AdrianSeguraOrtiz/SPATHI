@@ -41,8 +41,10 @@ MAX_FEATURES_NAMES: tuple[Literal["sqrt", "log2"], ...] = ("sqrt", "log2")
 MAX_RANDOM_SEED = 2**32 - 1
 DEFAULT_DISTANCE_METRIC: DistanceMetric = "cosine"
 DEFAULT_BANDWIDTH_SCALE: float = 1.0
-DEFAULT_N_ESTIMATORS = 250
-DEFAULT_MAX_FEATURES: MaxFeatures = "sqrt"
+DEFAULT_N_ESTIMATORS = 50
+DEFAULT_MAX_FEATURES: MaxFeatures = 0.5
+DEFAULT_MIN_SAMPLES_LEAF = 2
+DEFAULT_MIN_WEIGHT_FRACTION_LEAF = 0.1
 DEFAULT_THREADS: ThreadBudget = "auto"
 GENE_IDENTIFIERS: tuple[GeneIdentifier, ...] = ("name", "id")
 DUPLICATE_GENE_POLICIES: tuple[DuplicateGenePolicy, ...] = ("sum", "error")
@@ -192,12 +194,13 @@ class SpathiConfig:
     kernel: KernelName = "gaussian"
     bandwidth: Bandwidth = "auto"
     bandwidth_scale: float = DEFAULT_BANDWIDTH_SCALE
-    group_size_correction: GroupSizeCorrection = "cap-to-target"
+    group_size_correction: GroupSizeCorrection = "none"
     tree_method: TreeMethod = "extra-trees"
     n_estimators: int = DEFAULT_N_ESTIMATORS
     max_features: MaxFeatures = DEFAULT_MAX_FEATURES
-    min_samples_leaf: int = 1
+    min_samples_leaf: int = DEFAULT_MIN_SAMPLES_LEAF
     max_depth: int | None = None
+    min_weight_fraction_leaf: float = DEFAULT_MIN_WEIGHT_FRACTION_LEAF
     bootstrap: bool | None = None
     random_seed: int = 123
     threads: ThreadBudget = DEFAULT_THREADS
@@ -286,6 +289,18 @@ class SpathiConfig:
         _validate_integer("min_samples_leaf", self.min_samples_leaf, minimum=1)
         if self.max_depth is not None:
             _validate_integer("max_depth", self.max_depth, minimum=1)
+        if isinstance(self.min_weight_fraction_leaf, bool) or not isinstance(
+            self.min_weight_fraction_leaf, (int, float)
+        ):
+            raise TypeError("min_weight_fraction_leaf must be a number")
+        min_weight_fraction_leaf = float(self.min_weight_fraction_leaf)
+        if not isfinite(min_weight_fraction_leaf) or not 0 <= min_weight_fraction_leaf <= 0.5:
+            raise ValueError("min_weight_fraction_leaf must be in the interval [0, 0.5]")
+        object.__setattr__(
+            self,
+            "min_weight_fraction_leaf",
+            min_weight_fraction_leaf,
+        )
         if self.bootstrap is not None and type(self.bootstrap) is not bool:
             raise TypeError("bootstrap must be a boolean or None")
         _validate_integer("random_seed", self.random_seed, minimum=0)

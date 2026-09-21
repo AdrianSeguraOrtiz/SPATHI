@@ -239,6 +239,7 @@ def estimate_model_memory_bytes(
     n_estimators: int,
     min_samples_leaf: int,
     max_depth: int | None,
+    min_weight_fraction_leaf: float = 0.0,
 ) -> int:
     """Estimate a conservative peak for one fitted tree ensemble.
 
@@ -259,8 +260,22 @@ def estimate_model_memory_bytes(
         isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 1
     ):
         raise ValueError("max_depth must be a positive integer or None")
+    if (
+        isinstance(min_weight_fraction_leaf, bool)
+        or not isinstance(min_weight_fraction_leaf, Real)
+        or not 0.0 <= float(min_weight_fraction_leaf) <= 0.5
+    ):
+        raise ValueError("min_weight_fraction_leaf must be a finite number in [0, 0.5]")
 
     maximum_leaves = max(1, ceil(n_cells / min_samples_leaf))
+    if min_weight_fraction_leaf > 0:
+        # Every terminal node must contain at least this fraction of the
+        # ensemble's total sample weight. Terminal nodes partition that weight,
+        # so ceil(1 / fraction) is a deliberately conservative leaf bound.
+        maximum_leaves = min(
+            maximum_leaves,
+            ceil(1.0 / float(min_weight_fraction_leaf)),
+        )
     maximum_nodes = 2 * maximum_leaves - 1
     if max_depth is not None and max_depth + 1 < maximum_nodes.bit_length():
         depth_limited_nodes = 2 ** (max_depth + 1) - 1

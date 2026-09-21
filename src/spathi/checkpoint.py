@@ -33,7 +33,7 @@ _DATABASE_NAME = "checkpoint.sqlite3"
 _LOCK_DATABASE_NAME = "run-lock.sqlite3"
 _SQLITE_SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _MODEL_PAYLOAD_MAGIC = b"SPTHMODL"
-_MODEL_PAYLOAD_HEADER = struct.Struct("<8sBBIQQIIdIIIddIQQQQQ")
+_MODEL_PAYLOAD_HEADER = struct.Struct("<8sBBIQQIIdIIIddI" + "QdddQ" * 3 + "QQQQQ")
 _MAX_SQLITE_ID = (1 << 63) - 1
 _MAX_UINT32 = (1 << 32) - 1
 _ID_DTYPES: Mapping[int, np.dtype[Any]] = {
@@ -300,6 +300,18 @@ def _result_payload(
         _MAX_UINT32,
         label="n_estimators_fitted",
     )
+    tree_nodes_total = _validated_uint(
+        stat.tree_nodes_total, _MAX_SQLITE_ID, label="tree_nodes_total"
+    )
+    tree_nodes_max = _validated_uint(stat.tree_nodes_max, _MAX_SQLITE_ID, label="tree_nodes_max")
+    tree_leaves_total = _validated_uint(
+        stat.tree_leaves_total, _MAX_SQLITE_ID, label="tree_leaves_total"
+    )
+    tree_leaves_max = _validated_uint(stat.tree_leaves_max, _MAX_SQLITE_ID, label="tree_leaves_max")
+    tree_depth_total = _validated_uint(
+        stat.tree_depth_total, _MAX_SQLITE_ID, label="tree_depth_total"
+    )
+    tree_depth_max = _validated_uint(stat.tree_depth_max, _MAX_SQLITE_ID, label="tree_depth_max")
     discarded_ids = tuple(symbol_ids[value] for value in stat.discarded_predictors)
     constant_ids = tuple(symbol_ids[value] for value in stat.constant_predictors)
     source_ids = tuple(symbol_ids[edge.source] for edge in ordered_edges)
@@ -327,6 +339,21 @@ def _result_payload(
         _finite_float(stat.importance_sum, label="importance_sum"),
         _finite_float(stat.fit_seconds, label="fit_seconds"),
         n_estimators_fitted,
+        tree_nodes_total,
+        _finite_float(stat.tree_nodes_mean, label="tree_nodes_mean"),
+        _finite_float(stat.tree_nodes_p50, label="tree_nodes_p50"),
+        _finite_float(stat.tree_nodes_p95, label="tree_nodes_p95"),
+        tree_nodes_max,
+        tree_leaves_total,
+        _finite_float(stat.tree_leaves_mean, label="tree_leaves_mean"),
+        _finite_float(stat.tree_leaves_p50, label="tree_leaves_p50"),
+        _finite_float(stat.tree_leaves_p95, label="tree_leaves_p95"),
+        tree_leaves_max,
+        tree_depth_total,
+        _finite_float(stat.tree_depth_mean, label="tree_depth_mean"),
+        _finite_float(stat.tree_depth_p50, label="tree_depth_p50"),
+        _finite_float(stat.tree_depth_p95, label="tree_depth_p95"),
+        tree_depth_max,
         symbol_ids[stat.message],
         skipped_detail_id,
         edge_context_id,
@@ -377,6 +404,21 @@ def _result_from_payload(
             importance_sum,
             fit_seconds,
             n_estimators_fitted,
+            tree_nodes_total,
+            tree_nodes_mean,
+            tree_nodes_p50,
+            tree_nodes_p95,
+            tree_nodes_max,
+            tree_leaves_total,
+            tree_leaves_mean,
+            tree_leaves_p50,
+            tree_leaves_p95,
+            tree_leaves_max,
+            tree_depth_total,
+            tree_depth_mean,
+            tree_depth_p50,
+            tree_depth_p95,
+            tree_depth_max,
             message_id,
             skipped_detail_id,
             edge_context_id,
@@ -397,6 +439,15 @@ def _result_from_payload(
             ("weight_sum", weight_sum),
             ("importance_sum", importance_sum),
             ("fit_seconds", fit_seconds),
+            ("tree_nodes_mean", tree_nodes_mean),
+            ("tree_nodes_p50", tree_nodes_p50),
+            ("tree_nodes_p95", tree_nodes_p95),
+            ("tree_leaves_mean", tree_leaves_mean),
+            ("tree_leaves_p50", tree_leaves_p50),
+            ("tree_leaves_p95", tree_leaves_p95),
+            ("tree_depth_mean", tree_depth_mean),
+            ("tree_depth_p50", tree_depth_p50),
+            ("tree_depth_p95", tree_depth_p95),
         ):
             if not np.isfinite(value):
                 raise ValueError(f"{label} must be finite")
@@ -516,6 +567,21 @@ def _result_from_payload(
             importance_sum=importance_sum,
             fit_seconds=fit_seconds,
             n_estimators_fitted=n_estimators_fitted,
+            tree_nodes_total=tree_nodes_total,
+            tree_nodes_mean=tree_nodes_mean,
+            tree_nodes_p50=tree_nodes_p50,
+            tree_nodes_p95=tree_nodes_p95,
+            tree_nodes_max=tree_nodes_max,
+            tree_leaves_total=tree_leaves_total,
+            tree_leaves_mean=tree_leaves_mean,
+            tree_leaves_p50=tree_leaves_p50,
+            tree_leaves_p95=tree_leaves_p95,
+            tree_leaves_max=tree_leaves_max,
+            tree_depth_total=tree_depth_total,
+            tree_depth_mean=tree_depth_mean,
+            tree_depth_p50=tree_depth_p50,
+            tree_depth_p95=tree_depth_p95,
+            tree_depth_max=tree_depth_max,
             message=message,
         )
         result = ModelResult(edges=edges, skipped=skipped, stat=stat, trained=trained)

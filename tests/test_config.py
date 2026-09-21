@@ -34,6 +34,10 @@ def make_config(**changes: object) -> SpathiConfig:
         ("max_features", "all"),
         ("min_samples_leaf", 0),
         ("max_depth", 0),
+        ("min_weight_fraction_leaf", -0.01),
+        ("min_weight_fraction_leaf", 0.500_001),
+        ("min_weight_fraction_leaf", float("inf")),
+        ("min_weight_fraction_leaf", float("nan")),
         ("random_seed", -1),
         ("random_seed", 2**32),
         ("threads", 0),
@@ -74,6 +78,8 @@ def test_invalid_scalar_configuration_is_rejected(field: str, value: object) -> 
         ("min_samples_leaf", False),
         ("max_depth", 2.0),
         ("max_depth", False),
+        ("min_weight_fraction_leaf", "0.1"),
+        ("min_weight_fraction_leaf", False),
         ("bootstrap", "yes"),
         ("random_seed", 1.0),
         ("random_seed", True),
@@ -123,10 +129,12 @@ def test_configuration_serializes_paths_and_defaults() -> None:
     assert values["bandwidth"] == "auto"
     assert values["bandwidth_scale"] == 1.0
     assert values["weight_mode"] == "cell-distance-group-anchored"
-    assert values["group_size_correction"] == "cap-to-target"
+    assert values["group_size_correction"] == "none"
     assert values["bootstrap"] is None
-    assert values["n_estimators"] == 250
-    assert values["max_features"] == "sqrt"
+    assert values["n_estimators"] == 50
+    assert values["max_features"] == 0.5
+    assert values["min_samples_leaf"] == 2
+    assert values["min_weight_fraction_leaf"] == 0.1
     assert values["target_list"] is None
     assert values["centroid_weights"] is None
     assert values["report"] is True
@@ -157,6 +165,13 @@ def test_configuration_requires_explicit_keywords() -> None:
 def test_configuration_accepts_explicit_bootstrap_overrides() -> None:
     assert make_config(bootstrap=True).bootstrap is True
     assert make_config(bootstrap=False).bootstrap is False
+
+
+def test_configuration_canonicalizes_valid_minimum_leaf_weight_fraction() -> None:
+    configured = make_config(min_weight_fraction_leaf=0.1)
+    assert configured.min_weight_fraction_leaf == 0.1
+    assert type(configured.min_weight_fraction_leaf) is float
+    assert make_config(min_weight_fraction_leaf=0).min_weight_fraction_leaf == 0.0
 
 
 def test_bandwidth_scale_is_only_valid_for_automatic_bandwidth() -> None:

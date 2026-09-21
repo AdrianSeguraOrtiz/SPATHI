@@ -58,6 +58,22 @@ def _model_stat(
         n_edges=n_edges,
         importance_sum=1.0,
         fit_seconds=0.1,
+        n_estimators_fitted=2,
+        tree_nodes_total=8,
+        tree_nodes_mean=4.0,
+        tree_nodes_p50=4.0,
+        tree_nodes_p95=4.9,
+        tree_nodes_max=5,
+        tree_leaves_total=5,
+        tree_leaves_mean=2.5,
+        tree_leaves_p50=2.5,
+        tree_leaves_p95=2.95,
+        tree_leaves_max=3,
+        tree_depth_total=3,
+        tree_depth_mean=1.5,
+        tree_depth_p50=1.5,
+        tree_depth_p95=1.95,
+        tree_depth_max=2,
     )
 
 
@@ -134,6 +150,12 @@ def test_incremental_writer_produces_exact_schemas_and_canonical_order(tmp_path:
     weight_diagnostics = pd.read_csv(output_dir / "weight_diagnostics.tsv", sep="\t")
     assert weight_diagnostics["source_group"].tolist() == ["A", "B"]
     assert weight_diagnostics["canonicalized_cell_count"].tolist() == [0, 0]
+    model_diagnostics = pd.read_csv(output_dir / "model_diagnostics.tsv.gz", sep="\t")
+    assert model_diagnostics.loc[0, "n_estimators_fitted"] == 2
+    assert model_diagnostics.loc[0, "tree_nodes_total"] == 8
+    assert model_diagnostics.loc[0, "tree_nodes_p95"] == 4.9
+    assert model_diagnostics.loc[0, "tree_leaves_total"] == 5
+    assert model_diagnostics.loc[0, "tree_depth_max"] == 2
 
 
 def test_weight_artifacts_identify_each_numerically_canonicalized_cell(tmp_path: Path) -> None:
