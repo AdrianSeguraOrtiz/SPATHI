@@ -4,8 +4,8 @@
 
 SPATHI infers a gene-regulatory network for each cell group in a preprocessed
 single-cell RNA-seq expression matrix. Instead of fitting each group in isolation, it
-fits every target model with all cells and changes each observation's contribution
-according to its transcriptomic proximity to the group of interest.
+derives group-specific contributions from all cells according to their transcriptomic
+proximity to the group of interest and fits the models directly on those cells.
 
 > [!IMPORTANT]
 > SPATHI is an early-stage scientific tool. It produces hypotheses based on predictive
@@ -39,7 +39,7 @@ For each target group, SPATHI:
    weights and the effective contribution of each source group.
 
 The PCA or expression representation in steps 1–3 is used **only to define weights**.
-Models always use the expression values supplied by the user.
+Models always use the cell-level expression values supplied by the user.
 
 ## Installation
 
@@ -143,7 +143,9 @@ prepared/sample-01/
 
 The H5 matrix remains sparse throughout processing. Writing the required dense TSV
 materializes only one gene row of one analysis unit at a time, never the complete
-input matrix. See [the preparation contract](docs/preparation.md) for formulas,
+input matrix. See the
+[preparation contract](https://github.com/AdrianSeguraOrtiz/SPATHI/blob/main/docs/preparation.md)
+for formulas,
 validation rules, output provenance, and all options.
 
 ## Input contracts
@@ -263,11 +265,13 @@ The `--weight-mode` option provides exactly three definitions:
 The conservative default is `cell-distance-group-anchored`, which fixes the target
 population as the unit-weight core while keeping external-cell weights individual.
 
-The provisional development baseline uses cosine distance, 250 trees per ensemble,
-and `sqrt` predictors considered at each split. These values are encoded once in
-`SpathiConfig` and shared by both the Python API and CLI. They remain provisional until
-the full calibration study selects a first-release configuration; they are not a claim
-of optimality for every biological dataset.
+The default model uses cosine distance, 50 trees per ensemble, half of the eligible
+predictors at each split, at least two cells per leaf, and at least 10% of the model's
+total sample-weight mass per leaf. External-group size correction is disabled. These
+values are encoded once in `SpathiConfig` and shared by the Python API and CLI. They
+were selected together because the weighted leaf constraint sharply reduced fitted
+tree size while preserving accuracy in development validation; they remain explicit
+parameters rather than a claim of universal optimality.
 
 SPATHI stores distance, base weight, group-size factor, and final model weight
 separately. With `--group-size-correction cap-to-target`, an external cell from group
@@ -319,7 +323,7 @@ log messages. Redirected output stays plain and emits periodic progress records;
 `NO_COLOR` is respected.
 
 From a source checkout or unpacked source distribution, run the bundled example with
-the provisional baseline:
+the stable first-version defaults:
 
 ```bash
 spathi infer \
@@ -477,6 +481,9 @@ attempt; a checkpointed attempt can then be resumed. An exception from the final
 notification is logged because the complete output has already been published
 atomically.
 
+`max_depth=<positive integer>` supplies the tree-depth cap, while `None` leaves that
+cap unset.
+
 ## Outputs
 
 Each run directory is self-contained. Its primary artifact is `network.csv` with these
@@ -507,7 +514,7 @@ Additional artifacts are:
 | `centroids.tsv` | long-form `(group, dimension, centroid)` values for each reusable arithmetic or explicitly weighted centroid |
 | `weight_diagnostics.tsv` | authoritative raw/effective weight mass, numerical canonicalization, sample size, ESS, and source-group contributions |
 | `skipped_targets.tsv` | constant or otherwise non-trainable target models and reasons |
-| `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, fitted tree count, fit status, and timing |
+| `model_diagnostics.tsv.gz` | per-model seeds, predictor exclusions, fitted tree count, exact node/leaf/depth summaries, fit status, and timing |
 | `cell_embedding.tsv.gz` | cells, groups, and report coordinates: retained PCs for PCA-distance runs, or auxiliary PCs for expression-distance runs when reporting is enabled |
 | `pca_explained_variance.tsv` | per-PC and cumulative ratios for the fitted or auxiliary PCA; absent only for expression-distance runs with `--no-report` |
 | `report.html` | single self-contained interactive report with the Plotly runtime and run data embedded; omitted with `--no-report` |
@@ -517,8 +524,8 @@ Additional artifacts are:
 `group_affinities.tsv` is a centroid-level diagnostic. Its `base_affinity` is an
 actual per-cell base model weight only in `group-distance` mode; it must not be read as
 the effective contribution of a group in either cell-distance mode. The exact weights
-passed to the models are `cell_weights.tsv.gz:final_weight`, and their exact aggregate
-contributions are in `weight_diagnostics.tsv`.
+passed to cell-level models are `cell_weights.tsv.gz:final_weight`, and their exact
+aggregate contributions are in `weight_diagnostics.tsv`.
 
 Before masks, weighted-support checks, ESS calculations, or model fitting, SPATHI maps
 a positive weight whose normalized share of total mass is at or below binary64 machine
@@ -618,9 +625,35 @@ enabled for Random Forest. An explicit CLI flag overrides that choice.
 `run_metadata.json` records the effective boolean used for training.
 
 Every trainable model fits the fixed number of trees requested by `--n-estimators`.
-The fitted count is recorded in `model_diagnostics.tsv.gz`. The convergence API can
-reuse exact prefixes of one maximum forest to compare fixed tree budgets without
-retraining their shared trees or changing their importance aggregation.
+`--max-depth` optionally caps how far a tree may grow; omission leaves depth unbounded
+by that parameter, subject to the data and the other estimator stopping rules. For
+every fitted model, `model_diagnostics.tsv.gz` reads the realized structures directly
+from scikit-learn's fitted trees and records the tree count plus total, arithmetic mean,
+linear p50, linear p95, and maximum for node count, leaf count, and observed depth.
+These are measured structures, not estimates inferred from elapsed time or requested
+limits. `run_metadata.json` also provides run-level totals, per-tree means and maxima.
+The convergence API can reuse exact prefixes of one maximum forest to compare fixed
+tree budgets without retraining their shared trees or changing their importance
+aggregation.
+
+`--min-weight-fraction-leaf F` (Python API:
+`SpathiConfig(min_weight_fraction_leaf=F)`) requires each tree leaf to contain at least
+the fraction `F` of the total `sample_weight` of that model. `F` must be in `[0, 0.5]`
+and defaults to `0.1`. This differs from
+`--min-samples-leaf`: the latter counts training rows, whereas the former measures
+their group-specific statistical weight. Both conditions apply to a proposed split.
+Multiplying every model weight by the same positive constant leaves the fractional
+condition unchanged.
+
+A positive value changes the fitted trees and potentially their feature importances
+and inferred edges. It may yield smaller trees or shorter runtimes, but it is a
+scientific regularization setting that requires calibration and fidelity assessment,
+not a computationally neutral optimization. The requested value is retained in
+`parameters.json` and `run_metadata.json`; exact fitted node, leaf, and depth summaries
+remain available in `model_diagnostics.tsv.gz` and are aggregated in
+`run_metadata.json` so that its structural effect can be audited.
+
+`--min-samples-leaf` is expressed in source cells and defaults to two.
 
 `--threads` is the single CPU budget: `auto` uses all process-visible logical CPUs,
 `1` is sequential, and a positive integer caps available workers. The operational
@@ -710,8 +743,8 @@ python benchmarks/benchmark_scaling.py \
 ```
 
 The explicit 25-tree/20-component settings above are a reduced development scout, not
-the provisional 250-tree/50-component baseline. It executes complete CLI child processes
-in balanced, reproducibly shuffled orders and
+the stable 50-tree default configuration. It executes complete CLI child processes in
+balanced, reproducibly shuffled orders and
 writes machine-readable CSV measurements to standard output and to a synchronously
 flushed `benchmark-results.csv` inside the reported workspace. Each row includes child
 wall time; sampled process-tree user/system CPU (a lower bound for descendants that
