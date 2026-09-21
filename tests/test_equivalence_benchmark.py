@@ -299,6 +299,7 @@ def _profile_document(*, targets: list[int] | None = None) -> dict[str, object]:
             "max_features": "sqrt",
             "min_samples_leaf": 1,
             "max_depth": None,
+            "min_weight_fraction_leaf": 0.0,
             "bootstrap": False,
         },
         "defaults": {
@@ -431,6 +432,12 @@ def test_builtin_equivalence_profiles_follow_the_current_contract(benchmark: Mod
     assert not full_target.allow_identical_implementations
     assert full_target.cases[0].target_counts == ("all",)
     assert full_target.cases[0].n_estimators == (250,)
+    for profile in (smoke, progressive, full_target):
+        scientific = profile.scientific_parameters
+        assert scientific.multi_group_size_correction == "none"
+        assert scientific.max_features == 0.5
+        assert scientific.min_samples_leaf == 2
+        assert scientific.min_weight_fraction_leaf == 0.1
 
 
 def test_equivalence_profile_rejects_rescaling_an_explicit_bandwidth(
@@ -446,6 +453,21 @@ def test_equivalence_profile_rejects_rescaling_an_explicit_bandwidth(
     path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(benchmark.ContractError, match="must be 1 when bandwidth is explicit"):
+        benchmark.load_profile(path)
+
+
+def test_equivalence_profile_rejects_invalid_minimum_leaf_weight_fraction(
+    benchmark: ModuleType,
+    tmp_path: Path,
+) -> None:
+    document = _profile_document()
+    scientific = document["scientific_parameters"]
+    assert isinstance(scientific, dict)
+    scientific["min_weight_fraction_leaf"] = 0.500_001
+    path = tmp_path / "invalid-leaf-weight-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(benchmark.ContractError, match="must not exceed 0.5"):
         benchmark.load_profile(path)
 
 
@@ -503,7 +525,9 @@ def test_full_target_profile_requires_a_dataset_and_omits_target_list(
     )
     assert "--target-list" not in command
     assert command[command.index("--n-estimators") + 1] == "250"
-    assert command[command.index("--max-features") + 1] == "sqrt"
+    assert command[command.index("--max-features") + 1] == "0.5"
+    assert command[command.index("--min-samples-leaf") + 1] == "2"
+    assert command[command.index("--min-weight-fraction-leaf") + 1] == "0.1"
     assert command[command.index("--bandwidth-scale") + 1] == "1.0"
     assert "--no-bootstrap" in command
     resumed_command = benchmark.build_infer_command(
@@ -762,6 +786,21 @@ def test_canonical_table_comparison_tolerates_only_declared_numeric_delta_and_fi
             "importance_sum": "1.0",
             "fit_seconds": "0.2",
             "n_estimators_fitted": "5",
+            "tree_nodes_total": "50",
+            "tree_nodes_mean": "10",
+            "tree_nodes_p50": "9",
+            "tree_nodes_p95": "13.6",
+            "tree_nodes_max": "14",
+            "tree_leaves_total": "27",
+            "tree_leaves_mean": "5.4",
+            "tree_leaves_p50": "5",
+            "tree_leaves_p95": "7.8",
+            "tree_leaves_max": "8",
+            "tree_depth_total": "18",
+            "tree_depth_mean": "3.6",
+            "tree_depth_p50": "4",
+            "tree_depth_p95": "4.8",
+            "tree_depth_max": "5",
         }
     )
     candidate_row = {**reference_row, "weight_sum": "10.00000000001", "fit_seconds": "9.8"}
@@ -783,7 +822,7 @@ def test_canonical_table_comparison_tolerates_only_declared_numeric_delta_and_fi
         relative_tolerance=0.0,
     )
     assert equivalent.equivalent
-    assert equivalent.numeric_values_compared == 9
+    assert equivalent.numeric_values_compared == 24
 
     candidate.write_bytes(reference.read_bytes())
     byte_identical = benchmark.compare_table(
@@ -797,6 +836,19 @@ def test_canonical_table_comparison_tolerates_only_declared_numeric_delta_and_fi
     assert byte_identical.comparison_mode == "byte-identical"
     assert byte_identical.rows_compared == 0
 
+    candidate_row["tree_depth_max"] = "6"
+    write(candidate, candidate_row)
+    structurally_different = benchmark.compare_table(
+        reference,
+        candidate,
+        rule=rule,
+        absolute_tolerance=1e-10,
+        relative_tolerance=0.0,
+    )
+    assert not structurally_different.equivalent
+    assert "tree_depth_max" in structurally_different.first_mismatches[0]
+
+    candidate_row["tree_depth_max"] = reference_row["tree_depth_max"]
     candidate_row["status"] = "skipped"
     write(candidate, candidate_row)
     different = benchmark.compare_table(
@@ -886,6 +938,7 @@ def test_run_metadata_audit_pins_inputs_and_scientific_controls(
             "max_features": "sqrt",
             "min_samples_leaf": 1,
             "max_depth": None,
+            "min_weight_fraction_leaf": 0.0,
             "bootstrap": False,
             "report": False,
         },

@@ -23,11 +23,12 @@
     "bandwidth": "auto",
     "bandwidth_scale": 1.0,
     "single_group_size_correction": "none",
-    "multi_group_size_correction": "cap-to-target",
+    "multi_group_size_correction": "none",
     "tree_method": "extra-trees",
-    "max_features": "sqrt",
-    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "min_samples_leaf": 2,
     "max_depth": null,
+    "min_weight_fraction_leaf": 0.1,
     "bootstrap": false
   },
   "defaults": {

@@ -156,7 +156,7 @@
     },
     {
       "id": "trees-250",
-      "description": "Estimator-count scout at the provisional 250-tree baseline and a small target universe.",
+      "description": "Estimator-count stress point at 250 trees per model and a small target universe.",
       "tags": ["trees-axis"],
       "cells": 1000,
       "genes": 1000,

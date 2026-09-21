@@ -149,6 +149,7 @@ _SCIENTIFIC_PARAMETER_FIELDS = {
     "max_features",
     "min_samples_leaf",
     "max_depth",
+    "min_weight_fraction_leaf",
     "bootstrap",
 }
 _DATASET_MANIFEST_FIELDS = {"schema_version", "description", "datasets"}
@@ -285,6 +286,7 @@ class ScientificParameters:
     max_features: str | int | float
     min_samples_leaf: int
     max_depth: int | None
+    min_weight_fraction_leaf: float
     bootstrap: bool
 
 
@@ -495,6 +497,21 @@ _TABLE_RULES = (
                 "n_edges",
                 "importance_sum",
                 "n_estimators_fitted",
+                "tree_nodes_total",
+                "tree_nodes_mean",
+                "tree_nodes_p50",
+                "tree_nodes_p95",
+                "tree_nodes_max",
+                "tree_leaves_total",
+                "tree_leaves_mean",
+                "tree_leaves_p50",
+                "tree_leaves_p95",
+                "tree_leaves_max",
+                "tree_depth_total",
+                "tree_depth_mean",
+                "tree_depth_p50",
+                "tree_depth_p95",
+                "tree_depth_max",
             }
         ),
         ignored_columns=frozenset({"fit_seconds"}),
@@ -588,6 +605,21 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "importance_sum",
         "fit_seconds",
         "n_estimators_fitted",
+        "tree_nodes_total",
+        "tree_nodes_mean",
+        "tree_nodes_p50",
+        "tree_nodes_p95",
+        "tree_nodes_max",
+        "tree_leaves_total",
+        "tree_leaves_mean",
+        "tree_leaves_p50",
+        "tree_leaves_p95",
+        "tree_leaves_max",
+        "tree_depth_total",
+        "tree_depth_mean",
+        "tree_depth_p50",
+        "tree_depth_p95",
+        "tree_depth_max",
         "message",
     ),
 }
@@ -981,6 +1013,12 @@ def _parse_scientific_parameters(raw: Any) -> ScientificParameters:
         if max_depth_value is None
         else _integer(max_depth_value, location=f"{location}.max_depth", minimum=1)
     )
+    min_weight_fraction_leaf = _finite_number(
+        value["min_weight_fraction_leaf"],
+        location=f"{location}.min_weight_fraction_leaf",
+    )
+    if min_weight_fraction_leaf > 0.5:
+        raise ContractError(f"{location}.min_weight_fraction_leaf must not exceed 0.5")
     return ScientificParameters(
         single_group_weight_mode=_choice(
             value["single_group_weight_mode"],
@@ -1046,6 +1084,7 @@ def _parse_scientific_parameters(raw: Any) -> ScientificParameters:
             minimum=1,
         ),
         max_depth=max_depth,
+        min_weight_fraction_leaf=min_weight_fraction_leaf,
         bootstrap=_boolean(value["bootstrap"], location=f"{location}.bootstrap"),
     )
 
@@ -2121,6 +2160,8 @@ def build_infer_command(
         str(scientific_parameters.max_features),
         "--min-samples-leaf",
         str(scientific_parameters.min_samples_leaf),
+        "--min-weight-fraction-leaf",
+        str(scientific_parameters.min_weight_fraction_leaf),
         "--bootstrap" if scientific_parameters.bootstrap else "--no-bootstrap",
         "--random-seed",
         str(seed),
@@ -2507,6 +2548,7 @@ def _audit_run_metadata(
             "max_features": scientific_parameters.max_features,
             "min_samples_leaf": scientific_parameters.min_samples_leaf,
             "max_depth": scientific_parameters.max_depth,
+            "min_weight_fraction_leaf": scientific_parameters.min_weight_fraction_leaf,
             "bootstrap": scientific_parameters.bootstrap,
             "report": report,
         }
