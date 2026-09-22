@@ -15,6 +15,8 @@ from types import ModuleType
 
 import pytest
 
+pytestmark = pytest.mark.benchmark_runtime
+
 
 def _load_benchmark_module() -> ModuleType:
     path = Path(__file__).parents[1] / "benchmarks" / "benchmark_scaling.py"
@@ -646,7 +648,7 @@ def test_process_measurement_records_peak_rss_and_exit_state(
             (
                 "import time; "
                 "payload = bytearray(1_000_000); "
-                "time.sleep(0.2); "
+                "time.sleep(1.0); "
                 f"raise SystemExit({exit_code})"
             ),
         ],

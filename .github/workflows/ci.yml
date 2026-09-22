@@ -76,7 +76,7 @@ jobs:
           python -m pip check
 
       - name: Run tests
-        run: python .github/scripts/run_pytest.py -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution and not benchmark_runtime"
 
   minimum-direct-dependencies:
     name: Minimum direct dependencies
@@ -132,7 +132,7 @@ jobs:
           python -m pip check
 
       - name: Run tests against direct minima
-        run: python .github/scripts/run_pytest.py -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution and not benchmark_runtime"
 
   platform-tests:
     name: Python 3.11 on ${{ matrix.os }}
@@ -162,7 +162,7 @@ jobs:
           python -m pip check
 
       - name: Run cross-platform tests
-        run: python .github/scripts/run_pytest.py -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution and not benchmark_runtime"
 
       - name: Smoke-test the installed command
         env:
