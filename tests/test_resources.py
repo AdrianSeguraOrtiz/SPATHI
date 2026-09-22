@@ -113,6 +113,7 @@ def test_available_memory_combines_system_and_cgroup_headroom(
     assert available_memory_bytes() == 250
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux procfs contract")
 def test_linux_system_memory_prefers_mem_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -138,6 +139,7 @@ def test_linux_system_memory_prefers_mem_available(
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux procfs contract")
 def test_linux_system_memory_falls_back_to_available_pages_for_invalid_meminfo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

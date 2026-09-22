@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import subprocess
 import sys
 import weakref
@@ -2048,7 +2049,10 @@ def test_completed_model_failure_is_published_with_diagnostics(
         lambda *args, **kwargs: FailingEstimator(),
     )
     output_dir = tmp_path / "failed-run"
-    with pytest.raises(RuntimeError, match=str(output_dir / "model_diagnostics.tsv.gz")):
+    with pytest.raises(
+        RuntimeError,
+        match=re.escape(str(output_dir / "model_diagnostics.tsv.gz")),
+    ):
         infer(config_for(input_files, output_dir))
 
     metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
