@@ -21,21 +21,37 @@ def _escape_property(value: str) -> str:
 class FailureAnnotations:
     """Translate pytest failures into annotations visible from the Checks API."""
 
-    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+    def __init__(self) -> None:
+        self._reported: set[str] = set()
+
+    def _publish(self, report: object) -> None:
         if not report.failed:
             return
         path, line_index, _ = report.location
-        title = _escape_property(f"pytest: {report.nodeid}")
-        message = _escape_data(str(report.longrepr)[-8_000:])
+        line_number = int(line_index or 0) + 1
+        nodeid = str(report.nodeid)
+        details = str(report.longrepr)
+        identity = f"{nodeid}\0{details}"
+        if identity in self._reported:
+            return
+        self._reported.add(identity)
+        title = _escape_property(f"pytest: {nodeid}")
+        message = _escape_data(details[-8_000:])
         location = _escape_property(Path(path).as_posix())
-        annotation = f"::error file={location},line={line_index + 1},title={title}::{message}\n"
+        annotation = f"::error file={location},line={line_number},title={title}::{message}\n"
         os.write(sys.stdout.fileno(), annotation.encode("utf-8", errors="replace"))
         if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
             with Path(summary_path).open("a", encoding="utf-8") as summary:
                 summary.write(
-                    f"<details><summary>{escape(report.nodeid)}</summary>\n\n"
-                    f"<pre>{escape(str(report.longrepr))}</pre>\n\n</details>\n"
+                    f"<details><summary>{escape(nodeid)}</summary>\n\n"
+                    f"<pre>{escape(details)}</pre>\n\n</details>\n"
                 )
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        self._publish(report)
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        self._publish(report)
 
 
 if __name__ == "__main__":
