@@ -43,7 +43,7 @@ def test_distributions_contain_only_the_public_package_sources(tmp_path: Path) -
         assert "Requires-Python: >=3.11\n" in metadata
         assert "Requires-Dist: plotly>=6.0\n" in metadata
         assert "Requires-Dist: h5py>=3.10\n" in metadata
-        assert "Requires-Dist: scipy>=1.11\n" in metadata
+        assert "Requires-Dist: scipy>=1.11.1\n" in metadata
         for classifier in (
             "MacOS",
             "Microsoft :: Windows",

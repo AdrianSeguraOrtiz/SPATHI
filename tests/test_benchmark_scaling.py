@@ -643,7 +643,12 @@ def test_process_measurement_records_peak_rss_and_exit_state(
         [
             sys.executable,
             "-c",
-            f"payload = bytearray(1_000_000); raise SystemExit({exit_code})",
+            (
+                "import time; "
+                "payload = bytearray(1_000_000); "
+                "time.sleep(0.2); "
+                f"raise SystemExit({exit_code})"
+            ),
         ],
         sample_interval_seconds=0.001,
         timeout_seconds=5.0,

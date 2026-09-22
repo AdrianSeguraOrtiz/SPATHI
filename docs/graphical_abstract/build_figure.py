@@ -50,9 +50,7 @@ def find_font(bold: bool = False) -> str:
             candidate = command(["fc-match", "-f", "%{file}", pattern]).strip()
             if candidate and Path(candidate).exists():
                 return candidate
-        raise RuntimeError(
-            "Install DejaVu Sans, or configure an available font family."
-        ) from exc
+        raise RuntimeError("Install DejaVu Sans, or configure an available font family.") from exc
 
 
 FONTS = {False: find_font(False), True: find_font(True)}
