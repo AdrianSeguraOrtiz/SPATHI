@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import subprocess
 import sys
 import weakref
@@ -43,6 +44,10 @@ EXPECTED_ARTIFACTS = {
     "weight_diagnostics.tsv",
     "report.html",
 }
+
+
+def _normalized_path_text(path: Path) -> str:
+    return os.path.normcase(str(path).removeprefix("\\\\?\\"))
 
 
 def config_for(
@@ -1879,7 +1884,7 @@ def test_broken_output_symlink_is_never_overwritten(
         infer(config_for(input_files, output_dir), checkpoint=False)
 
     assert output_dir.is_symlink()
-    assert output_dir.readlink() == missing_target
+    assert _normalized_path_text(output_dir.readlink()) == _normalized_path_text(missing_target)
 
 
 @pytest.mark.integration
@@ -1902,7 +1907,7 @@ def test_output_path_appearing_before_publication_is_never_overwritten(
         infer(config_for(input_files, output_dir), checkpoint=False)
 
     assert output_dir.is_symlink()
-    assert output_dir.readlink() == missing_target
+    assert _normalized_path_text(output_dir.readlink()) == _normalized_path_text(missing_target)
     assert not list(tmp_path.glob(".late-output-link.staging-*"))
 
 

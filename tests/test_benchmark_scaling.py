@@ -700,7 +700,7 @@ def test_process_tree_cpu_includes_descendant_work(benchmark: ModuleType, tmp_pa
     child_program = """
 import time
 
-deadline = time.process_time() + 0.15
+deadline = time.process_time() + 0.5
 value = 1
 while time.process_time() < deadline:
     value = (value * 17 + 3) % 1_000_003
@@ -722,7 +722,7 @@ subprocess.run([sys.executable, "-c", sys.argv[1]], check=True)
     )
 
     assert measurement.status == "success"
-    assert measurement.sampled_cpu_user_seconds >= 0.08
+    assert measurement.sampled_cpu_user_seconds >= 0.1
     assert measurement.sampled_cpu_system_seconds >= 0
 
 

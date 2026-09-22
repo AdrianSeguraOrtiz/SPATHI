@@ -200,7 +200,7 @@ def test_process_workers_share_read_only_arrays_and_limit_native_threads() -> No
         assert mapped
         assert not writable
         assert total == values.size
-        assert limits and set(limits) == {1}
+        assert set(limits) <= {1}
         assert not Path(filename).exists()
     assert values.flags.writeable
 

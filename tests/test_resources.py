@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from math import ceil
 
 import pytest
@@ -12,6 +13,7 @@ def _mapping_reader(values: dict[str, str]) -> resources._TextReader:
     return lambda path: values.get(str(path))
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_v2_uses_current_systemd_group_and_restrictive_ancestor() -> None:
     cgroup_text = "0::/user.slice/user-1000.slice/session-4.scope\n"
     mountinfo_text = "36 25 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup rw\n"
@@ -38,6 +40,7 @@ def test_cgroup_v2_uses_current_systemd_group_and_restrictive_ancestor() -> None
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_v1_resolves_slurm_subgroup_relative_to_non_root_mount() -> None:
     cgroup_text = "8:cpuset:/slurm/uid_1000/job_42/step_0\n7:memory:/slurm/uid_1000/job_42/step_0\n"
     mountinfo_text = (
@@ -65,6 +68,7 @@ def test_cgroup_v1_resolves_slurm_subgroup_relative_to_non_root_mount() -> None:
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_exhausted_limit_reports_zero_headroom() -> None:
     assert (
         resources._cgroup_available_bytes(
@@ -81,6 +85,7 @@ def test_cgroup_exhausted_limit_reports_zero_headroom() -> None:
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_detection_falls_back_to_conventional_v1_path() -> None:
     read_text = _mapping_reader(
         {
@@ -114,7 +119,7 @@ def test_linux_system_memory_prefers_mem_available(
     def unexpected_sysconf(name: str) -> int:
         raise AssertionError(f"sysconf should not be called for {name}")
 
-    monkeypatch.setattr(resources.os, "sysconf", unexpected_sysconf)
+    monkeypatch.setattr(resources.os, "sysconf", unexpected_sysconf, raising=False)
 
     assert (
         resources._system_available_bytes(
@@ -137,7 +142,7 @@ def test_linux_system_memory_falls_back_to_available_pages_for_invalid_meminfo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sysconf_values = {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": 12}
-    monkeypatch.setattr(resources.os, "sysconf", sysconf_values.__getitem__)
+    monkeypatch.setattr(resources.os, "sysconf", sysconf_values.__getitem__, raising=False)
 
     assert (
         resources._system_available_bytes(
