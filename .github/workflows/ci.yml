@@ -46,7 +46,7 @@ jobs:
         run: mypy src/spathi
 
       - name: Run tests
-        run: pytest -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution"
 
   python-versions:
     name: Python ${{ matrix.python-version }}
@@ -76,7 +76,7 @@ jobs:
           python -m pip check
 
       - name: Run tests
-        run: pytest -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution"
 
   minimum-direct-dependencies:
     name: Minimum direct dependencies
@@ -132,7 +132,7 @@ jobs:
           python -m pip check
 
       - name: Run tests against direct minima
-        run: pytest -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution"
 
   platform-tests:
     name: Python 3.11 on ${{ matrix.os }}
@@ -162,7 +162,7 @@ jobs:
           python -m pip check
 
       - name: Run cross-platform tests
-        run: pytest -m "not distribution"
+        run: python .github/scripts/run_pytest.py -m "not distribution"
 
       - name: Smoke-test the installed command
         env:
