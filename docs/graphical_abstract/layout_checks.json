@@ -1,0 +1,43 @@
+{
+  "passed": true,
+  "checks": [
+    "panel disjointness",
+    "text within canvas",
+    "text within panel padding",
+    "pairwise text bounding-box intersections"
+  ],
+  "note": "Analytic checks cover text and major panels, not all decorative primitives. Inspect the rendered PNG/PDF as well.",
+  "problems": [],
+  "panel_count": 4,
+  "text_item_count": 72,
+  "canvas": {
+    "width": 1545.0,
+    "height": 849.0
+  },
+  "panels": {
+    "input": {
+      "x": 29.998800000000017,
+      "y": 136.99880000000002,
+      "w": 300.00239999999997,
+      "h": 570.0024
+    },
+    "weights": {
+      "x": 365.0004,
+      "y": 136.99880000000002,
+      "w": 439.99920000000003,
+      "h": 570.0024
+    },
+    "model": {
+      "x": 840.0016,
+      "y": 136.99880000000002,
+      "w": 319.9968,
+      "h": 570.0024
+    },
+    "output": {
+      "x": 1195.0016,
+      "y": 136.99880000000002,
+      "w": 319.9968,
+      "h": 570.0024
+    }
+  }
+}

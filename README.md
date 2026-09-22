@@ -7,6 +7,16 @@ single-cell RNA-seq expression matrix. Instead of fitting each group in isolatio
 derives group-specific contributions from all cells according to their transcriptomic
 proximity to the group of interest and fits the models directly on those cells.
 
+<p align="center">
+  <a href="docs/graphical_abstract/SPATHI_graphical_abstract.svg">
+    <img
+      src="docs/graphical_abstract/SPATHI_graphical_abstract.svg"
+      alt="SPATHI graphical abstract: single-cell inputs are converted into population-aware weights used by weighted tree ensembles to infer one regulatory network per cell group"
+      width="100%"
+    >
+  </a>
+</p>
+
 > [!IMPORTANT]
 > SPATHI is an early-stage scientific tool. It produces hypotheses based on predictive
 > feature importance. An inferred edge is not evidence of causality, and SPATHI does
