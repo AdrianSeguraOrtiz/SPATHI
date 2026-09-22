@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from html import escape
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,12 @@ class FailureAnnotations:
         location = _escape_property(Path(path).as_posix())
         annotation = f"::error file={location},line={line_index + 1},title={title}::{message}\n"
         os.write(sys.stdout.fileno(), annotation.encode("utf-8", errors="replace"))
+        if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
+            with Path(summary_path).open("a", encoding="utf-8") as summary:
+                summary.write(
+                    f"<details><summary>{escape(report.nodeid)}</summary>\n\n"
+                    f"<pre>{escape(str(report.longrepr))}</pre>\n\n</details>\n"
+                )
 
 
 if __name__ == "__main__":

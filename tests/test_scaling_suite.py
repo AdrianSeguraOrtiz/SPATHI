@@ -13,6 +13,8 @@ from types import ModuleType
 
 import pytest
 
+pytestmark = pytest.mark.benchmark_runtime
+
 
 def _package_digest(package_directory: Path) -> str:
     """Independently reproduce the package snapshot digest asserted by the tests."""

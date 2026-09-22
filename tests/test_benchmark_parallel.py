@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.benchmark_runtime
+
 
 def _module():
     path = Path(__file__).parents[1] / "benchmarks/benchmark_parallel.py"

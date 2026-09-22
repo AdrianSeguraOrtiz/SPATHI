@@ -15,6 +15,8 @@ import pytest
 
 from spathi.outputs import CELL_WEIGHT_COLUMNS, MODEL_DIAGNOSTIC_COLUMNS, WEIGHT_DIAGNOSTIC_COLUMNS
 
+pytestmark = pytest.mark.benchmark_runtime
+
 
 def _load_benchmark_module() -> ModuleType:
     path = Path(__file__).parents[1] / "benchmarks" / "benchmark_equivalence.py"

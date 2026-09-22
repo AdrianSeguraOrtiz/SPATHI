@@ -94,7 +94,7 @@ include = [
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 markers = [
-  "benchmark_runtime: process-lifecycle tests for the canonical Linux benchmark environment",
+  "benchmark_runtime: opt-in benchmark engineering tests for the canonical Linux environment",
   "distribution: tests that build or inspect distribution artifacts",
   "integration: end-to-end tests that exercise multiple SPATHI components",
 ]
