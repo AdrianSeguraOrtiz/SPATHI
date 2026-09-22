@@ -38,16 +38,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Weighted Extra-Trees and Random-Forest inference with deterministic task seeds,
   strict target subsets, constant-predictor filtering, and positive unsigned edge
   scores.
-- A provisional baseline shared by core and CLI: cosine distance, 250 trees, and
-  `max_features=sqrt`, pending selection by the full calibration study.
+- Stable first-version defaults shared by core and CLI: cosine distance, 50 trees,
+  `max_features=0.5`, two cells and 10% of model weight per leaf, no group-size
+  correction, and Extra-Trees without bootstrap sampling.
 - One CPU budget with operational `--parallel-backend auto|threads|processes`,
   non-nested parallelism, persistent workers, a rolling thread queue or bounded
   process batches, read-only shared memory maps, and workload/RAM/temporary-disk
   preflight. Backend choice preserves model seeds, scientific output and checkpoint
   identity; effective decisions and resource estimates are recorded.
-- Fixed-size forests with auditable fitted tree counts. Exact multi-prefix studies
-  reuse trees and individual tree importances without changing their ordered
-  float64 aggregation.
+- Fixed-size forests with a configurable depth cap and exact fitted-tree node, leaf,
+  and observed-depth summaries at model and run level. Exact multi-prefix studies
+  reuse trees and individual tree importances without changing their ordered float64
+  aggregation.
 - Compact checksummed binary checkpoint payloads with interned strings, columnar
   numeric edge storage, and group-bounded resume indexes.
 - `MemAvailable`- and cgroup-aware memory planning, live-headroom-sized distance

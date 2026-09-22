@@ -22,7 +22,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Integral, Real
 from time import perf_counter
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, TypedDict
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -30,6 +30,8 @@ from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 
 from spathi.config import (
     DEFAULT_MAX_FEATURES,
+    DEFAULT_MIN_SAMPLES_LEAF,
+    DEFAULT_MIN_WEIGHT_FRACTION_LEAF,
     DEFAULT_N_ESTIMATORS,
     MAX_RANDOM_SEED,
     MaxFeatures,
@@ -80,6 +82,11 @@ UNTRAINED_MODEL_STATUSES = frozenset(
 FATAL_MODEL_STATUSES = frozenset({"model_fit_failed", "invalid_feature_importances"})
 MODEL_STATUSES = TRAINED_MODEL_STATUSES | UNTRAINED_MODEL_STATUSES
 SKIP_REASONS = UNTRAINED_MODEL_STATUSES | {"no_positive_feature_importance"}
+FITTED_TREE_MODEL_STATUSES = TRAINED_MODEL_STATUSES | {"invalid_feature_importances"}
+PREFIT_MODEL_STATUSES = UNTRAINED_MODEL_STATUSES - {
+    "invalid_feature_importances",
+    "model_fit_failed",
+}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -137,6 +144,21 @@ class ModelStat:
     importance_sum: float
     fit_seconds: float
     n_estimators_fitted: int = 0
+    tree_nodes_total: int = 0
+    tree_nodes_mean: float = 0.0
+    tree_nodes_p50: float = 0.0
+    tree_nodes_p95: float = 0.0
+    tree_nodes_max: int = 0
+    tree_leaves_total: int = 0
+    tree_leaves_mean: float = 0.0
+    tree_leaves_p50: float = 0.0
+    tree_leaves_p95: float = 0.0
+    tree_leaves_max: int = 0
+    tree_depth_total: int = 0
+    tree_depth_mean: float = 0.0
+    tree_depth_p50: float = 0.0
+    tree_depth_p95: float = 0.0
+    tree_depth_max: int = 0
     message: str = ""
 
     def __post_init__(self) -> None:
@@ -152,6 +174,12 @@ class ModelStat:
             "n_predictors_used",
             "n_edges",
             "n_estimators_fitted",
+            "tree_nodes_total",
+            "tree_nodes_max",
+            "tree_leaves_total",
+            "tree_leaves_max",
+            "tree_depth_total",
+            "tree_depth_max",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
@@ -177,12 +205,83 @@ class ModelStat:
             raise ValueError("predictor diagnostics must contain unique non-empty identifiers")
         if not set(self.constant_predictors).issubset(self.discarded_predictors):
             raise ValueError("constant_predictors must be a subset of discarded_predictors")
-        for field_name in ("weight_sum", "importance_sum", "fit_seconds"):
+        for field_name in (
+            "weight_sum",
+            "importance_sum",
+            "fit_seconds",
+            "tree_nodes_mean",
+            "tree_nodes_p50",
+            "tree_nodes_p95",
+            "tree_leaves_mean",
+            "tree_leaves_p50",
+            "tree_leaves_p95",
+            "tree_depth_mean",
+            "tree_depth_p50",
+            "tree_depth_p95",
+        ):
             value = getattr(self, field_name)
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"{field_name} must be non-negative and finite")
         if self.weight_sum <= 0:
             raise ValueError("weight_sum must be positive")
+        self._validate_tree_structure()
+
+    def _validate_tree_structure(self) -> None:
+        """Require internally consistent structural summaries for fitted trees."""
+
+        families = (
+            (
+                "tree_nodes",
+                self.tree_nodes_total,
+                self.tree_nodes_mean,
+                self.tree_nodes_p50,
+                self.tree_nodes_p95,
+                self.tree_nodes_max,
+            ),
+            (
+                "tree_leaves",
+                self.tree_leaves_total,
+                self.tree_leaves_mean,
+                self.tree_leaves_p50,
+                self.tree_leaves_p95,
+                self.tree_leaves_max,
+            ),
+            (
+                "tree_depth",
+                self.tree_depth_total,
+                self.tree_depth_mean,
+                self.tree_depth_p50,
+                self.tree_depth_p95,
+                self.tree_depth_max,
+            ),
+        )
+        if self.status in FITTED_TREE_MODEL_STATUSES and self.n_estimators_fitted == 0:
+            raise ValueError(f"model status {self.status!r} requires at least one fitted tree")
+        if self.status in PREFIT_MODEL_STATUSES and self.n_estimators_fitted != 0:
+            raise ValueError(f"model status {self.status!r} cannot contain fitted trees")
+        if self.n_estimators_fitted == 0:
+            if any(any(value != 0 for value in values[1:]) for values in families):
+                raise ValueError("tree structure must be zero when no estimators were fitted")
+            return
+
+        for label, total, mean, p50, p95, maximum in families:
+            expected_mean = total / self.n_estimators_fitted
+            if mean != expected_mean:
+                raise ValueError(f"{label}_mean must equal total / n_estimators_fitted")
+            if p50 > p95:
+                raise ValueError(f"{label}_p50 cannot exceed {label}_p95")
+            if p50 > maximum or p95 > maximum or mean > maximum:
+                raise ValueError(f"{label} summaries cannot exceed {label}_max")
+            if maximum > total:
+                raise ValueError(f"{label}_max cannot exceed {label}_total")
+        if self.tree_nodes_total < self.n_estimators_fitted:
+            raise ValueError("every fitted tree must contain at least one node")
+        if self.tree_leaves_total < self.n_estimators_fitted:
+            raise ValueError("every fitted tree must contain at least one leaf")
+        if self.tree_leaves_total > self.tree_nodes_total:
+            raise ValueError("tree leaves cannot exceed tree nodes")
+        if self.tree_leaves_max > self.tree_nodes_max:
+            raise ValueError("maximum tree leaves cannot exceed maximum tree nodes")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -201,6 +300,21 @@ class ModelStat:
             "importance_sum": self.importance_sum,
             "fit_seconds": self.fit_seconds,
             "n_estimators_fitted": self.n_estimators_fitted,
+            "tree_nodes_total": self.tree_nodes_total,
+            "tree_nodes_mean": self.tree_nodes_mean,
+            "tree_nodes_p50": self.tree_nodes_p50,
+            "tree_nodes_p95": self.tree_nodes_p95,
+            "tree_nodes_max": self.tree_nodes_max,
+            "tree_leaves_total": self.tree_leaves_total,
+            "tree_leaves_mean": self.tree_leaves_mean,
+            "tree_leaves_p50": self.tree_leaves_p50,
+            "tree_leaves_p95": self.tree_leaves_p95,
+            "tree_leaves_max": self.tree_leaves_max,
+            "tree_depth_total": self.tree_depth_total,
+            "tree_depth_mean": self.tree_depth_mean,
+            "tree_depth_p50": self.tree_depth_p50,
+            "tree_depth_p95": self.tree_depth_p95,
+            "tree_depth_max": self.tree_depth_max,
             "message": self.message,
         }
 
@@ -361,6 +475,7 @@ class _FitContext:
     bootstrap: bool
     global_seed: int
     model_n_jobs: int
+    min_weight_fraction_leaf: float = DEFAULT_MIN_WEIGHT_FRACTION_LEAF
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -378,10 +493,95 @@ class _ModelExecution:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _ForestStructureStats:
+    """Exact structural summary of the trees currently fitted in one ensemble."""
+
+    tree_count: int
+    nodes_total: int
+    nodes_mean: float
+    nodes_p50: float
+    nodes_p95: float
+    nodes_max: int
+    leaves_total: int
+    leaves_mean: float
+    leaves_p50: float
+    leaves_p95: float
+    leaves_max: int
+    depth_total: int
+    depth_mean: float
+    depth_p50: float
+    depth_p95: float
+    depth_max: int
+
+    def model_stat_fields(self) -> _ModelStatTreeFields:
+        return {
+            "n_estimators_fitted": self.tree_count,
+            "tree_nodes_total": self.nodes_total,
+            "tree_nodes_mean": self.nodes_mean,
+            "tree_nodes_p50": self.nodes_p50,
+            "tree_nodes_p95": self.nodes_p95,
+            "tree_nodes_max": self.nodes_max,
+            "tree_leaves_total": self.leaves_total,
+            "tree_leaves_mean": self.leaves_mean,
+            "tree_leaves_p50": self.leaves_p50,
+            "tree_leaves_p95": self.leaves_p95,
+            "tree_leaves_max": self.leaves_max,
+            "tree_depth_total": self.depth_total,
+            "tree_depth_mean": self.depth_mean,
+            "tree_depth_p50": self.depth_p50,
+            "tree_depth_p95": self.depth_p95,
+            "tree_depth_max": self.depth_max,
+        }
+
+
+class _ModelStatTreeFields(TypedDict):
+    n_estimators_fitted: int
+    tree_nodes_total: int
+    tree_nodes_mean: float
+    tree_nodes_p50: float
+    tree_nodes_p95: float
+    tree_nodes_max: int
+    tree_leaves_total: int
+    tree_leaves_mean: float
+    tree_leaves_p50: float
+    tree_leaves_p95: float
+    tree_leaves_max: int
+    tree_depth_total: int
+    tree_depth_mean: float
+    tree_depth_p50: float
+    tree_depth_p95: float
+    tree_depth_max: int
+
+
+_EMPTY_FOREST_STRUCTURE = _ForestStructureStats(
+    tree_count=0,
+    nodes_total=0,
+    nodes_mean=0.0,
+    nodes_p50=0.0,
+    nodes_p95=0.0,
+    nodes_max=0,
+    leaves_total=0,
+    leaves_mean=0.0,
+    leaves_p50=0.0,
+    leaves_p95=0.0,
+    leaves_max=0,
+    depth_total=0,
+    depth_mean=0.0,
+    depth_p50=0.0,
+    depth_p95=0.0,
+    depth_max=0,
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _TreeFitOutcome:
     importances: NDArray[np.float64]
     fit_seconds: float
-    n_estimators_fitted: int
+    forest_structure: _ForestStructureStats
+
+    @property
+    def n_estimators_fitted(self) -> int:
+        return self.forest_structure.tree_count
 
 
 class _TreeFitFailure(RuntimeError):
@@ -392,12 +592,18 @@ class _TreeFitFailure(RuntimeError):
         error: ValueError | FloatingPointError,
         *,
         fit_seconds: float,
-        n_estimators_fitted: int,
+        forest_structure: _ForestStructureStats,
+        completed_outcomes: tuple[_TreeFitOutcome, ...],
     ) -> None:
         super().__init__(str(error))
         self.error = error
         self.fit_seconds = fit_seconds
-        self.n_estimators_fitted = n_estimators_fitted
+        self.forest_structure = forest_structure
+        self.completed_outcomes = completed_outcomes
+
+    @property
+    def n_estimators_fitted(self) -> int:
+        return self.forest_structure.tree_count
 
 
 def _normalise_estimator_prefixes(
@@ -451,6 +657,7 @@ class PreparedInference:
     max_depth: int | None
     bootstrap: bool
     random_seed: int
+    min_weight_fraction_leaf: float = DEFAULT_MIN_WEIGHT_FRACTION_LEAF
 
     @property
     def expression_dtype(self) -> str:
@@ -713,6 +920,7 @@ class PreparedInference:
             max_features=self.max_features,
             min_samples_leaf=self.min_samples_leaf,
             max_depth=self.max_depth,
+            min_weight_fraction_leaf=self.min_weight_fraction_leaf,
             bootstrap=self.bootstrap,
             global_seed=self.random_seed,
             model_n_jobs=plan.model_n_jobs,
@@ -886,6 +1094,7 @@ def create_tree_estimator(
     random_state: int,
     n_jobs: int,
     warm_start: bool = False,
+    min_weight_fraction_leaf: float = 0.0,
 ) -> TreeEstimator:
     """Create a supported scikit-learn estimator with explicit resources."""
 
@@ -894,6 +1103,7 @@ def create_tree_estimator(
         "max_features": max_features,
         "min_samples_leaf": min_samples_leaf,
         "max_depth": max_depth,
+        "min_weight_fraction_leaf": min_weight_fraction_leaf,
         "bootstrap": bootstrap,
         "random_state": random_state,
         "n_jobs": n_jobs,
@@ -935,8 +1145,14 @@ def _extract_feature_importances(
             informative += 1
     if informative == 0:
         return np.zeros(estimator.n_features_in_, dtype=np.float64)
-    importances = np.mean(all_importances[:informative, :], axis=0, dtype=np.float64)
-    return importances / np.sum(importances, dtype=np.float64)
+    importances: NDArray[np.float64] = np.asarray(
+        np.mean(all_importances[:informative, :], axis=0, dtype=np.float64),
+        dtype=np.float64,
+    )
+    return np.asarray(
+        importances / np.sum(importances, dtype=np.float64),
+        dtype=np.float64,
+    )
 
 
 @dataclass(slots=True)
@@ -958,9 +1174,90 @@ class _TreeImportanceCache:
             return np.zeros(self.values.shape[1], dtype=np.float64)
         # Keep the same complete, ordered float64 mean as sklearn. Incremental
         # sums would change reduction rounding and the exported importance scores.
-        importances = np.mean(self.values[: self.informative_trees, :], axis=0, dtype=np.float64)
+        importances: NDArray[np.float64] = np.asarray(
+            np.mean(
+                self.values[: self.informative_trees, :],
+                axis=0,
+                dtype=np.float64,
+            ),
+            dtype=np.float64,
+        )
         importances /= np.sum(importances, dtype=np.float64)
         return importances
+
+
+def _summarize_tree_measure(
+    values: NDArray[np.int64],
+) -> tuple[int, float, float, float, int]:
+    """Return exact totals/extrema and linear p50/p95 for one tree measure."""
+
+    if values.size == 0:
+        return 0, 0.0, 0.0, 0.0, 0
+    total = int(np.sum(values, dtype=np.int64))
+    p50, p95 = np.percentile(values, (50.0, 95.0), method="linear")
+    return total, total / int(values.size), float(p50), float(p95), int(np.max(values))
+
+
+@dataclass(slots=True)
+class _TreeStructureCache:
+    """Capture every fitted tree once and summarize each deterministic forest prefix."""
+
+    node_counts: NDArray[np.int64]
+    leaf_counts: NDArray[np.int64]
+    depths: NDArray[np.int64]
+    processed_trees: int = 0
+
+    @classmethod
+    def allocate(cls, maximum_trees: int) -> _TreeStructureCache:
+        return cls(
+            node_counts=np.empty(maximum_trees, dtype=np.int64),
+            leaf_counts=np.empty(maximum_trees, dtype=np.int64),
+            depths=np.empty(maximum_trees, dtype=np.int64),
+        )
+
+    def extract(
+        self,
+        estimator: TreeEstimator,
+        *,
+        require_fitted: bool = True,
+    ) -> _ForestStructureStats:
+        trees = getattr(estimator, "estimators_", None)
+        if trees is None:
+            if require_fitted:
+                raise RuntimeError("fitted tree ensemble does not expose estimators_")
+            return _EMPTY_FOREST_STRUCTURE
+        if len(trees) < self.processed_trees or len(trees) > self.node_counts.size:
+            raise RuntimeError("fitted tree count is inconsistent with the declared forest budget")
+        for index, tree in enumerate(trees[self.processed_trees :], start=self.processed_trees):
+            structure = getattr(tree, "tree_", None)
+            if structure is None:
+                raise RuntimeError("fitted tree does not expose tree_ structure")
+            self.node_counts[index] = int(structure.node_count)
+            self.leaf_counts[index] = int(structure.n_leaves)
+            self.depths[index] = int(structure.max_depth)
+        self.processed_trees = len(trees)
+
+        nodes = _summarize_tree_measure(self.node_counts[: self.processed_trees])
+        leaves = _summarize_tree_measure(self.leaf_counts[: self.processed_trees])
+        depths = _summarize_tree_measure(self.depths[: self.processed_trees])
+        return _ForestStructureStats(
+            tree_count=self.processed_trees,
+            nodes_total=nodes[0],
+            nodes_mean=nodes[1],
+            nodes_p50=nodes[2],
+            nodes_p95=nodes[3],
+            nodes_max=nodes[4],
+            leaves_total=leaves[0],
+            leaves_mean=leaves[1],
+            leaves_p50=leaves[2],
+            leaves_p95=leaves[3],
+            leaves_max=leaves[4],
+            depth_total=depths[0],
+            depth_mean=depths[1],
+            depth_p50=depths[2],
+            depth_p95=depths[3],
+            depth_max=depths[4],
+        )
 
 
 def _fit_fixed_tree_prefixes(
@@ -981,6 +1278,7 @@ def _fit_fixed_tree_prefixes(
         max_features=context.max_features,
         min_samples_leaf=context.min_samples_leaf,
         max_depth=context.max_depth,
+        min_weight_fraction_leaf=context.min_weight_fraction_leaf,
         bootstrap=context.bootstrap,
         random_state=seed,
         n_jobs=context.model_n_jobs,
@@ -993,6 +1291,7 @@ def _fit_fixed_tree_prefixes(
         if len(estimator_counts) > 1
         else None
     )
+    structure_cache = _TreeStructureCache.allocate(estimator_counts[-1])
     for estimator_count in estimator_counts:
         if estimator_count != first_tree_count:
             estimator.set_params(n_estimators=estimator_count)
@@ -1001,13 +1300,19 @@ def _fit_fixed_tree_prefixes(
             estimator.fit(x_model, y, sample_weight=weights)
         except (ValueError, FloatingPointError) as exc:
             fit_seconds += perf_counter() - started
-            fitted_trees = len(getattr(estimator, "estimators_", ()))
+            structure = structure_cache.extract(estimator, require_fitted=False)
             raise _TreeFitFailure(
                 exc,
                 fit_seconds=fit_seconds,
-                n_estimators_fitted=fitted_trees,
+                forest_structure=structure,
+                completed_outcomes=tuple(outcomes),
             ) from exc
         fit_seconds += perf_counter() - started
+        structure = structure_cache.extract(estimator)
+        if structure.tree_count != estimator_count:
+            raise RuntimeError(
+                "fitted tree ensemble contains a different number of trees than requested"
+            )
         outcomes.append(
             _TreeFitOutcome(
                 importances=(
@@ -1016,7 +1321,7 @@ def _fit_fixed_tree_prefixes(
                     else importance_cache.extract(estimator)
                 ),
                 fit_seconds=fit_seconds,
-                n_estimators_fitted=estimator_count,
+                forest_structure=structure,
             )
         )
         first_tree_count = estimator_count
@@ -1030,6 +1335,7 @@ def _validate_hyperparameters(
     max_features: MaxFeatures,
     min_samples_leaf: int,
     max_depth: int | None,
+    min_weight_fraction_leaf: float,
     bootstrap: bool | None,
     random_seed: int,
 ) -> None:
@@ -1062,6 +1368,10 @@ def _validate_hyperparameters(
             raise TypeError("max_depth must be None or a positive integer")
         if max_depth < 1:
             raise ValueError("max_depth must be None or a positive integer")
+    if isinstance(min_weight_fraction_leaf, bool) or not isinstance(min_weight_fraction_leaf, Real):
+        raise TypeError("min_weight_fraction_leaf must be a number in [0, 0.5]")
+    if not np.isfinite(min_weight_fraction_leaf) or not 0 <= min_weight_fraction_leaf <= 0.5:
+        raise ValueError("min_weight_fraction_leaf must be in the interval [0, 0.5]")
     if bootstrap is not None and not isinstance(bootstrap, bool):
         raise TypeError("bootstrap must be a boolean or None")
     if isinstance(random_seed, bool) or not isinstance(random_seed, Integral):
@@ -1417,7 +1727,7 @@ def _make_stat(
     n_edges: int = 0,
     importance_sum: float = 0.0,
     fit_seconds: float = 0.0,
-    n_estimators_fitted: int = 0,
+    forest_structure: _ForestStructureStats = _EMPTY_FOREST_STRUCTURE,
     message: str = "",
 ) -> ModelStat:
     return ModelStat(
@@ -1435,7 +1745,7 @@ def _make_stat(
         n_edges=n_edges,
         importance_sum=importance_sum,
         fit_seconds=fit_seconds,
-        n_estimators_fitted=n_estimators_fitted,
+        **forest_structure.model_stat_fields(),
         message=message,
     )
 
@@ -1451,7 +1761,7 @@ def _skipped_result(
     discarded: tuple[str, ...],
     constant_predictors: tuple[str, ...],
     fit_seconds: float = 0.0,
-    n_estimators_fitted: int = 0,
+    forest_structure: _ForestStructureStats = _EMPTY_FOREST_STRUCTURE,
 ) -> ModelResult:
     skipped = SkippedTargetRecord(
         target_group=task.group.name,
@@ -1468,7 +1778,7 @@ def _skipped_result(
         discarded=discarded,
         constant_predictors=constant_predictors,
         fit_seconds=fit_seconds,
-        n_estimators_fitted=n_estimators_fitted,
+        forest_structure=forest_structure,
         message=detail,
     )
     return ModelResult(edges=(), skipped=skipped, stat=stat, trained=False)
@@ -1501,7 +1811,7 @@ def _result_from_fit_outcome(
             discarded=discarded,
             constant_predictors=constant_predictors,
             fit_seconds=outcome.fit_seconds,
-            n_estimators_fitted=outcome.n_estimators_fitted,
+            forest_structure=outcome.forest_structure,
         )
     materially_negative = importances < -FEATURE_IMPORTANCE_NEGATIVE_ROUNDOFF_TOLERANCE
     if np.any(materially_negative):
@@ -1520,7 +1830,7 @@ def _result_from_fit_outcome(
             discarded=discarded,
             constant_predictors=constant_predictors,
             fit_seconds=outcome.fit_seconds,
-            n_estimators_fitted=outcome.n_estimators_fitted,
+            forest_structure=outcome.forest_structure,
         )
 
     roundoff_negative = importances < 0.0
@@ -1577,7 +1887,7 @@ def _result_from_fit_outcome(
             n_edges=0,
             importance_sum=importance_sum,
             fit_seconds=outcome.fit_seconds,
-            n_estimators_fitted=outcome.n_estimators_fitted,
+            forest_structure=outcome.forest_structure,
             message=(
                 f"{skipped.detail}; {diagnostic_message}" if diagnostic_message else skipped.detail
             ),
@@ -1595,7 +1905,7 @@ def _result_from_fit_outcome(
         n_edges=len(edges),
         importance_sum=importance_sum,
         fit_seconds=outcome.fit_seconds,
-        n_estimators_fitted=outcome.n_estimators_fitted,
+        forest_structure=outcome.forest_structure,
         message=diagnostic_message,
     )
     return ModelResult(edges=edges, skipped=None, stat=stat, trained=True)
@@ -1726,19 +2036,38 @@ def _fit_model_prefix_task(
         )
     except _TreeFitFailure as failure:
         detail = f"{type(failure.error).__name__}: {failure.error}"
-        return repeat(
-            _skipped_result(
+        completed_results = tuple(
+            _result_from_fit_outcome(
                 task,
                 context,
-                reason="model_fit_failed",
-                detail=detail,
+                outcome=fit_outcome,
                 seed=seed,
-                n_predictors_used=len(selected_positions),
+                selected_names=selected_names,
+                selected_positions=selected_positions,
                 discarded=discarded,
                 constant_predictors=constant_predictors,
-                fit_seconds=failure.fit_seconds,
-                n_estimators_fitted=failure.n_estimators_fitted,
             )
+            for fit_outcome in failure.completed_outcomes
+        )
+        if len(completed_results) >= len(estimator_counts):  # pragma: no cover - invariant
+            raise RuntimeError(
+                "a failed forest prefix cannot follow every requested prefix"
+            ) from failure
+        failed_result = _skipped_result(
+            task,
+            context,
+            reason="model_fit_failed",
+            detail=detail,
+            seed=seed,
+            n_predictors_used=len(selected_positions),
+            discarded=discarded,
+            constant_predictors=constant_predictors,
+            fit_seconds=failure.fit_seconds,
+            forest_structure=failure.forest_structure,
+        )
+        return (
+            *completed_results,
+            *((failed_result,) * (len(estimator_counts) - len(completed_results))),
         )
 
     return tuple(
@@ -1817,8 +2146,9 @@ def prepare_inference(
     tree_method: TreeMethod = "extra-trees",
     n_estimators: int = DEFAULT_N_ESTIMATORS,
     max_features: MaxFeatures = DEFAULT_MAX_FEATURES,
-    min_samples_leaf: int = 1,
+    min_samples_leaf: int = DEFAULT_MIN_SAMPLES_LEAF,
     max_depth: int | None = None,
+    min_weight_fraction_leaf: float = DEFAULT_MIN_WEIGHT_FRACTION_LEAF,
     bootstrap: bool | None = None,
     random_seed: int = 123,
 ) -> PreparedInference:
@@ -1837,6 +2167,7 @@ def prepare_inference(
         max_features=max_features,
         min_samples_leaf=min_samples_leaf,
         max_depth=max_depth,
+        min_weight_fraction_leaf=min_weight_fraction_leaf,
         bootstrap=bootstrap,
         random_seed=random_seed,
     )
@@ -1863,6 +2194,7 @@ def prepare_inference(
         max_features=max_features,
         min_samples_leaf=min_samples_leaf,
         max_depth=None if max_depth is None else int(max_depth),
+        min_weight_fraction_leaf=float(min_weight_fraction_leaf),
         bootstrap=effective_bootstrap,
         random_seed=int(random_seed),
     )

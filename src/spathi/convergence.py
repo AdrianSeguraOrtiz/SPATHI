@@ -98,6 +98,7 @@ class PreparedForestPrefixes:
             n_estimators=prepared.n_estimators,
             min_samples_leaf=prepared.min_samples_leaf,
             max_depth=prepared.max_depth,
+            min_weight_fraction_leaf=prepared.min_weight_fraction_leaf,
         )
         model_bytes += prepared.n_estimators * len(prepared.tf_names) * 8
         plan = _plan_inference_execution(
@@ -255,6 +256,7 @@ def prepare_forest_prefixes(
         max_features=config.max_features,
         min_samples_leaf=config.min_samples_leaf,
         max_depth=config.max_depth,
+        min_weight_fraction_leaf=config.min_weight_fraction_leaf,
         bootstrap=config.bootstrap,
         random_seed=config.random_seed,
     )

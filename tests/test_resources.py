@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from math import ceil
+
 import pytest
 
 from spathi import resources
@@ -10,6 +13,7 @@ def _mapping_reader(values: dict[str, str]) -> resources._TextReader:
     return lambda path: values.get(str(path))
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_v2_uses_current_systemd_group_and_restrictive_ancestor() -> None:
     cgroup_text = "0::/user.slice/user-1000.slice/session-4.scope\n"
     mountinfo_text = "36 25 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup rw\n"
@@ -36,6 +40,7 @@ def test_cgroup_v2_uses_current_systemd_group_and_restrictive_ancestor() -> None
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_v1_resolves_slurm_subgroup_relative_to_non_root_mount() -> None:
     cgroup_text = "8:cpuset:/slurm/uid_1000/job_42/step_0\n7:memory:/slurm/uid_1000/job_42/step_0\n"
     mountinfo_text = (
@@ -63,6 +68,7 @@ def test_cgroup_v1_resolves_slurm_subgroup_relative_to_non_root_mount() -> None:
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_exhausted_limit_reports_zero_headroom() -> None:
     assert (
         resources._cgroup_available_bytes(
@@ -79,6 +85,7 @@ def test_cgroup_exhausted_limit_reports_zero_headroom() -> None:
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux cgroup contract")
 def test_cgroup_detection_falls_back_to_conventional_v1_path() -> None:
     read_text = _mapping_reader(
         {
@@ -106,13 +113,14 @@ def test_available_memory_combines_system_and_cgroup_headroom(
     assert available_memory_bytes() == 250
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux procfs contract")
 def test_linux_system_memory_prefers_mem_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def unexpected_sysconf(name: str) -> int:
         raise AssertionError(f"sysconf should not be called for {name}")
 
-    monkeypatch.setattr(resources.os, "sysconf", unexpected_sysconf)
+    monkeypatch.setattr(resources.os, "sysconf", unexpected_sysconf, raising=False)
 
     assert (
         resources._system_available_bytes(
@@ -131,11 +139,12 @@ def test_linux_system_memory_prefers_mem_available(
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux procfs contract")
 def test_linux_system_memory_falls_back_to_available_pages_for_invalid_meminfo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sysconf_values = {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": 12}
-    monkeypatch.setattr(resources.os, "sysconf", sysconf_values.__getitem__)
+    monkeypatch.setattr(resources.os, "sysconf", sysconf_values.__getitem__, raising=False)
 
     assert (
         resources._system_available_bytes(
@@ -168,8 +177,67 @@ def test_model_memory_estimate_respects_leaf_and_depth_bounds() -> None:
         min_samples_leaf=1,
         max_depth=2,
     )
+    weight_limited = estimate_model_memory_bytes(
+        n_cells=100,
+        n_transcription_factors=20,
+        n_estimators=50,
+        min_samples_leaf=1,
+        max_depth=None,
+        min_weight_fraction_leaf=0.1,
+    )
     assert leaf_limited < unconstrained
     assert depth_limited < unconstrained
+    assert weight_limited < unconstrained
+    assert (
+        estimate_model_memory_bytes(
+            n_cells=100,
+            n_transcription_factors=20,
+            n_estimators=50,
+            min_samples_leaf=1,
+            max_depth=None,
+            min_weight_fraction_leaf=0.0,
+        )
+        == unconstrained
+    )
+
+
+def test_model_memory_weight_fraction_uses_a_conservative_leaf_bound() -> None:
+    n_cells = 100
+    n_tfs = 20
+    n_estimators = 5
+    fraction = 0.3
+    maximum_leaves = ceil(1.0 / fraction)
+    expected = (
+        n_estimators * (2 * maximum_leaves - 1) * resources._BYTES_PER_TREE_NODE_ESTIMATE
+        + n_cells * (n_tfs - 1) * 4
+    )
+
+    assert (
+        estimate_model_memory_bytes(
+            n_cells=n_cells,
+            n_transcription_factors=n_tfs,
+            n_estimators=n_estimators,
+            min_samples_leaf=1,
+            max_depth=None,
+            min_weight_fraction_leaf=fraction,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("value", [-0.01, 0.500_001, float("nan"), float("inf"), True])
+def test_model_memory_estimate_rejects_invalid_minimum_leaf_weight_fraction(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="min_weight_fraction_leaf"):
+        estimate_model_memory_bytes(
+            n_cells=100,
+            n_transcription_factors=20,
+            n_estimators=5,
+            min_samples_leaf=1,
+            max_depth=None,
+            min_weight_fraction_leaf=value,  # type: ignore[arg-type]
+        )
 
 
 def test_memory_plan_caps_concurrency_and_reports_infeasible_budget() -> None:

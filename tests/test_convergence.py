@@ -5,10 +5,12 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import spathi._workflow as workflow_module
 import spathi.convergence as convergence_module
+import spathi.inference as inference_module
 from spathi import SpathiConfig, prepare_forest_prefixes
 from spathi.inference import prepare_inference
 
@@ -75,6 +77,100 @@ def test_prepared_forest_prefixes_match_independent_prepared_inference(
             )
         )
         assert _without_runtime(item.inference) == _without_runtime(result)
+
+
+def test_prepared_forest_prefixes_preserve_minimum_leaf_weight_fraction(
+    input_files: dict[str, Path], tmp_path: Path
+) -> None:
+    config = replace(_config(input_files, tmp_path), min_weight_fraction_leaf=0.125)
+    study = prepare_forest_prefixes(config, estimator_counts=(3, 5, 7))
+
+    assert study.prepared_inference.min_weight_fraction_leaf == 0.125
+    batch = next(study.iter_batches(target_batch_size=100))
+    independent = prepare_inference(
+        study.prepared_inference._expression,
+        study.prepared_inference.gene_names,
+        study.prepared_inference.tf_names,
+        target_names=study.prepared_inference.target_names,
+        n_estimators=batch[-1].n_estimators,
+        max_features=config.max_features,
+        min_weight_fraction_leaf=0.125,
+        random_seed=config.random_seed,
+    )
+    expected = next(
+        independent.iter_group_target_batches(
+            {group: study.group_weights[group] for group in batch[-1].inference.group_order},
+            group_order=batch[-1].inference.group_order,
+            target_batch_size=100,
+            threads=1,
+        )
+    )
+    assert _without_runtime(batch[-1].inference) == _without_runtime(expected)
+
+
+def test_convergence_preserves_completed_prefixes_after_late_model_failure(
+    input_files: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingExtensionEstimator:
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+            self.estimators_: list[SimpleNamespace] = []
+            self.fit_calls = 0
+
+        def fit(
+            self,
+            x: np.ndarray,
+            y: np.ndarray,
+            *,
+            sample_weight: np.ndarray,
+        ) -> FailingExtensionEstimator:
+            del y, sample_weight
+            self.fit_calls += 1
+            if self.fit_calls == 2:
+                raise ValueError("simulated convergence extension failure")
+            importance = np.full(x.shape[1], 1.0 / x.shape[1], dtype=np.float64)
+            tree = SimpleNamespace(
+                tree_=SimpleNamespace(node_count=3, n_leaves=2, max_depth=1),
+                feature_importances_=importance,
+            )
+            self.estimators_.extend(tree for _ in range(self.n_estimators - len(self.estimators_)))
+            self.n_features_in_ = x.shape[1]
+            return self
+
+        def set_params(self, *, n_estimators: int) -> FailingExtensionEstimator:
+            self.n_estimators = n_estimators
+            return self
+
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: FailingExtensionEstimator(kwargs["n_estimators"]),
+    )
+    study = prepare_forest_prefixes(
+        _config(input_files, tmp_path),
+        estimator_counts=(3, 5, 7),
+    )
+
+    batches = list(study.iter_batches(target_batch_size=100))
+
+    assert batches
+    for prefixes in batches:
+        g3_stats = tuple(
+            next(stat for stat in prefix.inference.model_stats if stat.target == "G3")
+            for prefix in prefixes
+        )
+        assert tuple(stat.status for stat in g3_stats) == (
+            "trained",
+            "model_fit_failed",
+            "model_fit_failed",
+        )
+        assert tuple(stat.n_estimators_fitted for stat in g3_stats) == (3, 3, 3)
+        assert g3_stats[0].message == ""
+        assert all(
+            "simulated convergence extension failure" in stat.message for stat in g3_stats[1:]
+        )
 
 
 def test_prefix_process_backend_preserves_exact_independent_results(

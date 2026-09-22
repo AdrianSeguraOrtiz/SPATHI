@@ -15,6 +15,8 @@ from types import ModuleType
 
 import pytest
 
+pytestmark = pytest.mark.benchmark_runtime
+
 
 def _load_benchmark_module() -> ModuleType:
     path = Path(__file__).parents[1] / "benchmarks" / "benchmark_scaling.py"
@@ -643,7 +645,12 @@ def test_process_measurement_records_peak_rss_and_exit_state(
         [
             sys.executable,
             "-c",
-            f"payload = bytearray(1_000_000); raise SystemExit({exit_code})",
+            (
+                "import time; "
+                "payload = bytearray(1_000_000); "
+                "time.sleep(1.0); "
+                f"raise SystemExit({exit_code})"
+            ),
         ],
         sample_interval_seconds=0.001,
         timeout_seconds=5.0,
@@ -693,7 +700,7 @@ def test_process_tree_cpu_includes_descendant_work(benchmark: ModuleType, tmp_pa
     child_program = """
 import time
 
-deadline = time.process_time() + 0.15
+deadline = time.process_time() + 0.5
 value = 1
 while time.process_time() < deadline:
     value = (value * 17 + 3) % 1_000_003
@@ -715,7 +722,7 @@ subprocess.run([sys.executable, "-c", sys.argv[1]], check=True)
     )
 
     assert measurement.status == "success"
-    assert measurement.sampled_cpu_user_seconds >= 0.08
+    assert measurement.sampled_cpu_user_seconds >= 0.1
     assert measurement.sampled_cpu_system_seconds >= 0
 
 

@@ -193,18 +193,20 @@ scale, effective value, and decision. A numeric `bandwidth` cannot be combined w
 non-unit scale because that number already declares \(h\). Kernel outputs are validated
 to be finite and in \([0,1]\).
 
-## Provisional baseline defaults
+## Stable first-version defaults
 
-The current development baseline defaults to `cell-distance-group-anchored` weighting,
+The first-version configuration defaults to `cell-distance-group-anchored` weighting,
 PCA distance space, cosine distance, a Gaussian kernel with automatic bandwidth,
-`cap-to-target` group-size correction, and Extra-Trees. Each ensemble uses 250 trees
-and `max_features=sqrt`. The CLI reads these values from the same immutable
-`SpathiConfig` used by the Python API, so the two interfaces cannot drift.
+no group-size correction, and Extra-Trees without bootstrap sampling. Each ensemble
+uses 50 trees, `max_features=0.5`, `min_samples_leaf=2`, and
+`min_weight_fraction_leaf=0.1`; `max_depth` is unbounded by default. The CLI reads
+these values from the same immutable `SpathiConfig` used by the Python API, so the two
+interfaces cannot drift.
 
-These defaults make development and testing reproducible, but remain provisional until
-the full calibration study selects the first-release configuration. They do not
-establish universal optimality. A new biological dataset should still be checked for
-convergence and sensitivity to representation and weighting choices.
+This configuration combines the calibrated reduced-study choices with the weighted
+leaf constraint validated in the large-input performance pilot. It does not establish
+universal optimality. A new biological dataset should still be checked for convergence
+and sensitivity to representation and weighting choices.
 
 ## Base weights, multiplicity correction, and final weights
 
@@ -441,11 +443,37 @@ value and `run_metadata.json` records the effective boolean used by every estima
 
 ### Fixed tree budgets and model accounting
 
-Each trainable model fits exactly `n_estimators` trees. The fixed-prefix convergence
-API can compare several increasing budgets by extending the same seeded forest.
+Each trainable model fits exactly `n_estimators` trees. Optional `max_depth` is passed
+as a hard upper bound to every tree; `None` means that this particular bound is absent,
+not that every tree grows indefinitely. Data purity, the two leaf constraints, and the
+estimator's other stopping rules can produce shallower trees. The fixed-prefix
+convergence API can compare several increasing budgets by extending the same seeded
+forest.
 Each tree's importance vector is extracted once; complete, ordered `float64` means
 and normalization preserve the scores of independently fitted fixed-size forests.
 The fitted tree count and cumulative fitting time are recorded per model.
+
+### Row-count and weighted-mass leaf constraints
+
+For one target-group model, `min_samples_leaf` requires every leaf to contain at least
+the configured number of source cells. In addition, with
+`min_weight_fraction_leaf=f`, every terminal leaf \(L\) must satisfy
+
+\[
+\sum_{i \in L} w_i^{(c)} \geq f \sum_i w_i^{(c)}.
+\]
+
+The accepted interval is \(f\in[0,0.5]\); the default is \(f=0.1\). The threshold is
+model- and group-specific because SPATHI supplies a different weight vector for each
+target group, and it is invariant to multiplying all weights of a model by the same
+positive constant. Both the row-count and weighted-mass conditions must hold for a
+proposed split.
+
+A positive weighted fraction is a scientific regularizer, not a semantics-preserving
+implementation shortcut. It changes the fitted trees and can alter feature importances
+and inferred edges. The default was therefore selected from fidelity and runtime
+measurements rather than runtime alone. The requested value is retained in
+`parameters.json` and `run_metadata.json`.
 
 Every selected target is accounted for in every group. Constant responses,
 insufficient positive-weight samples, empty or entirely constant predictor sets, and
@@ -459,6 +487,13 @@ model and are not renormalized across targets or groups.
 
 Predictor collections and warning collections are serialized as compact JSON arrays in
 columns ending in `_json`; no delimiter is reserved inside biological identifiers.
+
+For every trained model, `model_diagnostics.tsv.gz` also reads the realized structures
+directly from the fitted scikit-learn trees. It reports the exact total, arithmetic
+mean, linearly interpolated p50 and p95, and maximum for node count, leaf count, and
+observed depth. `run_metadata.json` aggregates these measurements across the run.
+They are measured structures, not estimates derived from requested tree limits or
+elapsed time.
 
 Each output edge has `sign=?`. Tree impurity importance does not determine activation
 or repression, and SPATHI does not invent a sign.

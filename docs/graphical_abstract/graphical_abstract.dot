@@ -1,0 +1,23 @@
+digraph graphical_abstract {
+  graph [
+    margin=0,
+    nodesep=0,
+    pad=0,
+    rankdir=LR,
+    ranksep=0.486111
+  ];
+  node [
+    fixedsize=true,
+    height=7.916667,
+    label="",
+    shape=box,
+    style=invis
+  ];
+
+  input [width=4.1667];
+  weights [width=6.1111];
+  model [width=4.4444];
+  output [width=4.4444];
+
+  input -> weights -> model -> output [style=invis];
+}

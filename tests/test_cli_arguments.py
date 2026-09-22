@@ -30,6 +30,8 @@ def test_cli_builds_typed_configuration() -> None:
             "2.5",
             "--max-features",
             "sqrt",
+            "--min-weight-fraction-leaf",
+            "0.1",
             "--threads",
             "2",
             "--parallel-backend",
@@ -41,6 +43,7 @@ def test_cli_builds_typed_configuration() -> None:
     assert config.expression == Path("expression.tsv")
     assert config.bandwidth == 2.5
     assert config.max_features == "sqrt"
+    assert config.min_weight_fraction_leaf == 0.1
     assert config.threads == 2
     assert config.parallel_backend == "processes"
     assert config.bootstrap is True
@@ -147,6 +150,10 @@ def test_cli_distinguishes_integer_and_fractional_max_features() -> None:
         [*BASE_ARGUMENTS, "--bandwidth-scale", "inf"],
         [*BASE_ARGUMENTS, "--max-features", "1.5"],
         [*BASE_ARGUMENTS, "--max-features", "all"],
+        [*BASE_ARGUMENTS, "--min-weight-fraction-leaf", "-0.01"],
+        [*BASE_ARGUMENTS, "--min-weight-fraction-leaf", "0.500001"],
+        [*BASE_ARGUMENTS, "--min-weight-fraction-leaf", "nan"],
+        [*BASE_ARGUMENTS, "--min-weight-fraction-leaf", "inf"],
         [*BASE_ARGUMENTS, "--random-seed", "-1"],
         [*BASE_ARGUMENTS, "--random-seed", str(2**32)],
     ],
@@ -172,6 +179,7 @@ def test_cli_help_explains_ambiguous_max_features_and_automatic_bootstrap(
     assert "'1.0' means 100% of predictors" in help_text
     assert "Extra-Trees disables it" in help_text
     assert "Random Forest enables it" in help_text
+    assert "minimum fraction of total model weight" in help_text
     assert "an explicit number is never rescaled" in help_text
     assert "applied only to the median or fallback" in help_text
     assert "(default: None)" not in help_text

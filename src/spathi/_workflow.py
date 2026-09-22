@@ -439,6 +439,12 @@ class _ModelRunStatistics:
     fitted_estimators_total: int = 0
     fitted_estimators_min: int | None = None
     fitted_estimators_max: int = 0
+    tree_nodes_total: int = 0
+    tree_nodes_max: int = 0
+    tree_leaves_total: int = 0
+    tree_leaves_max: int = 0
+    tree_depth_total: int = 0
+    tree_depth_max: int = 0
 
     def account_model_stats(
         self,
@@ -457,6 +463,12 @@ class _ModelRunStatistics:
                     self.fitted_estimators_max,
                     stat.n_estimators_fitted,
                 )
+                self.tree_nodes_total += stat.tree_nodes_total
+                self.tree_nodes_max = max(self.tree_nodes_max, stat.tree_nodes_max)
+                self.tree_leaves_total += stat.tree_leaves_total
+                self.tree_leaves_max = max(self.tree_leaves_max, stat.tree_leaves_max)
+                self.tree_depth_total += stat.tree_depth_total
+                self.tree_depth_max = max(self.tree_depth_max, stat.tree_depth_max)
 
 
 @dataclass(slots=True)
@@ -1592,6 +1604,7 @@ def _run_workflow_impl(
             max_features=config.max_features,
             min_samples_leaf=config.min_samples_leaf,
             max_depth=config.max_depth,
+            min_weight_fraction_leaf=config.min_weight_fraction_leaf,
             bootstrap=config.bootstrap,
             random_seed=config.random_seed,
         )
@@ -1741,11 +1754,13 @@ def _run_workflow_impl(
         n_estimators=config.n_estimators,
         min_samples_leaf=config.min_samples_leaf,
         max_depth=config.max_depth,
+        min_weight_fraction_leaf=config.min_weight_fraction_leaf,
     )
     tree_importance_buffer_bytes = (
         config.n_estimators * len(tf_names) * np.dtype(np.float64).itemsize
     )
-    estimated_model_bytes += tree_importance_buffer_bytes
+    tree_structure_buffer_bytes = config.n_estimators * 3 * np.dtype(np.int64).itemsize
+    estimated_model_bytes += tree_importance_buffer_bytes + tree_structure_buffer_bytes
     batch_memory_plan: _BatchMemoryPlan | None = None
     model_memory_plan: MemoryPlan | None = None
     execution_plan: _InferenceExecutionPlan | None = None
@@ -1826,6 +1841,7 @@ def _run_workflow_impl(
         retained_model_results * (len(tf_names) * 256 + 768)
     )
     memory_estimate["tree_importance_buffer_float64"] = int(tree_importance_buffer_bytes)
+    memory_estimate["tree_structure_buffers_int64"] = int(tree_structure_buffer_bytes)
     memory_estimate["weight_result_working_float64"] = int(
         4 * len(cell_names) * np.dtype(np.float64).itemsize
     )
@@ -1851,6 +1867,7 @@ def _run_workflow_impl(
     )
     memory_estimate["estimated_model_fit_bytes"] = estimated_model_bytes
     memory_estimate["tree_importance_buffer_per_model_float64"] = tree_importance_buffer_bytes
+    memory_estimate["tree_structure_buffers_per_model_int64"] = tree_structure_buffer_bytes
     memory_estimate["rough_concurrent_model_upper_bound"] = concurrent_fits * estimated_model_bytes
     memory_estimate["process_worker_base_bytes_per_worker"] = (
         0 if execution_plan is None else execution_plan.process_worker_base_bytes
@@ -2288,6 +2305,7 @@ def _run_workflow_impl(
                 "material_negative_importances": "fatal",
             },
             "n_estimators": config.n_estimators,
+            "min_weight_fraction_leaf": config.min_weight_fraction_leaf,
             "tree_target_dtype": tree_target_dtype,
             "tree_predictor_dtype": tree_predictor_dtype,
             "inference_preparation_performed": prepared is not None,
@@ -2382,6 +2400,39 @@ def _run_workflow_impl(
             "fitted_estimators_total": fitted_estimators_total,
             "fitted_estimators_min": fitted_estimators_min,
             "fitted_estimators_max": fitted_estimators_max or None,
+            "observed_tree_structure": {
+                "tree_count": fitted_estimators_total,
+                "nodes": {
+                    "total": model_statistics.tree_nodes_total,
+                    "mean_per_tree": (
+                        None
+                        if fitted_estimators_total == 0
+                        else model_statistics.tree_nodes_total / fitted_estimators_total
+                    ),
+                    "maximum": model_statistics.tree_nodes_max or None,
+                },
+                "leaves": {
+                    "total": model_statistics.tree_leaves_total,
+                    "mean_per_tree": (
+                        None
+                        if fitted_estimators_total == 0
+                        else model_statistics.tree_leaves_total / fitted_estimators_total
+                    ),
+                    "maximum": model_statistics.tree_leaves_max or None,
+                },
+                "depth": {
+                    "total": model_statistics.tree_depth_total,
+                    "mean_per_tree": (
+                        None
+                        if fitted_estimators_total == 0
+                        else model_statistics.tree_depth_total / fitted_estimators_total
+                    ),
+                    "maximum": (
+                        model_statistics.tree_depth_max if fitted_estimators_total else None
+                    ),
+                },
+                "per_model_quantiles": "model_diagnostics.tsv.gz",
+            },
             "fit_or_importance_failures": fatal_model_failures,
             "skipped_target_records": skipped_target_records,
             "positive_edges": n_edges,
@@ -2422,6 +2473,10 @@ def _run_workflow_impl(
                     "float64 epsilon were canonicalized to exact zero"
                 ),
                 "n_estimators_fitted": "actual fitted trees, bounded by n_estimators",
+                "tree_structure": (
+                    "exact total, arithmetic mean, linear p50/p95 and maximum across the "
+                    "fitted trees of this model for node count, leaf count and observed depth"
+                ),
             },
             "centroid_weights.tsv.gz": {
                 "scope": "centroid construction only",

@@ -1,0 +1,20 @@
+{
+  "commit": "9edcff5b4010075ade4b784de6f3c46854b762ac",
+  "expansion": "Similarity-weighted Population-Aware Transcriptional Heterogeneity Inference",
+  "font_family": "DejaVu Sans",
+  "palette": {
+    "ink": "#173146",
+    "line": "#CFD9E1",
+    "muted": "#536778",
+    "orange": "#C57020",
+    "purple": "#7B65A1",
+    "soft": "#F5F8FA",
+    "teal": "#007F86",
+    "teal_soft": "#E9F6F5",
+    "white": "#FFFFFF"
+  },
+  "physical_width_mm": 240,
+  "repository": "AdrianSeguraOrtiz/SPATHI",
+  "subtitle": "Group-specific regulatory networks,\ninformed by transcriptomic similarity",
+  "title": "SPATHI"
+}

@@ -36,6 +36,29 @@ def edge_tuples(result: InferenceResult) -> list[tuple[str, str, float, str]]:
     return [(edge.context, edge.target, edge.score, edge.source) for edge in result.edges]
 
 
+def attach_fake_forest(
+    estimator: object,
+    importances: np.ndarray,
+    *,
+    n_estimators: int,
+    node_count: int = 3,
+    n_leaves: int = 2,
+    max_depth: int = 1,
+) -> None:
+    """Give estimator doubles the structural surface exposed by sklearn forests."""
+
+    tree = SimpleNamespace(
+        tree_=SimpleNamespace(
+            node_count=node_count,
+            n_leaves=n_leaves,
+            max_depth=max_depth,
+        ),
+        feature_importances_=importances,
+    )
+    estimator.estimators_ = [tree for _ in range(n_estimators)]  # type: ignore[attr-defined]
+    estimator.n_features_in_ = importances.size  # type: ignore[attr-defined]
+
+
 def run_inference(
     expression: np.ndarray,
     gene_names: list[str],
@@ -121,21 +144,82 @@ def test_model_result_enforces_status_skip_and_training_invariants() -> None:
         )
 
 
+def test_model_stat_enforces_tree_presence_by_execution_status() -> None:
+    base = skipped_model_result().stat.to_dict()
+    one_tree = {
+        "n_estimators_fitted": 1,
+        "tree_nodes_total": 3,
+        "tree_nodes_mean": 3.0,
+        "tree_nodes_p50": 3.0,
+        "tree_nodes_p95": 3.0,
+        "tree_nodes_max": 3,
+        "tree_leaves_total": 2,
+        "tree_leaves_mean": 2.0,
+        "tree_leaves_p50": 2.0,
+        "tree_leaves_p95": 2.0,
+        "tree_leaves_max": 2,
+        "tree_depth_total": 1,
+        "tree_depth_mean": 1.0,
+        "tree_depth_p50": 1.0,
+        "tree_depth_p95": 1.0,
+        "tree_depth_max": 1,
+    }
+
+    for status in (
+        "trained",
+        "trained_no_positive_importance",
+        "invalid_feature_importances",
+    ):
+        with pytest.raises(ValueError, match="requires at least one fitted tree"):
+            ModelStat(**{**base, "status": status})  # type: ignore[arg-type]
+        assert (
+            ModelStat(  # type: ignore[arg-type]
+                **{**base, "status": status, **one_tree},
+            ).n_estimators_fitted
+            == 1
+        )
+
+    for status in (
+        "insufficient_positive_weight_samples",
+        "constant_target",
+        "no_predictors_after_self_exclusion",
+        "no_variable_predictors",
+    ):
+        with pytest.raises(ValueError, match="cannot contain fitted trees"):
+            ModelStat(**{**base, "status": status, **one_tree})  # type: ignore[arg-type]
+        assert ModelStat(**{**base, "status": status}).n_estimators_fitted == 0  # type: ignore[arg-type]
+
+    zero_tree_failure = ModelStat(**{**base, "status": "model_fit_failed"})
+    partial_tree_failure = ModelStat(
+        **{**base, "status": "model_fit_failed", **one_tree},  # type: ignore[arg-type]
+    )
+    assert zero_tree_failure.n_estimators_fitted == 0
+    assert partial_tree_failure.n_estimators_fitted == 1
+
+
 def test_estimator_receives_exact_sample_weight(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[np.ndarray] = []
 
     class FakeEstimator:
         feature_importances_: np.ndarray
 
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+
         def fit(self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray) -> FakeEstimator:
             captured.append(sample_weight.copy())
             self.feature_importances_ = np.full(x.shape[1], 1.0 / x.shape[1])
+            attach_fake_forest(
+                self,
+                self.feature_importances_,
+                n_estimators=self.n_estimators,
+            )
             return self
 
     monkeypatch.setattr(
         inference_module,
         "create_tree_estimator",
-        lambda *args, **kwargs: FakeEstimator(),
+        lambda *args, **kwargs: FakeEstimator(kwargs["n_estimators"]),
     )
     expression = np.array([[0.0, 1.0, 1.0], [1.0, 0.0, 2.0], [2.0, 1.0, 4.0]], dtype=np.float64)
     weights = np.array([1.0, 0.25, 0.5])
@@ -158,19 +242,27 @@ def test_float64_negative_importance_roundoff_is_canonicalized(
     class RoundoffEstimator:
         feature_importances_: np.ndarray
 
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+
         def fit(
             self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray
         ) -> RoundoffEstimator:
             self.feature_importances_ = np.array(
-                [-np.finfo(np.float64).eps / 2.0, 1.0],
+                [-np.nextafter(0.0, 1.0), 1.0],
                 dtype=np.float64,
+            )
+            attach_fake_forest(
+                self,
+                self.feature_importances_,
+                n_estimators=self.n_estimators,
             )
             return self
 
     monkeypatch.setattr(
         inference_module,
         "create_tree_estimator",
-        lambda *args, **kwargs: RoundoffEstimator(),
+        lambda *args, **kwargs: RoundoffEstimator(kwargs["n_estimators"]),
     )
     expression = np.array(
         [[0.0, 1.0, 1.0], [1.0, 0.0, 2.0], [2.0, 1.0, 4.0]],
@@ -200,6 +292,9 @@ def test_materially_negative_importance_remains_a_fatal_model_result(
     class InvalidEstimator:
         feature_importances_: np.ndarray
 
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+
         def fit(
             self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray
         ) -> InvalidEstimator:
@@ -207,12 +302,17 @@ def test_materially_negative_importance_remains_a_fatal_model_result(
                 [-2.0 * np.finfo(np.float64).eps, 1.0],
                 dtype=np.float64,
             )
+            attach_fake_forest(
+                self,
+                self.feature_importances_,
+                n_estimators=self.n_estimators,
+            )
             return self
 
     monkeypatch.setattr(
         inference_module,
         "create_tree_estimator",
-        lambda *args, **kwargs: InvalidEstimator(),
+        lambda *args, **kwargs: InvalidEstimator(kwargs["n_estimators"]),
     )
     expression = np.array(
         [[0.0, 1.0, 1.0], [1.0, 0.0, 2.0], [2.0, 1.0, 4.0]],
@@ -274,16 +374,24 @@ def test_targets_retain_float64_variation_while_predictors_use_float32(
     class FakeEstimator:
         feature_importances_: np.ndarray
 
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+
         def fit(self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray) -> FakeEstimator:
             captured_predictor_dtypes.append(x.dtype)
             captured_targets.append(y.copy())
             self.feature_importances_ = np.ones(x.shape[1], dtype=np.float64)
+            attach_fake_forest(
+                self,
+                self.feature_importances_,
+                n_estimators=self.n_estimators,
+            )
             return self
 
     monkeypatch.setattr(
         inference_module,
         "create_tree_estimator",
-        lambda *args, **kwargs: FakeEstimator(),
+        lambda *args, **kwargs: FakeEstimator(kwargs["n_estimators"]),
     )
     predictor = np.linspace(0.0, 1.0, 64)
     # This is valid float64 variation, but the complete target range is smaller
@@ -399,6 +507,23 @@ def test_compact_feature_importance_buffer_is_bitwise_sklearn_equivalent() -> No
     np.testing.assert_array_equal(observed, expected)
 
 
+@pytest.mark.parametrize("tree_method", ["extra-trees", "random-forest"])
+def test_tree_estimator_receives_minimum_leaf_weight_fraction(tree_method: str) -> None:
+    estimator = inference_module.create_tree_estimator(
+        tree_method,  # type: ignore[arg-type]
+        n_estimators=3,
+        max_features="sqrt",
+        min_samples_leaf=1,
+        max_depth=None,
+        min_weight_fraction_leaf=0.125,
+        bootstrap=tree_method == "random-forest",
+        random_state=19,
+        n_jobs=1,
+    )
+
+    assert estimator.min_weight_fraction_leaf == 0.125
+
+
 @pytest.mark.parametrize(
     ("tree_method", "bootstrap"),
     [("extra-trees", False), ("random-forest", True)],
@@ -432,6 +557,7 @@ def test_fixed_forest_prefix_importances_are_bitwise_independent_fit_equivalent(
         bootstrap=bootstrap,
         global_seed=23,
         model_n_jobs=n_jobs,
+        min_weight_fraction_leaf=0.0,
     )
 
     tree_class = ExtraTreeRegressor if tree_method == "extra-trees" else DecisionTreeRegressor
@@ -472,6 +598,19 @@ def test_fixed_forest_prefix_importances_are_bitwise_independent_fit_equivalent(
         independent.fit(predictors, response, sample_weight=weights)
         expected = inference_module._extract_feature_importances(independent)
         np.testing.assert_array_equal(outcome.importances, expected)
+        structures = tuple(tree.tree_ for tree in independent.estimators_)
+        for family, values in (
+            ("nodes", np.asarray([tree.node_count for tree in structures], dtype=np.int64)),
+            ("leaves", np.asarray([tree.n_leaves for tree in structures], dtype=np.int64)),
+            ("depth", np.asarray([tree.max_depth for tree in structures], dtype=np.int64)),
+        ):
+            summary = inference_module._summarize_tree_measure(values)
+            assert getattr(outcome.forest_structure, f"{family}_total") == summary[0]
+            assert getattr(outcome.forest_structure, f"{family}_mean") == summary[1]
+            assert getattr(outcome.forest_structure, f"{family}_p50") == summary[2]
+            assert getattr(outcome.forest_structure, f"{family}_p95") == summary[3]
+            assert getattr(outcome.forest_structure, f"{family}_max") == summary[4]
+        assert outcome.forest_structure.depth_max <= 7
 
 
 def test_tree_importance_cache_preserves_prefixes_with_mixed_stumps() -> None:
@@ -623,7 +762,7 @@ def test_fixed_prefix_fit_failure_retains_elapsed_time_and_completed_tree_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeTree:
-        tree_ = SimpleNamespace(node_count=2)
+        tree_ = SimpleNamespace(node_count=2, n_leaves=1, max_depth=1)
         feature_importances_ = np.array([1.0])
 
     class FailingSecondBlockEstimator:
@@ -679,6 +818,91 @@ def test_fixed_prefix_fit_failure_retains_elapsed_time_and_completed_tree_count(
     assert str(caught.value.error) == "simulated second-block failure"
     assert caught.value.fit_seconds == 5.0
     assert caught.value.n_estimators_fitted == 10
+    assert len(caught.value.completed_outcomes) == 1
+    assert caught.value.completed_outcomes[0].n_estimators_fitted == 10
+    assert caught.value.forest_structure.nodes_total == 20
+    assert caught.value.forest_structure.leaves_total == 10
+    assert caught.value.forest_structure.depth_total == 10
+
+
+def test_prefix_api_preserves_completed_prefixes_after_late_fit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTree:
+        tree_ = SimpleNamespace(node_count=3, n_leaves=2, max_depth=1)
+        feature_importances_ = np.array([0.75, 0.25], dtype=np.float64)
+
+    class FailingExtensionEstimator:
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+            self.estimators_: list[FakeTree] = []
+            self.calls = 0
+            self.n_features_in_ = 2
+
+        def fit(self, *args: Any, **kwargs: Any) -> FailingExtensionEstimator:
+            self.calls += 1
+            if self.calls == 2:
+                raise ValueError("simulated late prefix failure")
+            self.estimators_.extend(
+                FakeTree() for _ in range(self.n_estimators - len(self.estimators_))
+            )
+            return self
+
+        def set_params(self, *, n_estimators: int) -> FailingExtensionEstimator:
+            self.n_estimators = n_estimators
+            return self
+
+    monkeypatch.setattr(
+        inference_module,
+        "create_tree_estimator",
+        lambda *args, **kwargs: FailingExtensionEstimator(kwargs["n_estimators"]),
+    )
+    expression = np.asarray(
+        [
+            [0.0, 1.0, 0.5],
+            [1.0, 0.0, 1.5],
+            [2.0, 1.0, 2.5],
+            [3.0, 1.5, 3.5],
+            [4.0, 2.0, 4.5],
+            [5.0, 3.0, 5.5],
+        ],
+        dtype=np.float64,
+    )
+    prepared = prepare_inference(
+        expression,
+        ["TF1", "TF2", "G"],
+        ["TF1", "TF2"],
+        target_names=["G"],
+        n_estimators=6,
+        random_seed=17,
+    )
+
+    batches = list(
+        prepared.iter_group_target_prefix_batches(
+            {"A": np.ones(expression.shape[0])},
+            estimator_counts=(2, 4, 6),
+            target_batch_size=1,
+            threads=1,
+        )
+    )
+
+    assert len(batches) == 1
+    prefixes = batches[0]
+    assert tuple(prefix.n_estimators for prefix in prefixes) == (2, 4, 6)
+    stats = tuple(prefix.inference.model_stats[0] for prefix in prefixes)
+    assert tuple(stat.status for stat in stats) == (
+        "trained",
+        "model_fit_failed",
+        "model_fit_failed",
+    )
+    assert tuple(stat.n_estimators_fitted for stat in stats) == (2, 2, 2)
+    assert tuple(prefix.inference.trained_models for prefix in prefixes) == (1, 0, 0)
+    assert prefixes[0].inference.skipped_targets == ()
+    assert tuple(prefix.inference.skipped_targets[0].reason for prefix in prefixes[1:]) == (
+        "model_fit_failed",
+        "model_fit_failed",
+    )
+    assert all("simulated late prefix failure" in stat.message for stat in stats[1:])
 
 
 def test_weights_reproducibly_change_target_network() -> None:
@@ -692,6 +916,7 @@ def test_weights_reproducibly_change_target_network() -> None:
         {"first": first_program, "second": second_program},
         n_estimators=80,
         max_features=1.0,
+        min_weight_fraction_leaf=0.0,
         random_seed=5,
         threads=2,
     )
@@ -785,13 +1010,17 @@ def test_explicit_all_gene_targets_reuse_default_response_storage_and_results() 
     assert prepared.target_expression_additional_nbytes == 0
 
 
-def test_low_level_inference_uses_the_canonical_provisional_model_defaults() -> None:
+def test_low_level_inference_uses_the_stable_model_defaults() -> None:
     expression, genes, tfs = inference_data()
 
     prepared = prepare_inference(expression, genes, tfs)
 
-    assert prepared.n_estimators == 250
-    assert prepared.max_features == "sqrt"
+    assert prepared.n_estimators == 50
+    assert prepared.max_features == 0.5
+    assert prepared.min_samples_leaf == 2
+    assert prepared.max_depth is None
+    assert prepared.min_weight_fraction_leaf == 0.1
+    assert prepared.bootstrap is False
 
 
 @pytest.mark.parametrize(
@@ -816,17 +1045,25 @@ def test_constant_predictors_are_excluded_with_correct_edge_mapping_and_diagnost
     class FakeEstimator:
         feature_importances_: np.ndarray
 
+        def __init__(self, n_estimators: int) -> None:
+            self.n_estimators = n_estimators
+
         def fit(self, x: np.ndarray, y: np.ndarray, *, sample_weight: np.ndarray) -> FakeEstimator:
             fitted_matrices[tuple(y.tolist())] = x.copy()
             fitted_matrix_ids[tuple(y.tolist())] = id(x)
             raw_importances = np.arange(1, x.shape[1] + 1, dtype=np.float64)
             self.feature_importances_ = raw_importances / raw_importances.sum()
+            attach_fake_forest(
+                self,
+                self.feature_importances_,
+                n_estimators=self.n_estimators,
+            )
             return self
 
     monkeypatch.setattr(
         inference_module,
         "create_tree_estimator",
-        lambda *args, **kwargs: FakeEstimator(),
+        lambda *args, **kwargs: FakeEstimator(kwargs["n_estimators"]),
     )
     tf_left = np.array([0.0, 1.0, 2.0, 3.0])
     tf_constant = np.full(4, 7.0)
@@ -1100,11 +1337,37 @@ def test_inference_rejects_seed_outside_sklearn_range() -> None:
         prepare_inference(expression, genes, tfs, random_seed=2**32)
 
 
+def test_prepared_inference_preserves_minimum_leaf_weight_fraction() -> None:
+    expression, genes, tfs = inference_data()
+    prepared = prepare_inference(
+        expression,
+        genes,
+        tfs,
+        n_estimators=2,
+        min_weight_fraction_leaf=0.2,
+    )
+
+    assert prepared.min_weight_fraction_leaf == 0.2
+
+
+@pytest.mark.parametrize("value", [-0.01, 0.500_001, float("nan"), float("inf")])
+def test_prepared_inference_rejects_invalid_minimum_leaf_weight_fraction(value: float) -> None:
+    expression, genes, tfs = inference_data()
+    with pytest.raises(ValueError, match="min_weight_fraction_leaf"):
+        prepare_inference(
+            expression,
+            genes,
+            tfs,
+            min_weight_fraction_leaf=value,
+        )
+
+
 @pytest.mark.parametrize(
     ("parameter", "value", "message"),
     [
         ("max_features", None, "max_features"),
         ("min_samples_leaf", 0.25, "positive integer"),
+        ("min_weight_fraction_leaf", False, "min_weight_fraction_leaf"),
     ],
 )
 def test_prepared_inference_uses_the_canonical_model_parameter_contract(

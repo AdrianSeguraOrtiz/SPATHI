@@ -137,6 +137,16 @@ def _max_features(value: str) -> MaxFeatures:
         ) from exc
 
 
+def _weight_fraction(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number in [0, 0.5]") from exc
+    if not isfinite(parsed) or not 0 <= parsed <= 0.5:
+        raise argparse.ArgumentTypeError("must be a finite number in [0, 0.5]")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the public argument parser."""
 
@@ -404,6 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum tree depth; omit for unbounded depth",
     )
     model.add_argument(
+        "--min-weight-fraction-leaf",
+        type=_weight_fraction,
+        default=_config_default("min_weight_fraction_leaf"),
+        help="minimum fraction of total model weight required in every leaf",
+    )
+    model.add_argument(
         "--bootstrap",
         action=argparse.BooleanOptionalAction,
         default=_config_default("bootstrap"),
@@ -482,6 +498,7 @@ def config_from_args(args: argparse.Namespace) -> SpathiConfig:
         max_features=args.max_features,
         min_samples_leaf=args.min_samples_leaf,
         max_depth=args.max_depth,
+        min_weight_fraction_leaf=args.min_weight_fraction_leaf,
         bootstrap=args.bootstrap,
         random_seed=args.random_seed,
         threads=args.threads,

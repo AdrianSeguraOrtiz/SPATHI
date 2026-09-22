@@ -46,7 +46,7 @@ dependencies = [
   "rich>=13.7",
   "rich-argparse>=1.5",
   "scikit-learn>=1.4",
-  "scipy>=1.11",
+  "scipy>=1.11.1",
   "threadpoolctl>=3.2",
 ]
 
@@ -94,6 +94,7 @@ include = [
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 markers = [
+  "benchmark_runtime: opt-in benchmark engineering tests for the canonical Linux environment",
   "distribution: tests that build or inspect distribution artifacts",
   "integration: end-to-end tests that exercise multiple SPATHI components",
 ]

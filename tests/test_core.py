@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
+import re
 import subprocess
 import sys
 import weakref
@@ -43,6 +45,10 @@ EXPECTED_ARTIFACTS = {
     "weight_diagnostics.tsv",
     "report.html",
 }
+
+
+def _normalized_path_text(path: Path) -> str:
+    return os.path.normcase(str(path).removeprefix("\\\\?\\"))
 
 
 def config_for(
@@ -833,6 +839,7 @@ def test_public_core_writes_self_contained_deterministic_run(
     parameters = json.loads((output_dir / "parameters.json").read_text(encoding="utf-8"))
     assert parameters["bandwidth"] == "auto"
     assert parameters["bandwidth_scale"] == 0.5
+    assert parameters["min_weight_fraction_leaf"] == 0.1
     assert metadata["status"] == "complete"
     assert metadata["input_dimensions"] == {
         "cells": 4,
@@ -887,6 +894,7 @@ def test_public_core_writes_self_contained_deterministic_run(
     assert metadata["effective_parameters"]["bootstrap_requested"] is None
     assert metadata["effective_parameters"]["bootstrap_effective"] is False
     assert metadata["effective_parameters"]["n_estimators"] == 12
+    assert metadata["effective_parameters"]["min_weight_fraction_leaf"] == 0.1
     assert metadata["effective_parameters"]["targets_per_batch"] == 4
     assert metadata["effective_parameters"]["target_selection"] == "all-expression-genes"
     assert metadata["effective_parameters"]["target_ids"] is None
@@ -912,6 +920,27 @@ def test_public_core_writes_self_contained_deterministic_run(
         "PC3",
     ]
     assert metadata["models"]["completed"] == 8
+    model_diagnostics = pd.read_csv(output_dir / "model_diagnostics.tsv.gz", sep="\t")
+    fitted = model_diagnostics.loc[model_diagnostics["n_estimators_fitted"] > 0]
+    assert not fitted.empty
+    for family in ("nodes", "leaves", "depth"):
+        np.testing.assert_allclose(
+            fitted[f"tree_{family}_mean"] * fitted["n_estimators_fitted"],
+            fitted[f"tree_{family}_total"],
+        )
+        assert (fitted[f"tree_{family}_p50"] <= fitted[f"tree_{family}_p95"]).all()
+        assert (fitted[f"tree_{family}_p95"] <= fitted[f"tree_{family}_max"]).all()
+    assert (fitted["tree_leaves_total"] <= fitted["tree_nodes_total"]).all()
+    tree_structure = metadata["models"]["observed_tree_structure"]
+    assert tree_structure["tree_count"] == int(fitted["n_estimators_fitted"].sum())
+    for family in ("nodes", "leaves", "depth"):
+        expected_total = int(fitted[f"tree_{family}_total"].sum())
+        assert tree_structure[family]["total"] == expected_total
+        assert tree_structure[family]["mean_per_tree"] == pytest.approx(
+            expected_total / tree_structure["tree_count"]
+        )
+        assert tree_structure[family]["maximum"] == int(fitted[f"tree_{family}_max"].max())
+    assert tree_structure["per_model_quantiles"] == "model_diagnostics.tsv.gz"
     assert metadata["parallelism"]["threads_requested"] == 1
     assert len(metadata["inputs"]["expression"]["sha256"]) == 64
     assert Path(metadata["inputs"]["expression"]["path"]).is_absolute()
@@ -1856,7 +1885,7 @@ def test_broken_output_symlink_is_never_overwritten(
         infer(config_for(input_files, output_dir), checkpoint=False)
 
     assert output_dir.is_symlink()
-    assert output_dir.readlink() == missing_target
+    assert _normalized_path_text(output_dir.readlink()) == _normalized_path_text(missing_target)
 
 
 @pytest.mark.integration
@@ -1879,7 +1908,7 @@ def test_output_path_appearing_before_publication_is_never_overwritten(
         infer(config_for(input_files, output_dir), checkpoint=False)
 
     assert output_dir.is_symlink()
-    assert output_dir.readlink() == missing_target
+    assert _normalized_path_text(output_dir.readlink()) == _normalized_path_text(missing_target)
     assert not list(tmp_path.glob(".late-output-link.staging-*"))
 
 
@@ -2020,7 +2049,10 @@ def test_completed_model_failure_is_published_with_diagnostics(
         lambda *args, **kwargs: FailingEstimator(),
     )
     output_dir = tmp_path / "failed-run"
-    with pytest.raises(RuntimeError, match=str(output_dir / "model_diagnostics.tsv.gz")):
+    with pytest.raises(
+        RuntimeError,
+        match=re.escape(str(output_dir / "model_diagnostics.tsv.gz")),
+    ):
         infer(config_for(input_files, output_dir))
 
     metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
